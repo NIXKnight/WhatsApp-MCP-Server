@@ -7,3 +7,14 @@ bridge/data/cooldown
 *.dll
 *.so
 *.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+mcp-server/.venv/
+mcp-server/*.egg-info/
+.eggs/
+dist/
+build/
