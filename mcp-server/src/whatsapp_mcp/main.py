@@ -21,17 +21,87 @@ from __future__ import annotations
 import builtins
 import functools
 import logging
+import logging.config
+import os
+import platform
 import sys
+
+LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+
+def get_logger_config(log_level: str = "INFO") -> dict:
+    """Return logging config dictionary for dictConfig.
+
+    Args:
+        log_level: One of DEBUG, INFO, WARNING, ERROR, CRITICAL.
+            Falls back to INFO if an unrecognised value is supplied.
+
+    Returns:
+        A dict suitable for passing directly to ``logging.config.dictConfig``.
+    """
+    if log_level not in LOG_LEVELS:
+        log_level = "INFO"
+
+    hostname = platform.node().split(".")[0]
+
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "standard": {
+                "format": (
+                    "%(asctime)s %(levelname)s %(process)d "
+                    "[%(name)s] %(filename)s:%(lineno)d - %(message)s"
+                ),
+            },
+            "verbose": {
+                "format": (
+                    f"[hostname={hostname}] "
+                    "%(asctime)s %(levelname)s %(process)d "
+                    "[%(name)s] %(filename)s:%(lineno)d - %(message)s"
+                ),
+            },
+        },
+        "handlers": {
+            "console": {
+                "level": log_level,
+                "class": "logging.StreamHandler",
+                "formatter": "standard",
+                "stream": "ext://sys.stderr",
+            },
+        },
+        "root": {
+            "level": log_level,
+            "handlers": ["console"],
+        },
+        "loggers": {
+            "whatsapp_mcp": {
+                "level": log_level,
+                "handlers": ["console"],
+                "propagate": False,
+            },
+            "httpx": {
+                "level": "WARNING",
+                "handlers": ["console"],
+                "propagate": False,
+            },
+            "httpcore": {
+                "level": "WARNING",
+                "handlers": ["console"],
+                "propagate": False,
+            },
+        },
+    }
 
 
 def _configure_logging() -> None:
-    """Route all log output to stderr, keeping stdout clean for MCP framing."""
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
+    """Route all log output to stderr, keeping stdout clean for MCP framing.
+
+    The log level is read from the ``LOG_LEVEL`` environment variable
+    (default: ``INFO``).  Unrecognised values silently revert to ``INFO``.
+    """
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.config.dictConfig(get_logger_config(log_level))
 
 
 def _patch_print() -> None:

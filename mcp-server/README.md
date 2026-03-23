@@ -44,6 +44,7 @@ python -m whatsapp_mcp.main
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BRIDGE_URL` | `http://localhost:8080` | Base URL of the Go WhatsApp bridge. Must be running and accessible. |
+| `LOG_LEVEL` | `INFO` | Logging verbosity. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Invalid values revert to `INFO`. |
 
 Example:
 
@@ -222,23 +223,20 @@ All output is sent to stderr to keep stdout clean for MCP framing (JSON-RPC). Th
 - Bridge health check results
 - Tool call execution (via FastMCP)
 
-Log format (ISO 8601 timestamps):
+Log format:
 
 ```
-2025-01-23T10:45:30  INFO      whatsapp_mcp.server  WhatsApp MCP server initialising.
-2025-01-23T10:45:30  INFO      whatsapp_mcp.bridge_client  Bridge health check passed on attempt 1.
+2025-01-23T10:45:30 INFO 12345 [whatsapp_mcp.main] main.py:74 - WhatsApp MCP server initialising.
+2025-01-23T10:45:30 INFO 12345 [whatsapp_mcp.bridge_client] bridge_client.py:88 - Bridge health check passed on attempt 1.
 ```
 
-To enable debug-level logging, modify `whatsapp_mcp/main.py`:
+The log level is controlled via the `LOG_LEVEL` environment variable (default: `INFO`):
 
-```python
-handler = logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.DEBUG,  # Change from INFO
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
+```bash
+LOG_LEVEL=DEBUG whatsapp-mcp
 ```
+
+Noisy third-party libraries (`httpx`, `httpcore`) are suppressed to `WARNING` regardless of the configured level.
 
 ## Troubleshooting
 
