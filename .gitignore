@@ -1,0 +1,9 @@
+# Go
+bridge/data/*.db
+bridge/data/media/
+bridge/data/cooldown
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
