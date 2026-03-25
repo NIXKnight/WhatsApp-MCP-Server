@@ -26,10 +26,6 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# Create a non-root user
-RUN groupadd --system app && \
-    useradd --system --gid app --create-home app
-
 # Copy the entire virtual environment and project from the builder
 COPY --from=builder /app /app
 
@@ -37,9 +33,7 @@ COPY --from=builder /app /app
 COPY --from=builder /root/.local/bin/uv /usr/local/bin/uv
 COPY --from=builder /root/.local/bin/uvx /usr/local/bin/uvx
 
-# Make the app user own the working directory
-RUN chown -R app:app /app
-
-USER app
+# Make /app writable by any user (docker-compose sets the runtime UID)
+RUN chmod -R a+rw /app
 
 CMD ["uv", "run", "whatsapp-mcp"]

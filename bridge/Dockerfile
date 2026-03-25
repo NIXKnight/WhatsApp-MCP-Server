@@ -22,15 +22,10 @@ FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates sqlite-libs
 
-# Non-root user for security
-RUN addgroup -S appuser && adduser -S -G appuser appuser
-
-# Data directory for SQLite database and media storage
-RUN mkdir /data && chown appuser:appuser /data
+# Data directory for SQLite database and media storage (writable by any UID)
+RUN mkdir /data && chmod 777 /data
 
 COPY --from=builder /build/whatsapp-bridge /usr/local/bin/whatsapp-bridge
-
-USER appuser
 
 EXPOSE 8080
 
