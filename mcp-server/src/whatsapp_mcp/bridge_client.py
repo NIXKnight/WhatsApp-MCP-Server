@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
+import time
 from typing import Any
 
 import httpx
@@ -64,6 +66,8 @@ class BridgeClient:
                 pool=_POOL_TIMEOUT,
             ),
         )
+        self._send_lock = asyncio.Lock()
+        self._last_send_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -106,6 +110,19 @@ class BridgeClient:
     async def close(self) -> None:
         """Close the underlying httpx connection pool."""
         await self._client.aclose()
+
+    async def _throttle_send(self) -> None:
+        """Enforce a randomized 2-7 second gap between send operations.
+
+        Serialises concurrent sends through a lock so that even parallel
+        tool calls respect the minimum inter-send delay.
+        """
+        async with self._send_lock:
+            elapsed = time.monotonic() - self._last_send_time
+            min_gap = random.uniform(2.0, 7.0)
+            if elapsed < min_gap:
+                await asyncio.sleep(min_gap - elapsed)
+            self._last_send_time = time.monotonic()
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -184,6 +201,7 @@ class BridgeClient:
         Raises:
             RuntimeError: On connection failure or on a non-2xx HTTP status code.
         """
+        await self._throttle_send()
         try:
             resp = await self._client.post(path, json=json)
             resp.raise_for_status()
@@ -221,6 +239,7 @@ class BridgeClient:
             RuntimeError: On connection failure, non-2xx HTTP status, or
                 request timeout.
         """
+        await self._throttle_send()
         try:
             resp = await self._client.post(path, data=data, files=files)
             resp.raise_for_status()

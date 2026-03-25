@@ -49,6 +49,20 @@ def _detect_media_type(file_path: str) -> MediaType:
     return "document"
 
 
+def _translate_path(host_path: str) -> str:
+    """Translate a host filesystem path to the container workspace path.
+
+    When ``WORKSPACE_HOST_PATH`` is set, any file path starting with that
+    prefix is rewritten to use ``WORKSPACE_DIR`` (the container mount point)
+    instead.  Paths that do not match the prefix are returned unchanged.
+    """
+    host_prefix = os.getenv("WORKSPACE_HOST_PATH", "")
+    container_dir = os.getenv("WORKSPACE_DIR", "")
+    if host_prefix and container_dir and host_path.startswith(host_prefix):
+        return host_path.replace(host_prefix, container_dir, 1)
+    return host_path
+
+
 def register_media_tools(mcp: FastMCP) -> None:
     """Register all media tools onto *mcp*.
 
@@ -89,9 +103,10 @@ def register_media_tools(mcp: FastMCP) -> None:
             to: Recipient JID.  For individuals: ``923001234567@s.whatsapp.net``
                 or bare number ``923001234567``.  For groups:
                 ``120363039783372408@g.us``.
-            file_path: Absolute path to the media file on the local filesystem
-                (e.g. ``/home/user/photo.jpg``).  Must be readable by this
-                process.
+            file_path: Absolute path to the media file.  Host paths under
+                the workspace directory are automatically translated to
+                container paths (e.g. ``/home/user/workspace/photo.jpg``
+                becomes ``/workspace/photo.jpg``).
             caption: Optional caption text displayed below the media in
                 WhatsApp.  Ignored for ``document`` and ``audio`` types.
             media_type: Explicit media type override.  One of ``"image"``,
@@ -106,6 +121,9 @@ def register_media_tools(mcp: FastMCP) -> None:
             success.  Raises :class:`RuntimeError` when the file does not
             exist, the bridge is unavailable, or the bridge returns an error.
         """
+        # Translate host paths to container workspace paths.
+        file_path = _translate_path(file_path)
+
         # Validate file existence before making any network call.
         if not os.path.isfile(file_path):
             raise RuntimeError(
@@ -173,7 +191,7 @@ def register_media_tools(mcp: FastMCP) -> None:
         payload: dict = {
             "message_id": message_id,
             "chat_jid": chat_jid,
-            "output_dir": "~/.cabal/media/",
+            "output_dir": os.getenv("WORKSPACE_DIR", "/workspace"),
         }
         result = await bridge.post("/api/download", json=payload)
         return json.dumps(result)

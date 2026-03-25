@@ -17,7 +17,9 @@ func AnalyzeOggOpus(data []byte) (durationSeconds uint32, waveform []byte, err e
 	}
 
 	var lastGranule uint64
-	var sampleRate uint32 = 48000 // Opus always uses 48 kHz internally
+	// Opus granule positions are always at 48 kHz regardless of the input
+	// sample rate stored in OpusHead, so this must never be overridden.
+	const sampleRate uint32 = 48000
 	var preSkip uint16
 	var foundOpusHead bool
 	var pageSamples []float64 // accumulated per-page loudness samples
@@ -71,10 +73,6 @@ func AnalyzeOggOpus(data []byte) (durationSeconds uint32, waveform []byte, err e
 				if hp+12 <= len(pagePayload) {
 					// Version (1B), Channels (1B), PreSkip (2B LE), SampleRate (4B LE)
 					preSkip = binary.LittleEndian.Uint16(pagePayload[hp+2 : hp+4])
-					sr := binary.LittleEndian.Uint32(pagePayload[hp+4 : hp+8])
-					if sr > 0 {
-						sampleRate = sr
-					}
 					foundOpusHead = true
 				}
 			}

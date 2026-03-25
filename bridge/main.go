@@ -114,11 +114,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ---- HTTP API server ---------------------------------------------------
+	// Start the HTTP server before connecting to WhatsApp so that /api/status
+	// is reachable during QR code scanning. Docker health checks and other
+	// probes will get a 200 response with state=QR_WAITING instead of a
+	// "connection refused" error.
+	h := api.NewHandler(client, store, log.With("component", "api"))
+	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"))
+
+	srvErrCh := make(chan error, 1)
+	go func() {
+		srvErrCh <- srv.Start()
+	}()
+
 	// ---- Signal handler for graceful shutdown ------------------------------
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// ---- Connect to WhatsApp (blocking until connected or ctx cancelled) ---
+	// ---- Connect to WhatsApp (non-blocking) --------------------------------
 	connectCtx, connectCancel := context.WithCancel(context.Background())
 	defer connectCancel()
 
@@ -127,7 +140,7 @@ func main() {
 		connectErrCh <- client.Connect(connectCtx)
 	}()
 
-	// Wait for connection or signal.
+	// Wait for connection, a fatal HTTP server error, or a signal.
 	select {
 	case err := <-connectErrCh:
 		if err != nil {
@@ -140,9 +153,15 @@ func main() {
 				log.Error("permanent disconnect detected, cooldown marker written",
 					"cooldown", cooldownDuration.String(),
 				)
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer shutdownCancel()
+				_ = srv.Shutdown(shutdownCtx)
 				store.Close()
 				os.Exit(2) // exit code 2: tell supervisor not to restart yet
 			}
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer shutdownCancel()
+			_ = srv.Shutdown(shutdownCtx)
 			store.Close()
 			os.Exit(1)
 		}
@@ -150,22 +169,22 @@ func main() {
 		log.Info("received signal before connection established, shutting down", "signal", sig)
 		connectCancel()
 		client.Disconnect()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
+		_ = srv.Shutdown(shutdownCtx)
 		store.Close()
 		os.Exit(0)
+	case err := <-srvErrCh:
+		log.Error("HTTP server error before connection established", "err", err)
+		connectCancel()
+		client.Disconnect()
+		store.Close()
+		os.Exit(1)
 	}
 
 	// Successful connection: remove any stale cooldown marker.
 	clearCooldownMarker(cfg.DataDir)
 	log.Info("WhatsApp connection established")
-
-	// ---- HTTP API server ---------------------------------------------------
-	h := api.NewHandler(client, store, log.With("component", "api"))
-	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"))
-
-	srvErrCh := make(chan error, 1)
-	go func() {
-		srvErrCh <- srv.Start()
-	}()
 
 	// ---- Wait for termination signal ---------------------------------------
 	select {

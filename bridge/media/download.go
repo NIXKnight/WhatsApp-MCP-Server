@@ -23,7 +23,7 @@ type DownloadResult struct {
 // Download retrieves the media referenced by msg, saves it to
 // outDir/<chat_jid_safe>/<filename>, and returns the result.
 // outDir defaults to dataDir/media when the caller passes the bridge data dir,
-// but can be any writable directory (e.g. ~/.cabal/media).
+// but can be any writable directory.
 // If the file already exists locally it is returned without re-downloading.
 func Download(ctx context.Context, client *whatsmeow.Client, msg *bridge.MessageRow, outDir string) (*DownloadResult, error) {
 	if msg.MediaType == "" {
@@ -76,7 +76,7 @@ func Download(ctx context.Context, client *whatsmeow.Client, msg *bridge.Message
 		return nil, fmt.Errorf("download cancelled: %w", err)
 	}
 
-	data, err := client.Download(dl)
+	data, err := client.Download(ctx, dl)
 	if err != nil {
 		return nil, fmt.Errorf("whatsmeow download: %w", err)
 	}
@@ -105,12 +105,12 @@ type storedMediaDownloader struct {
 	mediaType     whatsmeow.MediaType
 }
 
-func (d *storedMediaDownloader) GetDirectPath() string         { return d.directPath }
-func (d *storedMediaDownloader) GetURL() string                { return d.url }
-func (d *storedMediaDownloader) GetMediaKey() []byte           { return d.mediaKey }
-func (d *storedMediaDownloader) GetFileLength() uint64         { return d.fileLength }
-func (d *storedMediaDownloader) GetFileSHA256() []byte         { return d.fileSHA256 }
-func (d *storedMediaDownloader) GetFileEncSHA256() []byte      { return d.fileEncSHA256 }
+func (d *storedMediaDownloader) GetDirectPath() string             { return d.directPath }
+func (d *storedMediaDownloader) GetURL() string                    { return d.url }
+func (d *storedMediaDownloader) GetMediaKey() []byte               { return d.mediaKey }
+func (d *storedMediaDownloader) GetFileLength() uint64             { return d.fileLength }
+func (d *storedMediaDownloader) GetFileSHA256() []byte             { return d.fileSHA256 }
+func (d *storedMediaDownloader) GetFileEncSHA256() []byte          { return d.fileEncSHA256 }
 func (d *storedMediaDownloader) GetMediaType() whatsmeow.MediaType { return d.mediaType }
 
 // extractDirectPath extracts the URL path component from a WhatsApp media URL.

@@ -41,6 +41,7 @@ def register_message_tools(mcp: FastMCP) -> None:
         text: str,
         quoted_message_id: str | None = None,
         quoted_participant: str | None = None,
+        mentions: list[str] | None = None,
     ) -> str:
         """Send a plain-text WhatsApp message to an individual contact.
 
@@ -62,6 +63,11 @@ def register_message_tools(mcp: FastMCP) -> None:
             quoted_participant: Optional JID (phone or LID) of the quoted
                 message sender.  Required for quoting when the message is no
                 longer in the bridge store.
+            mentions: Optional list of JIDs to tag in the message. Use
+                phone JIDs (e.g. ``["923224387030@s.whatsapp.net"]``).
+                The message text should contain matching ``@phone``
+                placeholders (e.g. ``@923224387030``) for WhatsApp to
+                render them as display names.
 
         Returns:
             JSON string with ``{"id": "...", "timestamp": "..."}`` on
@@ -74,6 +80,8 @@ def register_message_tools(mcp: FastMCP) -> None:
             payload["quotedMessageId"] = quoted_message_id
         if quoted_participant:
             payload["quotedParticipant"] = quoted_participant
+        if mentions:
+            payload["mentions"] = mentions
 
         result = await bridge.post("/api/send", json=payload)
         return json.dumps(result)

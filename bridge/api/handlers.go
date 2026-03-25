@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log/slog"
@@ -303,7 +304,7 @@ func (h *Handler) GetGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.client.State() == bridge.StateConnected {
-		if gi, err := h.client.WA.GetGroupInfo(jid); err == nil {
+		if gi, err := h.client.WA.GetGroupInfo(r.Context(), jid); err == nil {
 			for _, p := range gi.Participants {
 				resp.Participants = append(resp.Participants, GroupParticipant{
 					JID:          p.JID.String(),
@@ -468,7 +469,8 @@ func (h *Handler) SendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg := buildTextMessage(req.Text, req.QuotedMessageID, req.QuotedParticipant, req.Mentions)
+	ephemeral := h.getEphemeralExpiry(r.Context(), jid)
+	msg := buildTextMessage(req.Text, req.QuotedMessageID, req.QuotedParticipant, req.Mentions, ephemeral)
 
 	resp, err := h.client.WA.SendMessage(r.Context(), jid, msg)
 	if err != nil {
@@ -558,6 +560,11 @@ func (h *Handler) SendMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ephemeral := h.getEphemeralExpiry(r.Context(), jid)
+	if ephemeral > 0 {
+		injectEphemeralExpiry(result.Message, ephemeral)
+	}
+
 	resp, err := h.client.WA.SendMessage(r.Context(), jid, result.Message)
 	if err != nil {
 		h.log.Error("send media message", "jid", toJID, "err", err)
@@ -575,7 +582,7 @@ func (h *Handler) SendMedia(w http.ResponseWriter, r *http.Request) {
 
 // DownloadMedia downloads a media file referenced in a stored message and
 // returns its local path. Accepts optional output_dir to override the default
-// media directory (Python passes ~/.cabal/media for CABAL voice note analysis).
+// media directory.
 func (h *Handler) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 	var req DownloadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -698,10 +705,24 @@ func toContactResponses(rows []bridge.ContactRow) []ContactResponse {
 	return out
 }
 
+// getEphemeralExpiry returns the disappearing message timer (in seconds) for a
+// group JID, or 0 if the JID is not a group or ephemeral messaging is not
+// enabled.
+func (h *Handler) getEphemeralExpiry(ctx context.Context, jid types.JID) uint32 {
+	if jid.Server != types.GroupServer {
+		return 0
+	}
+	info, err := h.client.WA.GetGroupInfo(ctx, jid)
+	if err != nil || !info.IsEphemeral {
+		return 0
+	}
+	return info.DisappearingTimer
+}
+
 // buildTextMessage constructs the waE2E.Message proto for a text send,
 // optionally with a quoted message context and/or mentions.
-func buildTextMessage(text, quotedID, quotedParticipant string, mentions []string) *waE2E.Message {
-	needsExtended := quotedID != "" || len(mentions) > 0
+func buildTextMessage(text, quotedID, quotedParticipant string, mentions []string, ephemeralExpiry uint32) *waE2E.Message {
+	needsExtended := quotedID != "" || len(mentions) > 0 || ephemeralExpiry > 0
 
 	if !needsExtended {
 		return &waE2E.Message{
@@ -713,7 +734,7 @@ func buildTextMessage(text, quotedID, quotedParticipant string, mentions []strin
 		Text: proto.String(text),
 	}
 
-	if quotedID != "" || len(mentions) > 0 {
+	if quotedID != "" || len(mentions) > 0 || ephemeralExpiry > 0 {
 		ci := &waE2E.ContextInfo{}
 		if quotedID != "" {
 			ci.StanzaID = proto.String(quotedID)
@@ -722,10 +743,36 @@ func buildTextMessage(text, quotedID, quotedParticipant string, mentions []strin
 		if len(mentions) > 0 {
 			ci.MentionedJID = mentions
 		}
+		if ephemeralExpiry > 0 {
+			ci.Expiration = proto.Uint32(ephemeralExpiry)
+		}
 		ext.ContextInfo = ci
 	}
 
 	return &waE2E.Message{ExtendedTextMessage: ext}
+}
+
+// injectEphemeralExpiry sets ContextInfo.Expiration on the inner media message
+// proto so that the message participates in the chat's disappearing timer.
+func injectEphemeralExpiry(msg *waE2E.Message, expiry uint32) {
+	setExpiry := func(ci **waE2E.ContextInfo) {
+		if *ci == nil {
+			*ci = &waE2E.ContextInfo{}
+		}
+		(*ci).Expiration = proto.Uint32(expiry)
+	}
+	switch {
+	case msg.ImageMessage != nil:
+		setExpiry(&msg.ImageMessage.ContextInfo)
+	case msg.AudioMessage != nil:
+		setExpiry(&msg.AudioMessage.ContextInfo)
+	case msg.VideoMessage != nil:
+		setExpiry(&msg.VideoMessage.ContextInfo)
+	case msg.DocumentMessage != nil:
+		setExpiry(&msg.DocumentMessage.ContextInfo)
+	case msg.StickerMessage != nil:
+		setExpiry(&msg.StickerMessage.ContextInfo)
+	}
 }
 
 // normaliseJID converts a bare phone number to a WhatsApp individual JID.

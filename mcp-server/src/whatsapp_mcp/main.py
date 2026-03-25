@@ -124,7 +124,7 @@ def _patch_print() -> None:
 
 
 def main() -> None:
-    """Configure the process and start the FastMCP server on stdio transport.
+    """Configure the process and start the FastMCP server.
 
     This function is the entry point registered in ``pyproject.toml`` under
     ``[project.scripts]``.  It:
@@ -133,8 +133,14 @@ def main() -> None:
     2. Patches ``print`` to default to stderr.
     3. Imports the :data:`~whatsapp_mcp.server.mcp` instance (which registers
        all twelve tools).
-    4. Calls ``mcp.run()`` which blocks on the stdio MCP transport loop until
-       the parent process closes the pipe.
+    4. Calls ``mcp.run()`` which blocks on the MCP transport loop until the
+       parent process closes the pipe (stdio) or the server is stopped.
+
+    Transport is selected via the ``MCP_TRANSPORT`` environment variable
+    (default: ``stdio``).  Set it to ``sse`` or ``http`` (streamable-HTTP) to
+    bind a network transport instead.  When using a network transport,
+    ``MCP_HOST`` (default: ``0.0.0.0``) and ``MCP_PORT`` (default: ``3000``)
+    control the bind address and port.
     """
     _configure_logging()
     _patch_print()
@@ -146,7 +152,14 @@ def main() -> None:
     # during tool registration already have the correct handler installed.
     from whatsapp_mcp.server import mcp  # noqa: PLC0415
 
-    mcp.run()
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "stdio":
+        mcp.run()
+    else:
+        host = os.getenv("MCP_HOST", "0.0.0.0")
+        port = int(os.getenv("MCP_PORT", "3000"))
+        logger.info("Starting %s transport on %s:%d", transport, host, port)
+        mcp.run(transport=transport, host=host, port=port)
 
 
 if __name__ == "__main__":

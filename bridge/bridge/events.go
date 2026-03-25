@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -304,14 +305,14 @@ func (c *Client) processPushName(evt *events.PushName) {
 // group info, contact store, and finally the bare JID user segment.
 func (c *Client) resolveChatName(jid types.JID, isGroup bool, pushName string) string {
 	if isGroup {
-		gi, err := c.WA.GetGroupInfo(jid)
+		gi, err := c.WA.GetGroupInfo(context.Background(), jid)
 		if err == nil && gi.Name != "" {
 			return gi.Name
 		}
 		return fmt.Sprintf("Group %s", jid.User)
 	}
 
-	contact, err := c.WA.Store.Contacts.GetContact(jid)
+	contact, err := c.WA.Store.Contacts.GetContact(context.Background(), jid)
 	if err == nil && contact.FullName != "" {
 		return contact.FullName
 	}

@@ -38,12 +38,12 @@ func NewClient(dataDir string, store *Store, log *slog.Logger) (*Client, error) 
 	deviceStorePath := filepath.Join(dataDir, "whatsapp.db")
 	deviceDSN := fmt.Sprintf("file:%s?_foreign_keys=on", deviceStorePath)
 
-	container, err := sqlstore.New("sqlite3", deviceDSN, dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", deviceDSN, dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("open whatsapp device store: %w", err)
 	}
 
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			deviceStore = container.NewDevice()
