@@ -10,7 +10,7 @@ Security: The API has no authentication and must only be accessible on the loopb
 
 ## Prerequisites
 
-- Go 1.23 or later
+- Go 1.25 or later
 - CGO enabled (required for `mattn/go-sqlite3` SQLite bindings)
 - A WhatsApp account with multi-device support enabled
 
@@ -32,6 +32,14 @@ go build -o whatsapp-bridge .
 On first run, the bridge enters QR pairing mode. Scan the displayed QR code with your WhatsApp mobile app (Settings → Linked Devices → Link a Device).
 
 After QR scan succeeds, the bridge stays connected. Subsequent runs reconnect automatically without requiring QR re-pairing (session data is persisted in the `bridge/data/` directory).
+
+### Docker Build
+
+```bash
+docker compose build bridge
+```
+
+The Dockerfile uses a multi-stage Alpine build with CGO enabled for SQLite.
 
 ## Environment Variables
 

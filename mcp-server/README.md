@@ -4,7 +4,7 @@ Python FastMCP server exposing 12 WhatsApp tools over the Model Context Protocol
 
 ## Overview
 
-This is a [FastMCP](https://github.com/modelcontextprotocol/python-sdk) implementation that bridges the Python/Claude ecosystem to WhatsApp via the Go bridge. It implements the MCP stdio transport, meaning it runs as a subprocess spawned by Claude Code or Claude Desktop.
+This is a [FastMCP](https://github.com/modelcontextprotocol/python-sdk) implementation that bridges the Python/Claude ecosystem to WhatsApp via the Go bridge. It supports both MCP stdio transport and SSE transport (for Docker).
 
 **Prerequisites:**
 - Python 3.11+
@@ -37,6 +37,27 @@ whatsapp-mcp
 python -m whatsapp_mcp.main
 ```
 
+### Docker
+
+When running via Docker Compose, the server uses SSE transport on port 3000:
+
+```bash
+docker compose up -d
+```
+
+Configure your MCP client:
+
+```json
+{
+  "mcpServers": {
+    "WhatsApp": {
+      "type": "sse",
+      "url": "http://localhost:3000/sse"
+    }
+  }
+}
+```
+
 ## Configuration
 
 ### Environment Variables
@@ -45,6 +66,11 @@ python -m whatsapp_mcp.main
 |----------|---------|-------------|
 | `BRIDGE_URL` | `http://localhost:8080` | Base URL of the Go WhatsApp bridge. Must be running and accessible. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Invalid values revert to `INFO`. |
+| `MCP_TRANSPORT` | `stdio` | Transport protocol: `stdio` or `sse`. |
+| `MCP_HOST` | `0.0.0.0` | Bind address for SSE transport. |
+| `MCP_PORT` | `3000` | Port for SSE transport. |
+| `WORKSPACE_DIR` | `/workspace` | Container workspace directory for media files. |
+| `WORKSPACE_HOST_PATH` | (none) | Host path prefix for automatic path translation. |
 
 Example:
 
@@ -105,8 +131,8 @@ All tools communicate with the Go bridge and return JSON strings. Errors raise `
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
-| `send_message` | `to`, `text`, `quoted_message_id?`, `quoted_participant?` | Send a plain-text message to an individual contact |
-| `send_group_message` | `to`, `text`, `quoted_message_id?`, `quoted_participant?` | Send a plain-text message to a group chat |
+| `send_message` | `to`, `text`, `mentions?`, `quoted_message_id?`, `quoted_participant?` | Send a plain-text message to an individual contact; supports optional `mentions` list for @-mentions |
+| `send_group_message` | `to`, `text`, `mentions?`, `quoted_message_id?`, `quoted_participant?` | Send a plain-text message to a group chat; supports optional `mentions` list for @-mentions |
 | `check_new_messages` | `since` (Unix ms), `limit?` (1-500, default 100) | Poll for new messages since a Unix millisecond timestamp |
 | `get_messages` | `jid`, `limit?` (default 20, max 500) | Retrieve recent messages from a specific chat (individual or group) |
 | `get_unread_chats` | `message_limit?` (default 5) | List all chats with unread messages and recent message previews |
@@ -205,6 +231,10 @@ If the bridge is not reachable during startup, the server fails immediately with
 
 - **GET requests**: Retried up to 3 times on transient network errors (ConnectError, TimeoutException) using exponential backoff (0.5s–5s)
 - **POST requests**: Never retried to prevent duplicate messages or media uploads
+
+### Send Throttling
+
+Send operations (POST) are throttled with a randomized 2-7 second delay between consecutive sends to avoid WhatsApp anti-spam detection.
 
 ### Error Handling
 

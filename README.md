@@ -10,23 +10,24 @@ A Model Context Protocol (MCP) server for WhatsApp, built with a Go bridge and P
 |    (MCP Server)         |  localhost:8080   |    (whatsmeow)             |
 |                         |                   |                            |
 |  - 12 MCP tools         |                   |  - WhatsApp Web protocol   |
-|  - stdio transport      |                   |  - SQLite message store    |
-|  - async httpx          |                   |  - QR code auth            |
-|                         |                   |  - Reconnection + backoff  |
+|  - stdio or SSE         |                   |  - SQLite message store    |
+|    transport            |                   |  - QR code auth            |
+|  - async httpx          |                   |  - Reconnection + backoff  |
 |                         |                   |  - Media upload/download   |
 +-------------------------+                   +----------------------------+
-        Started by                                Started independently
-       Claude Code                               (manual / systemd)
-       (.mcp.json)                               (needs terminal for QR)
+    Stdio: Claude Code                     Started independently
+    (.mcp.json) or Claude                 (manual / systemd / Docker)
+    Desktop. SSE: Docker                  (needs terminal for QR)
 ```
 
-The Go bridge connects to WhatsApp via the [whatsmeow](https://github.com/tulir/whatsmeow) library and exposes a REST API on `127.0.0.1:8080`. The Python MCP server communicates with the bridge via `httpx` and exposes 12 tools over the MCP stdio transport.
+The Go bridge connects to WhatsApp via the [whatsmeow](https://github.com/tulir/whatsmeow) library and exposes a REST API on `127.0.0.1:8080`. The Python MCP server communicates with the bridge via `httpx` and exposes 12 tools over the MCP stdio transport or SSE transport (for Docker).
 
 ## Prerequisites
 
-- Go 1.23+
+- Go 1.25+
 - Python 3.11+
 - [uv](https://astral.sh/uv) (Python package manager)
+- Docker (optional, for containerized deployment)
 - A WhatsApp account with multi-device support
 
 ## Setup
@@ -71,12 +72,47 @@ Add to your `.mcp.json` (Claude Code) or `claude_desktop_config.json` (Claude De
 Environment variables:
 - `BRIDGE_URL` (default: `http://localhost:8080`)
 
+### Docker (Recommended)
+
+The easiest way to run both services:
+
+```bash
+docker compose up -d
+```
+
+On first run, check bridge logs for the QR code:
+
+```bash
+docker compose logs bridge
+```
+
+Scan the QR code with WhatsApp (Settings → Linked Devices → Link a Device).
+
+Configure your MCP client to connect via SSE:
+
+```json
+{
+  "mcpServers": {
+    "WhatsApp": {
+      "type": "sse",
+      "url": "http://localhost:3000/sse"
+    }
+  }
+}
+```
+
+Environment variables can be set in `.env` next to `docker-compose.yml`:
+
+```bash
+WORKSPACE_PATH=/path/to/shared/directory
+```
+
 ## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `send_message` | Send a text message to an individual contact |
-| `send_group_message` | Send a text message to a group chat |
+| `send_message` | Send a text message to an individual contact; supports optional `mentions` for @-mentions |
+| `send_group_message` | Send a text message to a group chat; supports optional `mentions` for @-mentions |
 | `check_new_messages` | Poll for new messages since a timestamp |
 | `get_messages` | Retrieve recent messages from a chat |
 | `get_unread_chats` | Get all chats with unread messages |
