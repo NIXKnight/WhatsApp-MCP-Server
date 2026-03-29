@@ -201,6 +201,14 @@ func (c *Client) processHistorySync(evt *events.HistorySync) {
 		isGroup := jid.Server == "g.us"
 		chatName := c.resolveHistoryConvName(conv, jid, isGroup)
 
+		// Ensure the chat row exists before inserting messages that reference it
+		// via a FOREIGN KEY constraint. Use zero values for timestamp/preview;
+		// the upsert after the loop will update them with real values.
+		if err := c.Store.UpsertChat(chatJID, chatName, isGroup, 0, time.Time{}, ""); err != nil {
+			c.log.Warn("history sync: failed to pre-upsert chat", "jid", chatJID, "err", err)
+			continue
+		}
+
 		// Determine the timestamp of the most-recent message for the chat row.
 		var latestTime time.Time
 		var latestPreview string
