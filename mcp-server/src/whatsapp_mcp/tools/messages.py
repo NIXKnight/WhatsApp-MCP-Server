@@ -1,12 +1,13 @@
 """Message-related MCP tools.
 
-Provides five tools:
+Provides seven tools:
 
 * :func:`send_message` — Send a plain-text message to an individual contact.
 * :func:`check_new_messages` — Poll for new messages since a given Unix timestamp.
 * :func:`get_messages` — Retrieve recent messages from a specific chat.
 * :func:`get_unread_chats` — List all chats that have unread messages.
 * :func:`get_unread_messages` — Flat list of all unread messages across all chats.
+* :func:`get_group_context` — Compact recent-turn window for a group chat.
 """
 
 from __future__ import annotations
@@ -95,6 +96,7 @@ def register_message_tools(mcp: FastMCP) -> None:
         ctx: Context,
         since: int,
         limit: int = 100,
+        chat_jid: str | None = None,
     ) -> str:
         """Poll for new messages since an explicit Unix millisecond timestamp.
 
@@ -111,6 +113,7 @@ def register_message_tools(mcp: FastMCP) -> None:
                 after this time are returned.  Pass ``0`` to retrieve all
                 recent stored messages.  Example: ``1700000000000``.
             limit: Maximum number of messages to return (1-500, default 100).
+            chat_jid: Optional JID to filter results to a single chat.
 
         Returns:
             JSON string with ``{"count": N, "messages": [...], "since": "...",
@@ -121,7 +124,7 @@ def register_message_tools(mcp: FastMCP) -> None:
         """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
 
-        result = await bridge.get("/api/check", since=since, limit=limit)
+        result = await bridge.get("/api/check", since=since, limit=limit, chat_jid=chat_jid)
 
         messages = result.get("messages") if isinstance(result, dict) else []
         if not messages:
@@ -160,7 +163,7 @@ def register_message_tools(mcp: FastMCP) -> None:
         """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
         result = await bridge.get("/api/messages", chat_jid=jid, limit=limit)
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
 
     # ------------------------------------------------------------------
     # get_unread_chats
@@ -199,7 +202,7 @@ def register_message_tools(mcp: FastMCP) -> None:
         if not chats:
             return "No unread chats."
 
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
 
     # ------------------------------------------------------------------
     # get_unread_messages
@@ -235,4 +238,45 @@ def register_message_tools(mcp: FastMCP) -> None:
         if not messages:
             return "No unread messages."
 
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
+
+    # ------------------------------------------------------------------
+    # get_group_context
+    # ------------------------------------------------------------------
+
+    @mcp.tool
+    async def get_group_context(
+        ctx: Context,
+        jid: str,
+        limit: int = 20,
+    ) -> str:
+        """Return a compact recent-turn window for a group chat.
+
+        Strips own messages and empty content. Returns only fields needed
+        for context assembly in chronological order (oldest first).
+
+        Args:
+            ctx: FastMCP context.
+            jid: Group JID ending with @g.us.
+            limit: Maximum messages (default 20).
+
+        Returns:
+            JSON list: [{"name", "sender", "text", "ts"}] in chronological order.
+        """
+        bridge: BridgeClient = ctx.lifespan_context["bridge"]
+        result = await bridge.get("/api/messages", chat_jid=jid, limit=limit)
+        messages = result if isinstance(result, list) else []
+
+        chronological = []
+        for m in reversed(messages):
+            text = (m.get("content") or "").strip()
+            if not text:
+                continue
+            chronological.append({
+                "name": m.get("sender_name") or m.get("push_name") or m.get("sender", ""),
+                "sender": m.get("sender", ""),
+                "text": text,
+                "ts": m["timestamp"],
+            })
+
+        return json.dumps(chronological)

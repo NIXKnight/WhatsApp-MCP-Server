@@ -15,12 +15,12 @@ type ErrorResponse struct {
 
 // StatusResponse is returned by GET /api/status.
 type StatusResponse struct {
-	State         string    `json:"state"`
-	IsConnected   bool      `json:"is_connected"`
-	Uptime        string    `json:"uptime"`
-	MessageCount  int64     `json:"message_count"`
-	ChatCount     int64     `json:"chat_count"`
-	StartedAt     time.Time `json:"started_at"`
+	State        string    `json:"state"`
+	IsConnected  bool      `json:"is_connected"`
+	Uptime       string    `json:"uptime"`
+	MessageCount int64     `json:"message_count"`
+	ChatCount    int64     `json:"chat_count"`
+	StartedAt    time.Time `json:"started_at"`
 }
 
 // ---- Messages -----------------------------------------------------------
@@ -41,6 +41,7 @@ type MessageResponse struct {
 	PushName          string    `json:"push_name,omitempty"`
 	QuotedMessageID   string    `json:"quoted_message_id,omitempty"`
 	QuotedParticipant string    `json:"quoted_participant,omitempty"`
+	Snippet           string    `json:"snippet,omitempty"`
 }
 
 // MessagesResponse wraps a list of messages with pagination metadata.
@@ -117,13 +118,28 @@ type ContactsResponse struct {
 	Total    int               `json:"total"`
 }
 
+// SimilarContactPairResponse is a single pair of contacts with similar names.
+type SimilarContactPairResponse struct {
+	JIDA       string  `json:"jid_a"`
+	NameA      string  `json:"name_a"`
+	JIDB       string  `json:"jid_b"`
+	NameB      string  `json:"name_b"`
+	Similarity float64 `json:"similarity"`
+}
+
+// SimilarContactsResponse is returned by GET /api/contacts/similar.
+type SimilarContactsResponse struct {
+	Pairs []SimilarContactPairResponse `json:"pairs"`
+	Total int                          `json:"total"`
+}
+
 // ---- Groups -------------------------------------------------------------
 
 // GroupParticipant represents a participant in a group.
 type GroupParticipant struct {
-	JID     string `json:"jid"`
-	IsAdmin bool   `json:"is_admin"`
-	IsSuperAdmin bool `json:"is_super_admin"`
+	JID          string `json:"jid"`
+	IsAdmin      bool   `json:"is_admin"`
+	IsSuperAdmin bool   `json:"is_super_admin"`
 }
 
 // GroupResponse extends ChatResponse with participant information.
@@ -185,4 +201,91 @@ type DownloadResponse struct {
 	FilePath  string `json:"file_path"`
 	MediaType string `json:"media_type"`
 	FileSize  int64  `json:"file_size"`
+}
+
+// ---- Hybrid search ------------------------------------------------------
+
+// HybridSearchRequest is the body for POST /api/search.
+type HybridSearchRequest struct {
+	Query     string    `json:"query"`
+	Embedding []float32 `json:"embedding"`
+	ChatJID   string    `json:"chat_jid,omitempty"`
+	Limit     int       `json:"limit,omitempty"`
+}
+
+// SearchResultResponse is a single result from hybrid search.
+type SearchResultResponse struct {
+	ID         string    `json:"id"`
+	ChatJID    string    `json:"chat_jid"`
+	Content    string    `json:"content"`
+	Timestamp  time.Time `json:"timestamp"`
+	SenderName string    `json:"sender_name"`
+	Score      float64   `json:"score"`
+	Snippet    string    `json:"snippet,omitempty"`
+	MatchType  string    `json:"match_type"`
+}
+
+// HybridSearchResponse is returned by POST /api/search.
+type HybridSearchResponse struct {
+	Results []SearchResultResponse `json:"results"`
+	Total   int                    `json:"total"`
+}
+
+// ---- Chat topic search --------------------------------------------------
+
+// ChatTopicSearchRequest is the body for POST /api/chats/search.
+type ChatTopicSearchRequest struct {
+	Embedding []float32 `json:"embedding"`
+	Limit     int       `json:"limit,omitempty"`
+}
+
+// ChatWithScoreResponse is a chat paired with its relevance score.
+type ChatWithScoreResponse struct {
+	ChatResponse
+	Relevance float64 `json:"relevance"`
+}
+
+// ChatTopicSearchResponse is returned by POST /api/chats/search.
+type ChatTopicSearchResponse struct {
+	Results []ChatWithScoreResponse `json:"results"`
+	Total   int                     `json:"total"`
+}
+
+// ---- Similar messages ---------------------------------------------------
+
+// MessageWithScoreResponse is a message paired with a distance score.
+type MessageWithScoreResponse struct {
+	ID         string    `json:"id"`
+	ChatJID    string    `json:"chat_jid"`
+	Content    string    `json:"content"`
+	Timestamp  time.Time `json:"timestamp"`
+	SenderName string    `json:"sender_name"`
+	Distance   float64   `json:"distance"`
+}
+
+// SimilarMessagesResponse is returned by GET /api/messages/{id}/similar.
+type SimilarMessagesResponse struct {
+	Results []MessageWithScoreResponse `json:"results"`
+	Total   int                        `json:"total"`
+}
+
+// ---- Compact messages ---------------------------------------------------
+
+// CompactMessageResponse is a reduced-field message projection
+// for token-efficient context windows. Used when ?compact=true.
+type CompactMessageResponse struct {
+	ID          string `json:"id"`
+	SenderName  string `json:"name"`
+	Content     string `json:"text"`
+	Timestamp   string `json:"ts"`
+	QuotedMsgID string `json:"quoted_id,omitempty"`
+	QuotedBy    string `json:"quoted_by,omitempty"`
+}
+
+// ---- Embeddings ---------------------------------------------------------
+
+// UpsertEmbeddingRequest is the payload for PUT /api/messages/{id}/embedding.
+type UpsertEmbeddingRequest struct {
+	ChatJID   string    `json:"chat_jid"`
+	Embedding []float32 `json:"embedding"`
 }

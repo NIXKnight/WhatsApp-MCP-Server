@@ -5,9 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -31,14 +30,11 @@ type Client struct {
 // NewClient initialises the whatsmeow device store, creates the whatsmeow
 // client, attaches event handlers, and prepares (but does not start) the
 // connection state machine.
-func NewClient(dataDir string, store *Store, log *slog.Logger) (*Client, error) {
+func NewClient(databaseURL string, dataDir string, store *Store, log *slog.Logger) (*Client, error) {
 	waLogger := newWALogger(log)
 	dbLog := newWALogger(log.With("component", "wastore"))
 
-	deviceStorePath := filepath.Join(dataDir, "whatsapp.db")
-	deviceDSN := fmt.Sprintf("file:%s?_foreign_keys=on", deviceStorePath)
-
-	container, err := sqlstore.New(context.Background(), "sqlite3", deviceDSN, dbLog)
+	container, err := sqlstore.New(context.Background(), "pgx", databaseURL, dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("open whatsapp device store: %w", err)
 	}

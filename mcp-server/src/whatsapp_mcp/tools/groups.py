@@ -1,10 +1,11 @@
 """Group-related MCP tools.
 
-Provides three tools:
+Provides four tools:
 
 * :func:`list_groups` — List all group chats the account belongs to.
 * :func:`get_group` — Fetch full metadata for a single group including participants.
 * :func:`send_group_message` — Send a plain-text message to a group chat.
+* :func:`send_auto_message` — Send a message to any JID, auto-routing to individual or group.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def register_group_tools(mcp: FastMCP) -> None:
         """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
         result = await bridge.get("/api/groups")
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
 
     # ------------------------------------------------------------------
     # get_group
@@ -85,7 +86,7 @@ def register_group_tools(mcp: FastMCP) -> None:
 
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
         result = await bridge.get(f"/api/groups/{jid}")
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
 
     # ------------------------------------------------------------------
     # send_group_message
@@ -138,6 +139,48 @@ def register_group_tools(mcp: FastMCP) -> None:
                 "Example: 120363039783372408@g.us"
             )
 
+        bridge: BridgeClient = ctx.lifespan_context["bridge"]
+
+        payload: dict = {"to": jid, "text": text}
+        if quoted_message_id:
+            payload["quotedMessageId"] = quoted_message_id
+        if quoted_participant:
+            payload["quotedParticipant"] = quoted_participant
+        if mentions:
+            payload["mentions"] = mentions
+
+        result = await bridge.post("/api/send", json=payload)
+        return json.dumps(result)
+
+    # ------------------------------------------------------------------
+    # send_auto_message
+    # ------------------------------------------------------------------
+
+    @mcp.tool
+    async def send_auto_message(
+        ctx: Context,
+        jid: str,
+        text: str,
+        quoted_message_id: str | None = None,
+        quoted_participant: str | None = None,
+        mentions: list[str] | None = None,
+    ) -> str:
+        """Send a message to any WhatsApp JID, auto-routing based on suffix.
+
+        Works for both individual contacts (@s.whatsapp.net) and groups
+        (@g.us). Bare phone numbers are treated as individual contacts.
+
+        Args:
+            ctx: FastMCP context.
+            jid: Any WhatsApp JID — individual, group, or bare phone number.
+            text: Message body to send. Must be non-empty.
+            quoted_message_id: Optional message ID to reply or quote.
+            quoted_participant: Optional JID of the quoted message sender.
+            mentions: Optional list of JIDs to tag in the message.
+
+        Returns:
+            JSON string with {"id": "...", "timestamp": "..."} on success.
+        """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
 
         payload: dict = {"to": jid, "text": text}

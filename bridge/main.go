@@ -100,14 +100,14 @@ func main() {
 	}
 
 	// ---- Message store -----------------------------------------------------
-	store, err := bridge.NewStore(cfg.DataDir, log.With("component", "store"))
+	store, err := bridge.NewStore(cfg.DatabaseURL, log.With("component", "store"))
 	if err != nil {
 		log.Error("failed to open message store", "err", err)
 		os.Exit(1)
 	}
 
 	// ---- WhatsApp client ---------------------------------------------------
-	client, err := bridge.NewClient(cfg.DataDir, store, log.With("component", "client"))
+	client, err := bridge.NewClient(cfg.DatabaseURL, cfg.DataDir, store, log.With("component", "client"))
 	if err != nil {
 		log.Error("failed to create WhatsApp client", "err", err)
 		store.Close()

@@ -1,9 +1,7 @@
 # ---------------------------------------------------------------------------
-# Build stage: compile the Go binary with CGO enabled (required by go-sqlite3)
+# Build stage: compile the Go binary (pure Go, no CGO dependencies)
 # ---------------------------------------------------------------------------
 FROM golang:1.25-alpine AS builder
-
-RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /build
 
@@ -13,16 +11,16 @@ RUN go mod download
 
 # Copy source and build
 COPY . .
-RUN CGO_ENABLED=1 go build -o whatsapp-bridge .
+RUN CGO_ENABLED=0 go build -o whatsapp-bridge .
 
 # ---------------------------------------------------------------------------
 # Runtime stage: minimal Alpine image with only the compiled binary
 # ---------------------------------------------------------------------------
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates sqlite-libs
+RUN apk add --no-cache ca-certificates tzdata
 
-# Data directory for SQLite database and media storage (writable by any UID)
+# Data directory for media storage (writable by any UID)
 RUN mkdir /data && chmod 777 /data
 
 COPY --from=builder /build/whatsapp-bridge /usr/local/bin/whatsapp-bridge

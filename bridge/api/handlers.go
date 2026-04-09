@@ -66,7 +66,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 // ---- GET /api/messages --------------------------------------------------
 
 // ListMessages returns messages with optional filters: chat_jid, sender,
-// after (Unix ms), before (Unix ms), query, limit, page.
+// after (Unix ms), before (Unix ms), query, search_mode, limit, page.
 func (h *Handler) ListMessages(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit := intParam(q.Get("limit"), 50, 1, 500)
@@ -89,20 +89,42 @@ func (h *Handler) ListMessages(w http.ResponseWriter, r *http.Request) {
 
 	sender := q.Get("sender")
 
+	searchMode := q.Get("search_mode")
+	if searchMode == "" {
+		searchMode = "ilike"
+	}
+
 	params := bridge.QueryMessagesParams{
-		ChatJID: chatJID,
-		Sender:  sender,
-		After:   after,
-		Before:  before,
-		Query:   q.Get("query"),
-		Limit:   limit,
-		Offset:  offset,
+		ChatJID:    chatJID,
+		Sender:     sender,
+		After:      after,
+		Before:     before,
+		Query:      q.Get("query"),
+		SearchMode: searchMode,
+		Limit:      limit,
+		Offset:     offset,
 	}
 
 	msgs, err := h.store.ListMessages(params)
 	if err != nil {
 		h.log.Error("list messages", "err", err)
 		writeError(w, http.StatusInternalServerError, "failed to query messages", "DB_ERROR")
+		return
+	}
+
+	if q.Get("compact") == "true" {
+		compact := make([]CompactMessageResponse, len(msgs))
+		for i, m := range msgs {
+			compact[i] = CompactMessageResponse{
+				ID:          m.ID,
+				SenderName:  m.SenderName,
+				Content:     m.Content,
+				Timestamp:   m.Timestamp.Format(time.RFC3339),
+				QuotedMsgID: m.QuotedMessageID,
+				QuotedBy:    m.QuotedParticipant,
+			}
+		}
+		writeJSON(w, http.StatusOK, compact)
 		return
 	}
 
@@ -150,6 +172,107 @@ func (h *Handler) MessageContext(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---- GET /api/messages/{id}/similar -------------------------------------
+
+// SimilarMessages returns messages with embeddings closest to the specified message.
+func (h *Handler) SimilarMessages(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	chatJID := r.URL.Query().Get("chat_jid")
+	if chatJID == "" {
+		writeError(w, http.StatusBadRequest, "chat_jid query parameter required", "MISSING_PARAM")
+		return
+	}
+	if !jidRe.MatchString(chatJID) {
+		writeError(w, http.StatusBadRequest, "invalid chat_jid format", "INVALID_JID")
+		return
+	}
+
+	limit := intParam(r.URL.Query().Get("limit"), 10, 1, 100)
+
+	results, err := h.store.FindSimilarMessages(id, chatJID, limit)
+	if err != nil {
+		h.log.Error("similar messages", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to find similar messages", "DB_ERROR")
+		return
+	}
+
+	out := make([]MessageWithScoreResponse, len(results))
+	for i, r := range results {
+		out[i] = MessageWithScoreResponse{
+			ID:         r.ID,
+			ChatJID:    r.ChatJID,
+			Content:    r.Content,
+			Timestamp:  r.Timestamp,
+			SenderName: r.SenderName,
+			Distance:   r.Distance,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, SimilarMessagesResponse{
+		Results: out,
+		Total:   len(out),
+	})
+}
+
+// ---- POST /api/search ---------------------------------------------------
+
+// HybridSearch performs RRF over FTS and/or vector embeddings.
+// Accepts JSON body: {"query":"...","embedding":[...],"chat_jid":"...","limit":20}
+func (h *Handler) HybridSearch(w http.ResponseWriter, r *http.Request) {
+	var req HybridSearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON")
+		return
+	}
+
+	if req.Query == "" && len(req.Embedding) == 0 {
+		writeError(w, http.StatusBadRequest, "at least one of query or embedding is required", "MISSING_FIELD")
+		return
+	}
+	if len(req.Embedding) > 0 && len(req.Embedding) != 1536 {
+		writeError(w, http.StatusBadRequest, "embedding must have exactly 1536 dimensions", "INVALID_EMBEDDING")
+		return
+	}
+	if req.ChatJID != "" && !jidRe.MatchString(req.ChatJID) {
+		writeError(w, http.StatusBadRequest, "invalid chat_jid format", "INVALID_JID")
+		return
+	}
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	results, err := h.store.SearchHybrid(req.Query, req.Embedding, req.ChatJID, limit)
+	if err != nil {
+		h.log.Error("hybrid search", "err", err)
+		writeError(w, http.StatusInternalServerError, "search failed", "DB_ERROR")
+		return
+	}
+
+	out := make([]SearchResultResponse, len(results))
+	for i, sr := range results {
+		out[i] = SearchResultResponse{
+			ID:         sr.ID,
+			ChatJID:    sr.ChatJID,
+			Content:    sr.Content,
+			Timestamp:  sr.Timestamp,
+			SenderName: sr.SenderName,
+			Score:      sr.Score,
+			Snippet:    sr.Snippet,
+			MatchType:  sr.MatchType,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, HybridSearchResponse{
+		Results: out,
+		Total:   len(out),
+	})
+}
+
 // ---- GET /api/chats -----------------------------------------------------
 
 // ListChats returns all chats with optional name search and pagination.
@@ -171,6 +294,55 @@ func (h *Handler) ListChats(w http.ResponseWriter, r *http.Request) {
 		Total:  len(chats),
 		Limit:  limit,
 		Offset: offset,
+	})
+}
+
+// ---- POST /api/chats/search ---------------------------------------------
+
+// SearchChatsByTopic returns chats ranked by cosine similarity to the provided
+// topic embedding. Accepts JSON body: {"embedding":[...],"limit":10}
+func (h *Handler) SearchChatsByTopic(w http.ResponseWriter, r *http.Request) {
+	var req ChatTopicSearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON")
+		return
+	}
+
+	if len(req.Embedding) == 0 {
+		writeError(w, http.StatusBadRequest, "embedding is required", "MISSING_FIELD")
+		return
+	}
+	if len(req.Embedding) != 1536 {
+		writeError(w, http.StatusBadRequest, "embedding must have exactly 1536 dimensions", "INVALID_EMBEDDING")
+		return
+	}
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	results, err := h.store.SearchChatsByTopic(req.Embedding, limit)
+	if err != nil {
+		h.log.Error("chat topic search", "err", err)
+		writeError(w, http.StatusInternalServerError, "search failed", "DB_ERROR")
+		return
+	}
+
+	out := make([]ChatWithScoreResponse, len(results))
+	for i, cs := range results {
+		out[i] = ChatWithScoreResponse{
+			ChatResponse: toChatResponse(cs.ChatRow),
+			Relevance:    cs.Relevance,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, ChatTopicSearchResponse{
+		Results: out,
+		Total:   len(out),
 	})
 }
 
@@ -212,6 +384,46 @@ func (h *Handler) ListContacts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ContactsResponse{
 		Contacts: toContactResponses(contacts),
 		Total:    len(contacts),
+	})
+}
+
+// ---- GET /api/contacts/similar ------------------------------------------
+
+// SimilarContacts returns pairs of contacts with similar name embeddings.
+func (h *Handler) SimilarContacts(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	thresholdStr := q.Get("threshold")
+	threshold := 0.85
+	if thresholdStr != "" {
+		if v, err := strconv.ParseFloat(thresholdStr, 64); err == nil && v >= 0 && v <= 1 {
+			threshold = v
+		}
+	}
+
+	limit := intParam(q.Get("limit"), 20, 1, 200)
+
+	pairs, err := h.store.FindSimilarContacts(threshold, limit)
+	if err != nil {
+		h.log.Error("similar contacts", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to find similar contacts", "DB_ERROR")
+		return
+	}
+
+	out := make([]SimilarContactPairResponse, len(pairs))
+	for i, p := range pairs {
+		out[i] = SimilarContactPairResponse{
+			JIDA:       p.JIDA,
+			NameA:      p.NameA,
+			JIDB:       p.JIDB,
+			NameB:      p.NameB,
+			Similarity: p.Similarity,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, SimilarContactsResponse{
+		Pairs: out,
+		Total: len(out),
 	})
 }
 
@@ -415,7 +627,16 @@ func (h *Handler) CheckNewMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msgs, err := h.store.ListMessagesSince(since, chatJID, limit)
+	var msgs []bridge.MessageRow
+	var err error
+
+	jidsParam := q.Get("jids")
+	if jidsParam != "" {
+		jids := strings.Split(jidsParam, ",")
+		msgs, err = h.store.ListMessagesSinceMultiChat(since, jids, limit)
+	} else {
+		msgs, err = h.store.ListMessagesSince(since, chatJID, limit)
+	}
 	if err != nil {
 		h.log.Error("check new messages", "err", err)
 		writeError(w, http.StatusInternalServerError, "failed to query messages", "DB_ERROR")
@@ -635,6 +856,37 @@ func (h *Handler) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---- PUT /api/messages/{id}/embedding -----------------------------------
+
+// UpsertEmbedding stores or replaces the vector embedding for a message.
+// Accepts JSON body: {"chat_jid":"...","embedding":[...1536 floats...]}
+func (h *Handler) UpsertEmbedding(w http.ResponseWriter, r *http.Request) {
+	messageID := chi.URLParam(r, "id")
+	if messageID == "" {
+		writeError(w, http.StatusBadRequest, "message ID required", "MISSING_ID")
+		return
+	}
+
+	var req UpsertEmbeddingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body", "BAD_REQUEST")
+		return
+	}
+
+	if req.ChatJID == "" {
+		writeError(w, http.StatusBadRequest, "chat_jid required", "MISSING_CHAT_JID")
+		return
+	}
+	if len(req.Embedding) != 1536 {
+		writeError(w, http.StatusBadRequest, "embedding must have 1536 dimensions", "BAD_EMBEDDING")
+		return
+	}
+
+	// Note: The store method for upserting embeddings will be added in a future PR.
+	// For now, return 501 Not Implemented.
+	writeError(w, http.StatusNotImplemented, "embedding storage not yet implemented", "NOT_IMPLEMENTED")
+}
+
 // ---- Conversion helpers -------------------------------------------------
 
 func toMessageResponse(m bridge.MessageRow) MessageResponse {
@@ -653,6 +905,7 @@ func toMessageResponse(m bridge.MessageRow) MessageResponse {
 		PushName:          m.PushName,
 		QuotedMessageID:   m.QuotedMessageID,
 		QuotedParticipant: m.QuotedParticipant,
+		Snippet:           m.Snippet,
 	}
 }
 

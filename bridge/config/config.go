@@ -13,8 +13,10 @@ import (
 type Config struct {
 	// Addr is the TCP address to bind the HTTP server to (default: 127.0.0.1:8080).
 	Addr string
-	// DataDir is the directory for SQLite databases and downloaded media.
+	// DataDir is the directory for media file storage.
 	DataDir string
+	// DatabaseURL is the PostgreSQL connection string (required).
+	DatabaseURL string
 	// LogLevel controls slog output verbosity (debug, info, warn, error).
 	LogLevel slog.Level
 }
@@ -26,6 +28,11 @@ func Load() (*Config, error) {
 	addr := getEnv("BRIDGE_ADDR", "127.0.0.1:8080")
 	dataDir := getEnv("BRIDGE_DATA_DIR", "./data")
 	logLevelStr := getEnv("BRIDGE_LOG_LEVEL", "info")
+
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL environment variable is required")
+	}
 
 	logLevel, err := parseLogLevel(logLevelStr)
 	if err != nil {
@@ -52,9 +59,10 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		Addr:     addr,
-		DataDir:  absDataDir,
-		LogLevel: logLevel,
+		Addr:        addr,
+		DataDir:     absDataDir,
+		DatabaseURL: databaseURL,
+		LogLevel:    logLevel,
 	}, nil
 }
 

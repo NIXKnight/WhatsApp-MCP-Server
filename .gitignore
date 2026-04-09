@@ -18,3 +18,4 @@ mcp-server/*.egg-info/
 .eggs/
 dist/
 build/
+bridge/whatsapp-bridge
