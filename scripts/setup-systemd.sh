@@ -44,6 +44,7 @@ WorkingDirectory=%h/.local/share/whatsapp-bridge
 Environment=BRIDGE_DATA_DIR=%h/.local/share/whatsapp-bridge/data
 Environment=BRIDGE_ADDR=127.0.0.1:8080
 Environment=BRIDGE_LOG_LEVEL=info
+Environment=EMBEDDER_URL=http://127.0.0.1:8000
 EnvironmentFile=-%h/.config/whatsapp-bridge/env
 Restart=on-failure
 RestartSec=5
@@ -110,6 +111,7 @@ Type=simple
 ExecStart=${REPO_ROOT}/embedder/.venv/bin/python -m whatsapp_embedder
 WorkingDirectory=${REPO_ROOT}/embedder
 Environment=EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+Environment=EMBED_HTTP_ADDR=127.0.0.1:8000
 EnvironmentFile=-%h/.config/whatsapp-bridge/env
 Restart=on-failure
 RestartSec=5

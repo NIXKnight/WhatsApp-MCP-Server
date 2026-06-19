@@ -21,6 +21,7 @@ services:
       BRIDGE_ADDR: "0.0.0.0:8080"
       BRIDGE_DATA_DIR: "/data"
       DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
+      EMBEDDER_URL: "http://embedder:8000"
     volumes:
       - bridge-data:/data
       - ${WORKSPACE_PATH:-./workspace}:/workspace
@@ -63,6 +64,9 @@ services:
       EMBEDDING_MODEL: "${EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}"
       EMBED_BATCH_SIZE: "${EMBED_BATCH_SIZE:-100}"
       EMBED_POLL_INTERVAL: "${EMBED_POLL_INTERVAL:-30}"
+      # Bind all interfaces inside the container so the bridge can reach it over
+      # the compose network. NOT published to the host (internal network only).
+      EMBED_HTTP_ADDR: "0.0.0.0:8000"
       HF_HOME: "/home/bridge/.cache/huggingface"
     volumes:
       - embedder-cache:/home/bridge/.cache/huggingface
