@@ -30,6 +30,19 @@ This worker issues no DDL — it only reads/writes the `messages_media` table.
 
 The connection runs in **autocommit** mode to avoid idle-in-transaction.
 
+## On-demand video analysis
+
+Alongside the poll loop the worker exposes a stdlib HTTP server for on-demand
+video extraction (the visual verdict is the caller's job — this only does the
+mechanical work): `POST /analyze {"chat_jid","message_id"}` downloads the video
+via the bridge, samples keyframes (1 fps, capped at 8) and demuxes the audio
+with ffmpeg, transcribes the WAV via Whisper, and returns
+`{"frame_paths":[...abs...],"transcription":"...","duration":<float>,"frame_count":<int>}`;
+`GET /health` returns `{"status":"ok"}`. Bind via `ANALYZER_HTTP_ADDR` (default
+`127.0.0.1:8500`); a bind failure is logged but never stops the poll loop. The
+endpoint is stateless and never touches the poll loop's DB connection. Videos
+longer than 600s are rejected (`422`).
+
 ## Config
 
 | Env | Default | Meaning |
@@ -42,7 +55,8 @@ The connection runs in **autocommit** mode to avoid idle-in-transaction.
 | `WHISPER_LANGUAGE` | `ur` | Forced transcription language |
 | `TRANSCRIBE_BATCH_SIZE` | `20` | Rows per cycle |
 | `TRANSCRIBE_POLL_INTERVAL` | `30` | Seconds between polls when idle |
-| `REDOWNLOAD_DIR` | `/data` | Shared dir for re-downloaded media |
+| `REDOWNLOAD_DIR` | `/data` | Shared dir for re-downloaded media + extracted frames/audio |
+| `ANALYZER_HTTP_ADDR` | `127.0.0.1:8500` | `/analyze` + `/health` HTTP bind address |
 
 Whisper is an **external host process** — point `WHISPER_URL` at it; no Whisper
 container is bundled.

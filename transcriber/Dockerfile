@@ -29,6 +29,10 @@ ENV DATABASE_URL=""
 ENV BRIDGE_URL="http://bridge:8080"
 ENV WHISPER_URL="http://127.0.0.1:8443"
 
+# Auxiliary on-demand /analyze + /health HTTP server (video keyframes + audio
+# transcript). Loopback by default; override ANALYZER_HTTP_ADDR to publish.
+EXPOSE 8500
+
 USER bridge
 
 ENTRYPOINT ["python", "-m", "whatsapp_transcriber"]

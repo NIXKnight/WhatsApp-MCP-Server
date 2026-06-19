@@ -31,6 +31,19 @@ Target schema (bridge-owned ``messages_media``):
 Usage:
     whatsapp-transcriber --pg "$DATABASE_URL" --whisper-url "$WHISPER_URL"
 
+On-demand video analysis:
+    Besides the poll loop, the worker exposes a small standard-library HTTP
+    server for on-demand video extraction (the visual verdict is the caller's
+    job — this only does the mechanical work):
+        POST /analyze {"chat_jid": "...", "message_id": "..."}
+            -> {"frame_paths": [...abs...], "transcription": "...",
+                "duration": <float>, "frame_count": <int>}
+        GET  /health  -> {"status": "ok"}
+    It downloads the video via the bridge, samples keyframes (1 fps) and demuxes
+    the audio with ffmpeg, transcribes the WAV with the same Whisper call, and
+    returns the frame paths + transcript. It is stateless and never touches the
+    poll loop's DB connection.
+
 Environment variables (CLI args take precedence):
     DATABASE_URL        - PostgreSQL DSN (bridge convention; required)
     PG_DSN              - fallback DSN if DATABASE_URL is unset
@@ -40,16 +53,23 @@ Environment variables (CLI args take precedence):
                           audio to ``{WHISPER_URL}/inference``
     TRANSCRIBE_BATCH_SIZE    - rows per cycle (default: 20)
     TRANSCRIBE_POLL_INTERVAL - seconds between polls when idle (default: 30)
+    ANALYZER_HTTP_ADDR  - /analyze + /health bind address (default: 127.0.0.1:8500)
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
+import json
 import logging
 import os
+import re
 import signal
+import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import FrameType
 
 import httpx
@@ -65,6 +85,16 @@ MAX_DOWNLOAD_ATTEMPTS = 8
 MAX_BACKOFF = 300  # 5 minutes
 RECONNECT_BACKOFF = 5
 TRANSCRIBE_TIMEOUT = 300  # generous: whisper.cpp on a long voice note
+
+# --- On-demand video analysis (auxiliary HTTP endpoint) -------------------
+# Bind address for the auxiliary /analyze + /health server. Loopback by
+# default so the extraction endpoint is not exposed off-host.
+DEFAULT_ANALYZER_HTTP_ADDR = "127.0.0.1:8500"
+# Caps for the mechanical extraction: keep work bounded so an accidental call
+# on a multi-hour video cannot wedge ffmpeg or fill the disk.
+ANALYZE_MAX_DURATION_S = 600  # reject videos longer than 10 minutes
+ANALYZE_MAX_FRAMES = 8        # at fps=1, the first N seconds as keyframes
+FFMPEG_TIMEOUT = 300          # ceiling on any single ffmpeg/ffprobe call
 
 # Sentinel: a present-but-unprocessable audio file (server rejects the input as
 # undecodable). Distinct from None (transient server failure -> retry) so the
@@ -277,6 +307,324 @@ def redownload_audio(msg_id: str, chat_jid: str, bridge_url: str) -> tuple[str |
         return (None, f"request_error: {e}")
 
 
+def _run_ffmpeg(args: list[str], what: str) -> tuple[bool, str]:
+    """Run an ffmpeg/ffprobe command (list-form, no shell) with a timeout.
+
+    ``-nostdin`` is included by callers so ffmpeg never blocks waiting on a
+    controlling terminal. stdout/stderr are captured (not streamed) so request
+    bodies / file contents never reach the access log. Returns (ok, stderr_tail)
+    where stderr_tail is bounded and safe to log (ffmpeg diagnostics only — no
+    secrets, no message content).
+    """
+    try:
+        proc = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=FFMPEG_TIMEOUT,
+            check=False,
+        )
+    except FileNotFoundError:
+        return (False, f"{what}: binary not found")
+    except subprocess.TimeoutExpired:
+        return (False, f"{what}: timed out after {FFMPEG_TIMEOUT}s")
+    if proc.returncode != 0:
+        tail = (proc.stderr or b"").decode("utf-8", "replace")[-500:]
+        return (False, f"{what}: exit {proc.returncode}: {tail}")
+    return (True, "")
+
+
+def probe_duration(path: str) -> float:
+    """Return the media duration in seconds via ``ffprobe``, or 0.0 if unknown.
+
+    ``ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1``
+    prints just the bare float. A missing/garbage value (some containers omit a
+    format-level duration) maps to 0.0 — the caller treats 0.0 as "unknown",
+    not "instant", so it neither rejects nor trusts a phantom length.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nk=1:nw=1",
+                path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=FFMPEG_TIMEOUT,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0.0
+    raw = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
+def extract_frames(video: str, out_dir: str, max_frames: int) -> list[str]:
+    """Sample up to ``max_frames`` keyframes (1 fps) as JPEGs into ``out_dir``.
+
+    ``ffmpeg -nostdin -y -i <video> -vf fps=1 -frames:v <max_frames> -q:v 3
+    <out_dir>/frame_%03d.jpg`` — one frame per second, capped, JPEG quality 3.
+    Returns the SORTED list of files actually produced (ffmpeg may emit fewer
+    than ``max_frames`` for a short clip). A non-zero exit still returns
+    whatever frames landed on disk, so a partial extraction is usable.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    pattern = os.path.join(out_dir, "frame_%03d.jpg")
+    ok, err = _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            video,
+            "-vf",
+            "fps=1",
+            "-frames:v",
+            str(max_frames),
+            "-q:v",
+            "3",
+            pattern,
+        ],
+        "extract_frames",
+    )
+    if not ok:
+        logger.warning("frame extraction issue: %s", err)
+    return sorted(glob.glob(os.path.join(out_dir, "frame_*.jpg")))
+
+
+def extract_audio_wav(video: str, out_dir: str) -> str | None:
+    """Demux the audio track to 16 kHz mono WAV (whisper.cpp's native rate).
+
+    ``ffmpeg -nostdin -y -i <video> -vn -ac 1 -ar 16000 <out_dir>/audio.wav``.
+    Returns the WAV path on success, or None when the video carries no audio
+    stream / ffmpeg fails (a silent or video-only clip is not an error — the
+    caller returns an empty transcript).
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    wav = os.path.join(out_dir, "audio.wav")
+    ok, err = _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            video,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            wav,
+        ],
+        "extract_audio_wav",
+    )
+    if not ok or not os.path.isfile(wav):
+        logger.warning("audio extraction issue: %s", err)
+        return None
+    return wav
+
+
+def analyze_video(
+    chat_jid: str,
+    message_id: str,
+    bridge_url: str,
+    whisper_url: str,
+) -> dict:
+    """Download a video and mechanically extract keyframes + an audio transcript.
+
+    Pipeline (all stateless — no DB, no shared connection):
+      1. Re-download the media via the bridge (``redownload_audio`` is media-type
+         agnostic; it returns the on-disk path of any downloaded media).
+      2. ``probe_duration``; reject anything longer than ``ANALYZE_MAX_DURATION_S``.
+      3. ``extract_frames`` (1 fps, capped at ``ANALYZE_MAX_FRAMES``).
+      4. ``extract_audio_wav`` then ``transcribe_file`` on the WAV.
+
+    Returns a dict that is the wire contract:
+        {"frame_paths": [<abs str>...], "transcription": <str>,
+         "duration": <float>, "frame_count": <int>}
+    On a hard failure (download produced nothing) returns
+        {"error": <str>, "status": <int>}
+    so the handler can map it to a 4xx/5xx. Soft failures (no audio, transcript
+    timeout, partial frames) degrade gracefully into the success shape with an
+    empty transcript and whatever frames were produced.
+    """
+    if not chat_jid or not message_id:
+        return {"error": "chat_jid and message_id are required", "status": 400}
+
+    # 1. Download the video bytes via the bridge. The function name says "audio"
+    #    but it POSTs {message_id, chat_jid} and returns any media's path.
+    local_path, err = redownload_audio(message_id, chat_jid, bridge_url)
+    if not local_path or not os.path.isfile(local_path):
+        # Hard failure: nothing to extract from.
+        return {"error": f"download failed: {err or 'no file path returned'}", "status": 502}
+
+    # 2. Duration gate. 0.0 == unknown (container omitted it) -> allow.
+    duration = probe_duration(local_path)
+    if duration > ANALYZE_MAX_DURATION_S:
+        return {
+            "error": (
+                f"video too long: {duration:.0f}s exceeds "
+                f"{ANALYZE_MAX_DURATION_S}s cap"
+            ),
+            "status": 422,
+        }
+
+    # Write frames + extracted audio NEXT TO the downloaded video, in the
+    # directory the bridge already wrote it into. That directory is guaranteed
+    # writable (the bridge just created the file there; under systemd both run
+    # as the same user, under compose both share the bridge-data volume). This
+    # avoids depending on a separate REDOWNLOAD_DIR/DEFAULT_DATA_ROOT that may
+    # point at a non-existent, non-writable container path (e.g. /data) on a
+    # systemd-from-source host.
+    safe_message_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(message_id))
+    out_dir = os.path.join(os.path.dirname(local_path), f"analyze_{safe_message_id}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 3. Frames. extract_frames returns whatever landed even on partial failure.
+    frame_paths = [os.path.abspath(p) for p in extract_frames(local_path, out_dir, ANALYZE_MAX_FRAMES)]
+
+    # 4. Audio -> transcript. Any failure here yields an empty transcript rather
+    #    than failing the whole call (the frames are still useful).
+    transcription = ""
+    wav = extract_audio_wav(local_path, out_dir)
+    if wav:
+        result = transcribe_file(wav, whisper_url)
+        if isinstance(result, str):
+            transcription = result
+        # None (transient) / UNPROCESSABLE (undecodable) -> leave transcript "".
+
+    return {
+        "frame_paths": frame_paths,
+        "transcription": transcription,
+        "duration": duration,
+        "frame_count": len(frame_paths),
+    }
+
+
+def make_analyze_handler(
+    bridge_url: str, whisper_url: str
+) -> type[BaseHTTPRequestHandler]:
+    """Build a request handler bound to the bridge/whisper URLs.
+
+    The handler is fully stateless: it only calls ``analyze_video`` (download +
+    ffmpeg + Whisper over HTTP). It never touches the poll loop's psycopg2
+    connection (psycopg2 connections are not thread-safe). Access logging is
+    suppressed because request bodies carry ``chat_jid``/``message_id`` and must
+    never reach the log (§14).
+    """
+
+    class AnalyzeHandler(BaseHTTPRequestHandler):
+        def _send_json(self, code: int, payload: dict) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args) -> None:
+            # Suppress the default stderr access log: request lines would echo
+            # chat_jid/message_id and we must never log message identifiers (§14).
+            return
+
+        def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+            try:
+                if self.path != "/analyze":
+                    self._send_json(404, {"error": "not found"})
+                    return
+
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except (ValueError, UnicodeDecodeError):
+                    self._send_json(400, {"error": "invalid JSON body"})
+                    return
+                if not isinstance(payload, dict):
+                    self._send_json(400, {"error": "body must be a JSON object"})
+                    return
+
+                chat_jid = payload.get("chat_jid")
+                message_id = payload.get("message_id")
+                if not isinstance(chat_jid, str) or not chat_jid:
+                    self._send_json(400, {"error": "missing or empty 'chat_jid'"})
+                    return
+                if not isinstance(message_id, str) or not message_id:
+                    self._send_json(400, {"error": "missing or empty 'message_id'"})
+                    return
+
+                result = analyze_video(
+                    chat_jid, message_id, bridge_url, whisper_url
+                )
+                if "error" in result:
+                    status = int(result.get("status", 500))
+                    self._send_json(status, {"error": result["error"]})
+                    return
+
+                self._send_json(200, result)
+            except Exception:
+                # Never let a handler exception kill the server thread. Do not
+                # log the request body (it carries chat_jid/message_id).
+                logger.exception("analyze request failed")
+                try:
+                    self._send_json(500, {"error": "analysis failed"})
+                except Exception:
+                    pass
+
+        def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+            try:
+                if self.path != "/health":
+                    self._send_json(404, {"error": "not found"})
+                    return
+                self._send_json(200, {"status": "ok"})
+            except Exception:
+                logger.exception("health request failed")
+
+    return AnalyzeHandler
+
+
+def start_analyze_server(bridge_url: str, whisper_url: str) -> None:
+    """Start the auxiliary /analyze + /health HTTP server in a daemon thread.
+
+    Bind address comes from ``ANALYZER_HTTP_ADDR`` (``host:port``, default
+    ``127.0.0.1:8500``). The server is auxiliary: a bind failure is logged but
+    must NOT stop the poll loop, which is the worker's primary function. The
+    thread is a daemon so process shutdown (the global ``running`` flag path) is
+    unaffected.
+    """
+    addr = os.environ.get("ANALYZER_HTTP_ADDR", DEFAULT_ANALYZER_HTTP_ADDR)
+    try:
+        host, _, port_str = addr.rpartition(":")
+        if not host or not port_str:
+            raise ValueError(f"expected host:port, got {addr!r}")
+        port = int(port_str)
+    except ValueError as e:
+        logger.error("invalid ANALYZER_HTTP_ADDR (%s); analyze http server disabled", e)
+        return
+
+    handler_cls = make_analyze_handler(bridge_url, whisper_url)
+    try:
+        httpd = ThreadingHTTPServer((host, port), handler_cls)
+    except OSError as e:
+        logger.error(
+            "analyze http server bind failed on %s (%s); continuing without it", addr, e
+        )
+        return
+
+    thread = threading.Thread(target=httpd.serve_forever, name="analyze-http", daemon=True)
+    thread.start()
+    logger.info("analyze http server listening on %s", addr)
+
+
 def update_transcription(
     pg_conn: "psycopg2.extensions.connection",
     msg_id: str,
@@ -331,6 +679,12 @@ def run_loop(
         bridge_url,
         poll_interval,
     )
+
+    # Auxiliary on-demand video-analysis endpoint (frames + audio transcript).
+    # Stateless (download + ffmpeg + Whisper); it never shares pg_conn. Bind
+    # failure logs but never blocks the poll loop below. Frames/audio are written
+    # next to the bridge-downloaded video, so no shared data-root env is needed.
+    start_analyze_server(bridge_url, whisper_url)
 
     while running:
         try:
