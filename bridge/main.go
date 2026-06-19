@@ -27,6 +27,7 @@ import (
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/api"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/client"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/config"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/embed"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
@@ -120,7 +121,8 @@ func main() {
 	// is reachable during QR code scanning. Docker health checks and other
 	// probes will get a 200 response with state=QR_WAITING instead of a
 	// "connection refused" error.
-	h := api.NewHandler(waClient, st, log.With("component", "api"))
+	embedder := embed.New(cfg.EmbedderURL, cfg.EmbedderTimeout)
+	h := api.NewHandler(waClient, st, embedder, log.With("component", "api"))
 	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"))
 
 	srvErrCh := make(chan error, 1)

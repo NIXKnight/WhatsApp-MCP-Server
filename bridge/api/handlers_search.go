@@ -32,6 +32,19 @@ func (h *Handler) HybridSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// When the caller supplies query text but no embedding, fetch one from the
+	// L3 embedder so the existing hybrid (FTS + vector) path runs. On failure we
+	// degrade gracefully: leave req.Embedding empty and let SearchHybrid fall
+	// back to FTS-only rather than erroring the request.
+	if req.Query != "" && len(req.Embedding) == 0 {
+		vec, err := h.embedder.Embed(r.Context(), req.Query)
+		if err != nil {
+			h.log.Warn("query embed failed; falling back to FTS-only", "err", err)
+		} else {
+			req.Embedding = vec
+		}
+	}
+
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 20

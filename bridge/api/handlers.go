@@ -7,23 +7,26 @@ import (
 	"time"
 
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/client"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/embed"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
-// Handler holds references to the bridge client and message store, providing
-// all REST endpoint handlers.
+// Handler holds references to the bridge client, message store, and embedder
+// client, providing all REST endpoint handlers.
 type Handler struct {
 	client    *client.Client
 	store     *store.Store
+	embedder  *embed.Client
 	log       *slog.Logger
 	startedAt time.Time
 }
 
-// NewHandler creates a Handler bound to the given client and store.
-func NewHandler(c *client.Client, s *store.Store, log *slog.Logger) *Handler {
+// NewHandler creates a Handler bound to the given client, store, and embedder.
+func NewHandler(c *client.Client, s *store.Store, e *embed.Client, log *slog.Logger) *Handler {
 	return &Handler{
 		client:    c,
 		store:     s,
+		embedder:  e,
 		log:       log,
 		startedAt: time.Now(),
 	}

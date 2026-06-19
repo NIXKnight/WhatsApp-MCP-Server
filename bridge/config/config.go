@@ -1,4 +1,4 @@
-// Package config provides environment-based configuration for the WhatsApp bridge.
+// Package config provides L2 environment-based configuration for the WhatsApp bridge.
 package config
 
 import (
@@ -7,7 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// defaultEmbedderTimeout bounds each query-time embedding request to the L3
+// embedder service. Search degrades to FTS-only when this deadline is exceeded,
+// so it is kept short to avoid stalling interactive searches.
+const defaultEmbedderTimeout = 2 * time.Second
 
 // Config holds all runtime configuration for the bridge.
 type Config struct {
@@ -19,6 +25,11 @@ type Config struct {
 	DatabaseURL string
 	// LogLevel controls slog output verbosity (debug, info, warn, error).
 	LogLevel slog.Level
+	// EmbedderURL is the base URL of the L3 embedder service used for
+	// query-time vector embeddings (default: http://embedder:8000).
+	EmbedderURL string
+	// EmbedderTimeout bounds each outbound embedding request.
+	EmbedderTimeout time.Duration
 }
 
 // Load reads configuration from environment variables, applying defaults for
@@ -28,6 +39,7 @@ func Load() (*Config, error) {
 	addr := getEnv("BRIDGE_ADDR", "127.0.0.1:8080")
 	dataDir := getEnv("BRIDGE_DATA_DIR", "./data")
 	logLevelStr := getEnv("BRIDGE_LOG_LEVEL", "info")
+	embedderURL := getEnv("EMBEDDER_URL", "http://embedder:8000")
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
@@ -59,10 +71,12 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		Addr:        addr,
-		DataDir:     absDataDir,
-		DatabaseURL: databaseURL,
-		LogLevel:    logLevel,
+		Addr:            addr,
+		DataDir:         absDataDir,
+		DatabaseURL:     databaseURL,
+		LogLevel:        logLevel,
+		EmbedderURL:     embedderURL,
+		EmbedderTimeout: defaultEmbedderTimeout,
 	}, nil
 }
 
