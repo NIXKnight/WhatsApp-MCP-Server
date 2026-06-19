@@ -1,7 +1,7 @@
 [project]
 name = "whatsapp-embedder"
 version = "0.1.0"
-description = "L3 enrichment worker: embeds WhatsApp messages into pgvector (message_embeddings, vector(384))"
+description = "L3 enrichment worker: embeds WhatsApp messages into pgvector (message_embeddings, vector(384)); also serves query embeddings over a small /embed + /health HTTP endpoint"
 requires-python = ">=3.11"
 dependencies = [
     "psycopg2-binary>=2.9",

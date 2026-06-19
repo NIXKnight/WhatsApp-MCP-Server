@@ -22,6 +22,19 @@ This worker issues no DDL — it only reads `messages` and writes
 
 The connection runs in **autocommit** mode to avoid idle-in-transaction.
 
+## Query-embed HTTP endpoint
+
+A standard-library HTTP server (no extra deps) runs in a daemon thread alongside
+the poll loop, serving query embeddings from the **same warm model** that
+produced the stored vectors (parity is the whole point):
+
+- `POST /embed` — body `{"text": "..."}` → `{"embedding": [..384 floats..]}`
+  (`400` on missing/empty `text`, `500` on encode failure).
+- `GET /health` — `{"status": "ok", "model": "<model>", "dim": 384}`.
+
+Bind address is `EMBED_HTTP_ADDR` (default `127.0.0.1:8000`). The endpoint is
+auxiliary: a bind failure is logged but never stops message embedding.
+
 ## Config
 
 | Env | Default | Meaning |
@@ -31,6 +44,7 @@ The connection runs in **autocommit** mode to avoid idle-in-transaction.
 | `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | sentence-transformers model (must be 384-dim) |
 | `EMBED_BATCH_SIZE` | `100` | Messages per batch |
 | `EMBED_POLL_INTERVAL` | `30` | Seconds between polls when idle |
+| `EMBED_HTTP_ADDR` | `127.0.0.1:8000` | Bind address for the `/embed` + `/health` server |
 
 ## Run
 

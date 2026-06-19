@@ -24,6 +24,10 @@ ENV PYTHONPATH="/app/src"
 ENV HF_HOME="/home/bridge/.cache/huggingface"
 ENV DATABASE_URL=""
 
+# Embedder HTTP endpoint (POST /embed, GET /health). Documentation only; the
+# bind address is controlled by EMBED_HTTP_ADDR at runtime.
+EXPOSE 8000
+
 USER bridge
 
 ENTRYPOINT ["python", "-m", "whatsapp_embedder"]
