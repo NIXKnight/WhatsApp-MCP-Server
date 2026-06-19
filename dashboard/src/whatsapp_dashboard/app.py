@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from whatsapp_dashboard import db
@@ -20,6 +21,7 @@ HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DASHBOARD_PORT", "9090"))
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+STATIC_DIR = Path(__file__).parent / "static"
 
 # Optional config.toml is supported only to surface a curated set of monitored
 # group JIDs. The target deployment configures the database through
@@ -52,6 +54,7 @@ def _load_watched_jids() -> list[str]:
 WATCHED_JIDS = _load_watched_jids()
 
 app = FastAPI(title="WhatsApp Bridge Dashboard")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 

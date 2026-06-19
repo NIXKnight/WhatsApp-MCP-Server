@@ -1,13 +1,13 @@
-<h2>Connection</h2>
+<h2><i class="fa-solid fa-plug" aria-hidden="true"></i>Connection</h2>
 <div class="stat">
     <span class="stat-label">State</span>
     <span class="stat-value">
         {% if status.is_connected %}
-        <span class="badge badge-green">{{ status.state }}</span>
+        <span class="badge badge-green"><i class="fa-solid fa-circle-check mr-1" aria-hidden="true"></i>{{ status.state }}</span>
         {% elif status.state == 'UNREACHABLE' %}
-        <span class="badge badge-red">UNREACHABLE</span>
+        <span class="badge badge-red"><i class="fa-solid fa-circle-xmark mr-1" aria-hidden="true"></i>UNREACHABLE</span>
         {% else %}
-        <span class="badge badge-yellow">{{ status.state }}</span>
+        <span class="badge badge-yellow"><i class="fa-solid fa-circle-exclamation mr-1" aria-hidden="true"></i>{{ status.state }}</span>
         {% endif %}
     </span>
 </div>
