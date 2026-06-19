@@ -21,6 +21,13 @@ import (
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/migrations"
 )
 
+// EmbeddingDim is the fixed dimensionality of all pgvector columns in the
+// schema (message_embeddings.embedding, chats.topic_embedding,
+// contacts.name_embedding). It matches the MiniLM enrichment embedder and the
+// vector(384) columns created by migration 000006. All embedding validation
+// must reference this constant so the API can never drift from the schema.
+const EmbeddingDim = 384
+
 // WriteOp is a single write operation submitted to the store's single-writer goroutine.
 type WriteOp struct {
 	fn   func(*sql.Tx) error

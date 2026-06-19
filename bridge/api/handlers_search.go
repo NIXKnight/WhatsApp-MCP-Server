@@ -2,7 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
 // ---- POST /api/search ---------------------------------------------------
@@ -20,8 +23,8 @@ func (h *Handler) HybridSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "at least one of query or embedding is required", "MISSING_FIELD")
 		return
 	}
-	if len(req.Embedding) > 0 && len(req.Embedding) != 1536 {
-		writeError(w, http.StatusBadRequest, "embedding must have exactly 1536 dimensions", "INVALID_EMBEDDING")
+	if len(req.Embedding) > 0 && len(req.Embedding) != store.EmbeddingDim {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("embedding must have exactly %d dimensions", store.EmbeddingDim), "INVALID_EMBEDDING")
 		return
 	}
 	if req.ChatJID != "" && !jidRe.MatchString(req.ChatJID) {
@@ -79,8 +82,8 @@ func (h *Handler) SearchChatsByTopic(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "embedding is required", "MISSING_FIELD")
 		return
 	}
-	if len(req.Embedding) != 1536 {
-		writeError(w, http.StatusBadRequest, "embedding must have exactly 1536 dimensions", "INVALID_EMBEDDING")
+	if len(req.Embedding) != store.EmbeddingDim {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("embedding must have exactly %d dimensions", store.EmbeddingDim), "INVALID_EMBEDDING")
 		return
 	}
 

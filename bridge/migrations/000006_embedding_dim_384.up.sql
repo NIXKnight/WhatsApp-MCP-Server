@@ -1,5 +1,5 @@
 -- Reconcile embedding dimension 1536 -> 384.
--- The enrichment embedder emits 384-dim MiniLM (all-MiniLM-L6-v2) vectors.
+-- The enrichment embedder emits 384-dim MiniLM (paraphrase-multilingual-MiniLM-L12-v2) vectors.
 -- No embeddings exist yet, so recreating the columns/tables and their HNSW
 -- indexes at vector(384) is non-destructive.
 

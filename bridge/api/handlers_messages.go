@@ -3,6 +3,7 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -265,7 +266,7 @@ func (h *Handler) CheckTriggers(w http.ResponseWriter, r *http.Request) {
 // ---- PUT /api/messages/{id}/embedding -----------------------------------
 
 // UpsertEmbedding stores or replaces the vector embedding for a message.
-// Accepts JSON body: {"chat_jid":"...","embedding":[...1536 floats...]}
+// Accepts JSON body: {"chat_jid":"...","embedding":[...384 floats...]}
 func (h *Handler) UpsertEmbedding(w http.ResponseWriter, r *http.Request) {
 	messageID := chi.URLParam(r, "id")
 	if messageID == "" {
@@ -283,8 +284,8 @@ func (h *Handler) UpsertEmbedding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "chat_jid required", "MISSING_CHAT_JID")
 		return
 	}
-	if len(req.Embedding) != 1536 {
-		writeError(w, http.StatusBadRequest, "embedding must have 1536 dimensions", "BAD_EMBEDDING")
+	if len(req.Embedding) != store.EmbeddingDim {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("embedding must have %d dimensions", store.EmbeddingDim), "BAD_EMBEDDING")
 		return
 	}
 
