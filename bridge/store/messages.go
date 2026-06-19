@@ -27,6 +27,11 @@ type MessageRow struct {
 	QuotedMessageID   string
 	QuotedParticipant string
 	Snippet           string
+	// Transcription is the voice-note / audio transcription from
+	// messages_media (LEFT JOIN). Empty for non-media or pending media.
+	Transcription string
+	// TranscribedAt is the transcription timestamp; zero when absent.
+	TranscribedAt time.Time
 }
 
 // QueryMessagesParams holds filter parameters for ListMessages.
@@ -43,12 +48,33 @@ type QueryMessagesParams struct {
 
 // CompactMessage holds a reduced set of fields for token-efficient context windows.
 type CompactMessage struct {
-	ID          string    `json:"id"`
-	SenderName  string    `json:"name"`
-	Content     string    `json:"text"`
-	Timestamp   time.Time `json:"ts"`
-	QuotedMsgID string    `json:"quoted_id,omitempty"`
+	ID            string    `json:"id"`
+	SenderName    string    `json:"name"`
+	Content       string    `json:"text"`
+	Timestamp     time.Time `json:"ts"`
+	QuotedMsgID   string    `json:"quoted_id,omitempty"`
+	Transcription string    `json:"transcription,omitempty"`
+	TranscribedAt time.Time `json:"transcribed_at,omitempty"`
 }
+
+// msgSelectCols is the qualified standard message column list. The base table
+// is aliased m; columns are qualified so a LEFT JOIN onto messages_media (mm)
+// cannot raise ambiguous-column errors for names shared by both tables
+// (chat_jid, media_type, filename, url, file_length, etc.).
+const msgSelectCols = `m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp, m.is_from_me, ` +
+	`m.media_type, m.filename, m.url, m.media_key, m.file_sha256, m.file_enc_sha256, ` +
+	`m.file_length, m.push_name, m.quoted_message_id, m.quoted_participant`
+
+// msgMediaCols are the two transcription columns appended after the snippet
+// column. COALESCE collapses both "no media row" and "pending" to '' so the
+// scan target is a plain string; transcribed_at stays nullable.
+const msgMediaCols = `COALESCE(mm.transcription, '') AS transcription, mm.transcribed_at`
+
+// msgFromJoin is the FROM clause with the 1:1 LEFT JOIN onto messages_media.
+// PK (message_id, chat_jid) guarantees at most one match, so the join never
+// fans out the message rows.
+const msgFromJoin = ` FROM messages m
+	 LEFT JOIN messages_media mm ON mm.message_id = m.id AND mm.chat_jid = m.chat_jid`
 
 // UpsertMessage inserts or replaces a message row. Messages with no content
 // and no media type are silently ignored.
@@ -96,16 +122,16 @@ func (s *Store) ListMessages(p QueryMessagesParams) ([]MessageRow, error) {
 	al := &argList{}
 
 	if p.ChatJID != "" {
-		where = append(where, "chat_jid = "+al.add(p.ChatJID))
+		where = append(where, "m.chat_jid = "+al.add(p.ChatJID))
 	}
 	if p.Sender != "" {
-		where = append(where, "sender = "+al.add(p.Sender))
+		where = append(where, "m.sender = "+al.add(p.Sender))
 	}
 	if !p.After.IsZero() {
-		where = append(where, "timestamp > "+al.add(p.After))
+		where = append(where, "m.timestamp > "+al.add(p.After))
 	}
 	if !p.Before.IsZero() {
-		where = append(where, "timestamp < "+al.add(p.Before))
+		where = append(where, "m.timestamp < "+al.add(p.Before))
 	}
 
 	useFTS := p.SearchMode == "fts" && p.Query != ""
@@ -114,21 +140,18 @@ func (s *Store) ListMessages(p QueryMessagesParams) ([]MessageRow, error) {
 
 	if useFTS {
 		queryParam := al.add(p.Query)
-		where = append(where, "content_fts @@ plainto_tsquery('simple', "+queryParam+")")
-		snippetExpr = "ts_headline('simple', content, plainto_tsquery('simple', " + queryParam + "), 'MaxWords=35,MinWords=15,MaxFragments=2') AS snippet"
-		orderBy = "ORDER BY ts_rank(content_fts, plainto_tsquery('simple', " + queryParam + ")) DESC"
+		where = append(where, "m.content_fts @@ plainto_tsquery('simple', "+queryParam+")")
+		snippetExpr = "ts_headline('simple', m.content, plainto_tsquery('simple', " + queryParam + "), 'MaxWords=35,MinWords=15,MaxFragments=2') AS snippet"
+		orderBy = "ORDER BY ts_rank(m.content_fts, plainto_tsquery('simple', " + queryParam + ")) DESC"
 	} else {
 		if p.Query != "" {
-			where = append(where, "content ILIKE "+al.add("%"+p.Query+"%"))
+			where = append(where, "m.content ILIKE "+al.add("%"+p.Query+"%"))
 		}
 		snippetExpr = "'' AS snippet"
-		orderBy = "ORDER BY timestamp DESC"
+		orderBy = "ORDER BY m.timestamp DESC"
 	}
 
-	q := `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-	      media_type, filename, url, media_key, file_sha256, file_enc_sha256,
-	      file_length, push_name, quoted_message_id, quoted_participant, ` + snippetExpr + `
-	      FROM messages`
+	q := `SELECT ` + msgSelectCols + `, ` + snippetExpr + `, ` + msgMediaCols + msgFromJoin
 	if len(where) > 0 {
 		q += " WHERE "
 		for i, w := range where {
@@ -155,10 +178,8 @@ func (s *Store) ListMessages(p QueryMessagesParams) ([]MessageRow, error) {
 func (s *Store) GetMessageContext(messageID, chatJID string, contextSize int) ([]MessageRow, error) {
 	// Resolve the target message and its timestamp in one query.
 	targetRows, err := s.db.Query(
-		`SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-		 media_type, filename, url, media_key, file_sha256, file_enc_sha256,
-		 file_length, push_name, quoted_message_id, quoted_participant, '' AS snippet
-		 FROM messages WHERE id = $1 AND chat_jid = $2`,
+		`SELECT `+msgSelectCols+`, '' AS snippet, `+msgMediaCols+msgFromJoin+
+			` WHERE m.id = $1 AND m.chat_jid = $2`,
 		messageID, chatJID,
 	)
 	if err != nil {
@@ -177,12 +198,9 @@ func (s *Store) GetMessageContext(messageID, chatJID string, contextSize int) ([
 
 	// Fetch N messages strictly before the target, newest-first, then reverse.
 	beforeRows, err := s.db.Query(
-		`SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-		 media_type, filename, url, media_key, file_sha256, file_enc_sha256,
-		 file_length, push_name, quoted_message_id, quoted_participant, '' AS snippet
-		 FROM messages
-		 WHERE chat_jid = $1 AND timestamp < $2
-		 ORDER BY timestamp DESC LIMIT $3`,
+		`SELECT `+msgSelectCols+`, '' AS snippet, `+msgMediaCols+msgFromJoin+
+			` WHERE m.chat_jid = $1 AND m.timestamp < $2
+		 ORDER BY m.timestamp DESC LIMIT $3`,
 		chatJID, targetTS, contextSize,
 	)
 	if err != nil {
@@ -196,12 +214,9 @@ func (s *Store) GetMessageContext(messageID, chatJID string, contextSize int) ([
 
 	// Fetch N messages strictly after the target, oldest-first.
 	afterRows, err := s.db.Query(
-		`SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-		 media_type, filename, url, media_key, file_sha256, file_enc_sha256,
-		 file_length, push_name, quoted_message_id, quoted_participant, '' AS snippet
-		 FROM messages
-		 WHERE chat_jid = $1 AND timestamp > $2
-		 ORDER BY timestamp ASC LIMIT $3`,
+		`SELECT `+msgSelectCols+`, '' AS snippet, `+msgMediaCols+msgFromJoin+
+			` WHERE m.chat_jid = $1 AND m.timestamp > $2
+		 ORDER BY m.timestamp ASC LIMIT $3`,
 		chatJID, targetTS, contextSize,
 	)
 	if err != nil {
@@ -229,14 +244,15 @@ func (s *Store) GetMessageContext(messageID, chatJID string, contextSize int) ([
 // that have non-empty content, projected to the minimal CompactMessage shape.
 func (s *Store) ListMessagesCompact(chatJID string, limit int) ([]CompactMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT id,
-		        COALESCE(sender_name, push_name, sender, '') AS name,
-		        COALESCE(content, '') AS text,
-		        timestamp,
-		        COALESCE(quoted_message_id, '') AS quoted_id
-		 FROM messages
-		 WHERE chat_jid = $1 AND content != ''
-		 ORDER BY timestamp DESC LIMIT $2`,
+		`SELECT m.id,
+		        COALESCE(m.sender_name, m.push_name, m.sender, '') AS name,
+		        COALESCE(m.content, '') AS text,
+		        m.timestamp,
+		        COALESCE(m.quoted_message_id, '') AS quoted_id,
+		        COALESCE(mm.transcription, '') AS transcription,
+		        mm.transcribed_at`+msgFromJoin+`
+		 WHERE m.chat_jid = $1 AND m.content != ''
+		 ORDER BY m.timestamp DESC LIMIT $2`,
 		chatJID, limit,
 	)
 	if err != nil {
@@ -247,12 +263,15 @@ func (s *Store) ListMessagesCompact(chatJID string, limit int) ([]CompactMessage
 	var msgs []CompactMessage
 	for rows.Next() {
 		var m CompactMessage
-		var ts sql.NullTime
-		if err := rows.Scan(&m.ID, &m.SenderName, &m.Content, &ts, &m.QuotedMsgID); err != nil {
+		var ts, transcribedAt sql.NullTime
+		if err := rows.Scan(&m.ID, &m.SenderName, &m.Content, &ts, &m.QuotedMsgID, &m.Transcription, &transcribedAt); err != nil {
 			return nil, fmt.Errorf("scan compact message: %w", err)
 		}
 		if ts.Valid {
 			m.Timestamp = ts.Time
+		}
+		if transcribedAt.Valid {
+			m.TranscribedAt = transcribedAt.Time
 		}
 		msgs = append(msgs, m)
 	}
@@ -262,10 +281,8 @@ func (s *Store) ListMessagesCompact(chatJID string, limit int) ([]CompactMessage
 // GetMessageByID fetches a single message by ID and chatJID.
 func (s *Store) GetMessageByID(messageID, chatJID string) (*MessageRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-		 media_type, filename, url, media_key, file_sha256, file_enc_sha256,
-		 file_length, push_name, quoted_message_id, quoted_participant, '' AS snippet
-		 FROM messages WHERE id = $1 AND chat_jid = $2`,
+		`SELECT `+msgSelectCols+`, '' AS snippet, `+msgMediaCols+msgFromJoin+
+			` WHERE m.id = $1 AND m.chat_jid = $2`,
 		messageID, chatJID,
 	)
 	if err != nil {
@@ -293,20 +310,16 @@ func (s *Store) ListMessagesSince(since time.Time, chatJID string, limit int) ([
 
 	if chatJID != "" {
 		rows, err = s.db.Query(
-			`SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-			 media_type, filename, url, media_key, file_sha256, file_enc_sha256,
-			 file_length, push_name, quoted_message_id, quoted_participant, '' AS snippet
-			 FROM messages WHERE timestamp > $1 AND chat_jid = $2
-			 ORDER BY timestamp ASC LIMIT $3`,
+			`SELECT `+msgSelectCols+`, '' AS snippet, `+msgMediaCols+msgFromJoin+
+				` WHERE m.timestamp > $1 AND m.chat_jid = $2
+			 ORDER BY m.timestamp ASC LIMIT $3`,
 			since, chatJID, limit,
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-			 media_type, filename, url, media_key, file_sha256, file_enc_sha256,
-			 file_length, push_name, quoted_message_id, quoted_participant, '' AS snippet
-			 FROM messages WHERE timestamp > $1
-			 ORDER BY timestamp ASC LIMIT $2`,
+			`SELECT `+msgSelectCols+`, '' AS snippet, `+msgMediaCols+msgFromJoin+
+				` WHERE m.timestamp > $1
+			 ORDER BY m.timestamp ASC LIMIT $2`,
 			since, limit,
 		)
 	}
@@ -327,12 +340,9 @@ func (s *Store) ListMessagesSinceMultiChat(since time.Time, jids []string, limit
 		return nil, nil
 	}
 	rows, err := s.db.Query(
-		`SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-		 media_type, filename, url, media_key, file_sha256, file_enc_sha256,
-		 file_length, push_name, quoted_message_id, quoted_participant, '' AS snippet
-		 FROM messages
-		 WHERE chat_jid = ANY($1::text[]) AND timestamp > $2
-		 ORDER BY timestamp ASC LIMIT $3`,
+		`SELECT `+msgSelectCols+`, '' AS snippet, `+msgMediaCols+msgFromJoin+
+			` WHERE m.chat_jid = ANY($1::text[]) AND m.timestamp > $2
+		 ORDER BY m.timestamp ASC LIMIT $3`,
 		jids, since, limit,
 	)
 	if err != nil {
@@ -464,11 +474,7 @@ func (s *Store) CheckTriggersMulti(jids []string, filters TriggerFilters, limit 
 			where += " AND m.content ILIKE " + al.add("%"+filters.MentionJID+"%")
 		}
 
-		q := `SELECT m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp,
-		       m.is_from_me, m.media_type, m.filename, m.url, m.media_key,
-		       m.file_sha256, m.file_enc_sha256, m.file_length, m.push_name,
-		       m.quoted_message_id, m.quoted_participant, '' AS snippet
-		       FROM messages m
+		q := `SELECT ` + msgSelectCols + `, '' AS snippet, ` + msgMediaCols + msgFromJoin + `
 		       WHERE ` + where + `
 		       ORDER BY m.timestamp ASC LIMIT ` + al.add(limit)
 

@@ -1,7 +1,8 @@
-// Package store implements the PostgreSQL message persistence layer for the
-// WhatsApp bridge. It owns the connection pool, the golang-migrate migration
-// runner, a single-writer goroutine that serialises all writes, and the
-// domain query methods for messages, chats, contacts, and hybrid search.
+// Package store implements the L3 PostgreSQL persistence layer for the WhatsApp
+// bridge — the system's source of truth. It owns the connection pool, the
+// golang-migrate migration runner, a single-writer goroutine that serialises
+// all writes, and the domain query methods for messages, chats, contacts, and
+// hybrid (FTS + pgvector RRF) search.
 package store
 
 import (
@@ -181,18 +182,23 @@ func runMigrations(databaseURL string) error {
 }
 
 // scanMessages scans a *sql.Rows produced by the standard message SELECT
-// column list (including the trailing snippet column) into MessageRow values.
+// column list into MessageRow values. The expected column order is the 17 base
+// message columns, then the snippet column, then the two messages_media
+// transcription columns (transcription, transcribed_at) supplied by the LEFT
+// JOIN in the message queries.
 func scanMessages(rows *sql.Rows) ([]MessageRow, error) {
 	var msgs []MessageRow
 	for rows.Next() {
 		var m MessageRow
 		var ts sql.NullTime
 		var fileLength sql.NullInt64
+		var transcribedAt sql.NullTime
 		err := rows.Scan(
 			&m.ID, &m.ChatJID, &m.Sender, &m.SenderName, &m.Content,
 			&ts, &m.IsFromMe, &m.MediaType, &m.Filename, &m.URL,
 			&m.MediaKey, &m.FileSHA256, &m.FileEncSHA256, &fileLength,
 			&m.PushName, &m.QuotedMessageID, &m.QuotedParticipant, &m.Snippet,
+			&m.Transcription, &transcribedAt,
 		)
 		if err != nil {
 			return nil, err
@@ -202,6 +208,9 @@ func scanMessages(rows *sql.Rows) ([]MessageRow, error) {
 		}
 		if fileLength.Valid {
 			m.FileLength = fileLength.Int64
+		}
+		if transcribedAt.Valid {
+			m.TranscribedAt = transcribedAt.Time
 		}
 		msgs = append(msgs, m)
 	}

@@ -32,7 +32,7 @@ func NewHandler(c *client.Client, s *store.Store, log *slog.Logger) *Handler {
 // ---- Conversion helpers -------------------------------------------------
 
 func toMessageResponse(m store.MessageRow) MessageResponse {
-	return MessageResponse{
+	resp := MessageResponse{
 		ID:                m.ID,
 		ChatJID:           m.ChatJID,
 		Sender:            m.Sender,
@@ -48,7 +48,13 @@ func toMessageResponse(m store.MessageRow) MessageResponse {
 		QuotedMessageID:   m.QuotedMessageID,
 		QuotedParticipant: m.QuotedParticipant,
 		Snippet:           m.Snippet,
+		Transcription:     m.Transcription,
 	}
+	if !m.TranscribedAt.IsZero() {
+		t := m.TranscribedAt
+		resp.TranscribedAt = &t
+	}
+	return resp
 }
 
 func toMessageResponses(rows []store.MessageRow) []MessageResponse {

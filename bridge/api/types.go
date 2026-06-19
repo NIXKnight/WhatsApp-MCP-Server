@@ -1,4 +1,5 @@
-// Package api implements the REST HTTP layer for the WhatsApp bridge.
+// Package api implements the L2 gateway: the REST HTTP layer for the WhatsApp
+// bridge (send, query, and enrichment-support routes).
 package api
 
 import "time"
@@ -42,6 +43,11 @@ type MessageResponse struct {
 	QuotedMessageID   string    `json:"quoted_message_id,omitempty"`
 	QuotedParticipant string    `json:"quoted_participant,omitempty"`
 	Snippet           string    `json:"snippet,omitempty"`
+	// Transcription is the voice-note / audio transcription, when available.
+	// Empty for non-media messages and media whose transcription is pending.
+	Transcription string `json:"transcription,omitempty"`
+	// TranscribedAt is when the transcription was produced; nil when absent.
+	TranscribedAt *time.Time `json:"transcribed_at,omitempty"`
 }
 
 // MessagesResponse wraps a list of messages with pagination metadata.
@@ -356,12 +362,13 @@ type SimilarMessagesResponse struct {
 // CompactMessageResponse is a reduced-field message projection
 // for token-efficient context windows. Used when ?compact=true.
 type CompactMessageResponse struct {
-	ID          string `json:"id"`
-	SenderName  string `json:"name"`
-	Content     string `json:"text"`
-	Timestamp   string `json:"ts"`
-	QuotedMsgID string `json:"quoted_id,omitempty"`
-	QuotedBy    string `json:"quoted_by,omitempty"`
+	ID            string `json:"id"`
+	SenderName    string `json:"name"`
+	Content       string `json:"text"`
+	Timestamp     string `json:"ts"`
+	QuotedMsgID   string `json:"quoted_id,omitempty"`
+	QuotedBy      string `json:"quoted_by,omitempty"`
+	Transcription string `json:"transcription,omitempty"`
 }
 
 // ---- Embeddings ---------------------------------------------------------

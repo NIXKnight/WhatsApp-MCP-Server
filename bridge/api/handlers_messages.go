@@ -66,12 +66,13 @@ func (h *Handler) ListMessages(w http.ResponseWriter, r *http.Request) {
 		compact := make([]CompactMessageResponse, len(msgs))
 		for i, m := range msgs {
 			compact[i] = CompactMessageResponse{
-				ID:          m.ID,
-				SenderName:  m.SenderName,
-				Content:     m.Content,
-				Timestamp:   m.Timestamp.Format(time.RFC3339),
-				QuotedMsgID: m.QuotedMessageID,
-				QuotedBy:    m.QuotedParticipant,
+				ID:            m.ID,
+				SenderName:    m.SenderName,
+				Content:       m.Content,
+				Timestamp:     m.Timestamp.Format(time.RFC3339),
+				QuotedMsgID:   m.QuotedMessageID,
+				QuotedBy:      m.QuotedParticipant,
+				Transcription: m.Transcription,
 			}
 		}
 		writeJSON(w, http.StatusOK, compact)
