@@ -16,5 +16,15 @@ dependencies = [
 [project.scripts]
 whatsapp-mcp = "whatsapp_mcp.main:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/whatsapp_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
