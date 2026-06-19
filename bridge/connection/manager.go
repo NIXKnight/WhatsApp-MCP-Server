@@ -1,4 +1,4 @@
-package bridge
+package connection
 
 import (
 	"context"
@@ -12,35 +12,6 @@ import (
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
 )
-
-// ConnectionState represents the state of the WhatsApp connection.
-type ConnectionState int32
-
-const (
-	StateDisconnected           ConnectionState = iota
-	StateConnecting                             // attempting to connect
-	StateQRWaiting                              // waiting for QR scan
-	StateConnected                              // fully connected
-	StatePermanentlyDisconnected                // logged out, no reconnect
-)
-
-// String returns a human-readable name for the state.
-func (s ConnectionState) String() string {
-	switch s {
-	case StateDisconnected:
-		return "DISCONNECTED"
-	case StateConnecting:
-		return "CONNECTING"
-	case StateQRWaiting:
-		return "QR_WAITING"
-	case StateConnected:
-		return "CONNECTED"
-	case StatePermanentlyDisconnected:
-		return "PERMANENTLY_DISCONNECTED"
-	default:
-		return "UNKNOWN"
-	}
-}
 
 // connectTimeout is how long reconnect() waits for events.Connected before
 // returning an error.
@@ -76,23 +47,14 @@ type Connection struct {
 	connectedCh chan struct{}
 }
 
-func newConnection(wa *whatsmeow.Client, log *slog.Logger) *Connection {
+// NewConnection creates a Connection bound to the given whatsmeow client.
+func NewConnection(wa *whatsmeow.Client, log *slog.Logger) *Connection {
 	return &Connection{
 		wa:          wa,
 		log:         log,
 		stopCh:      make(chan struct{}),
 		connectedCh: make(chan struct{}),
 	}
-}
-
-// State returns the current connection state.
-func (c *Connection) State() ConnectionState {
-	return ConnectionState(c.state.Load())
-}
-
-func (c *Connection) setState(s ConnectionState) {
-	c.state.Store(int32(s))
-	c.log.Info("connection state changed", "state", s.String())
 }
 
 // resetConnectedCh creates a fresh (unclosed) connectedCh for the next
@@ -103,13 +65,6 @@ func (c *Connection) resetConnectedCh() chan struct{} {
 	ch := make(chan struct{})
 	c.connectedCh = ch
 	return ch
-}
-
-// currentConnectedCh returns the current connectedCh under the lock.
-func (c *Connection) currentConnectedCh() chan struct{} {
-	c.connectedMu.Lock()
-	defer c.connectedMu.Unlock()
-	return c.connectedCh
 }
 
 // Connect performs the initial connection. If the device has no ID yet,
@@ -194,7 +149,7 @@ func (c *Connection) reconnect(ctx context.Context) error {
 
 	select {
 	case <-connCh:
-		// handleConnected already called setState(StateConnected).
+		// HandleConnected already called setState(StateConnected).
 		return nil
 	case <-timeout.C:
 		c.setState(StateDisconnected)
@@ -206,8 +161,8 @@ func (c *Connection) reconnect(ctx context.Context) error {
 	}
 }
 
-// handleConnected is called from the event handler when events.Connected fires.
-func (c *Connection) handleConnected() {
+// HandleConnected is called from the event handler when events.Connected fires.
+func (c *Connection) HandleConnected() {
 	c.retryCount.Store(0)
 	c.setState(StateConnected)
 
@@ -217,7 +172,7 @@ func (c *Connection) handleConnected() {
 	c.connectedMu.Unlock()
 
 	// Close is idempotent via select; use non-blocking close to avoid panic if
-	// already closed (e.g. handleConnected called twice).
+	// already closed (e.g. HandleConnected called twice).
 	select {
 	case <-ch:
 		// Already closed.
@@ -226,25 +181,25 @@ func (c *Connection) handleConnected() {
 	}
 }
 
-// handleDisconnected is called from the event handler when events.Disconnected
+// HandleDisconnected is called from the event handler when events.Disconnected
 // fires. whatsmeow's Disconnected event is a transient websocket close;
 // whatsmeow will attempt its own reconnect, but we also schedule our own
 // reconnect to ensure state recovery.
-func (c *Connection) handleDisconnected() {
+func (c *Connection) HandleDisconnected() {
 	c.setState(StateDisconnected)
 	c.scheduleReconnect()
 }
 
-// handleLoggedOut is called when events.LoggedOut fires.
-func (c *Connection) handleLoggedOut() {
-	c.handlePermanentDisconnect("logged out")
+// HandleLoggedOut is called when events.LoggedOut fires.
+func (c *Connection) HandleLoggedOut() {
+	c.HandlePermanentDisconnect("logged out")
 }
 
-// handlePermanentDisconnect transitions to StatePermanentlyDisconnected and
+// HandlePermanentDisconnect transitions to StatePermanentlyDisconnected and
 // cancels all pending reconnect goroutines by closing stopCh. Call this for
 // any condition that must not trigger automatic reconnection (bans, stream
 // replacement, outdated client, etc.).
-func (c *Connection) handlePermanentDisconnect(reason string) {
+func (c *Connection) HandlePermanentDisconnect(reason string) {
 	c.log.Error("permanent disconnect", "reason", reason)
 	c.setState(StatePermanentlyDisconnected)
 	c.stopOnce.Do(func() {
@@ -252,8 +207,8 @@ func (c *Connection) handlePermanentDisconnect(reason string) {
 	})
 }
 
-// handleStreamError is called when events.StreamError fires.
-func (c *Connection) handleStreamError() {
+// HandleStreamError is called when events.StreamError fires.
+func (c *Connection) HandleStreamError() {
 	c.log.Warn("stream error, scheduling reconnect")
 	c.setState(StateDisconnected)
 	c.scheduleReconnect()
@@ -297,7 +252,7 @@ func (c *Connection) scheduleReconnect() {
 		if err := c.reconnect(context.Background()); err != nil {
 			c.log.Warn("reconnect failed", "err", err)
 			// Do not overwrite a permanent disconnect state that was set
-			// concurrently (e.g. by handlePermanentDisconnect or handleLoggedOut).
+			// concurrently (e.g. by HandlePermanentDisconnect or HandleLoggedOut).
 			if c.State() != StatePermanentlyDisconnected {
 				c.setState(StateDisconnected)
 				c.scheduleReconnect()

@@ -1,4 +1,4 @@
-package bridge
+package client
 
 import (
 	"context"
@@ -9,6 +9,8 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
 // handleEvent is the central event dispatcher registered with whatsmeow.
@@ -17,19 +19,19 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 
 	case *events.Connected:
 		c.log.Info("whatsapp: connected")
-		c.conn.handleConnected()
+		c.conn.HandleConnected()
 
 	case *events.Disconnected:
 		c.log.Warn("whatsapp: disconnected (transient)")
-		c.conn.handleDisconnected()
+		c.conn.HandleDisconnected()
 
 	case *events.LoggedOut:
 		c.log.Warn("whatsapp: logged out", "reason", evt.Reason)
-		c.conn.handleLoggedOut()
+		c.conn.HandleLoggedOut()
 
 	case *events.StreamError:
 		c.log.Warn("whatsapp: stream error", "code", evt.Code)
-		c.conn.handleStreamError()
+		c.conn.HandleStreamError()
 
 	case *events.ConnectFailure:
 		// ConnectFailure carries reason codes covering bans, outdated clients,
@@ -41,7 +43,7 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 			"reason", evt.Reason.String(),
 			"message", evt.Message,
 		)
-		c.conn.handlePermanentDisconnect("connect failure: " + evt.Reason.String())
+		c.conn.HandlePermanentDisconnect("connect failure: " + evt.Reason.String())
 
 	case *events.TemporaryBan:
 		// Account temporarily banned. The ban reason and remaining duration are
@@ -51,28 +53,28 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 			"code", evt.Code.String(),
 			"expire", evt.Expire,
 		)
-		c.conn.handlePermanentDisconnect("temporary ban: " + evt.Code.String())
+		c.conn.HandlePermanentDisconnect("temporary ban: " + evt.Code.String())
 
 	case *events.ClientOutdated:
 		// WhatsApp rejected the connection because the client version is too
 		// old. Reconnecting will not help until the whatsmeow dependency is
 		// updated and the binary is redeployed.
 		c.log.Error("whatsapp: client outdated — update whatsmeow dependency and redeploy")
-		c.conn.handlePermanentDisconnect("client outdated")
+		c.conn.HandlePermanentDisconnect("client outdated")
 
 	case *events.StreamReplaced:
 		// Another device connected with the same session keys and took over the
 		// stream. Auto-reconnecting would create a reconnect fight between the
 		// two instances. Require a manual operator restart.
 		c.log.Error("whatsapp: session replaced by another device — manual restart required")
-		c.conn.handlePermanentDisconnect("stream replaced by another device")
+		c.conn.HandlePermanentDisconnect("stream replaced by another device")
 
 	case *events.KeepAliveTimeout:
-		c.keepAliveFailures++
-		c.log.Warn("whatsapp: keep-alive timeout", "consecutive", c.keepAliveFailures)
-		if c.keepAliveFailures >= 3 {
+		consecutive := c.keepAlive.RecordFailure()
+		c.log.Warn("whatsapp: keep-alive timeout", "consecutive", consecutive)
+		if c.keepAlive.ShouldReconnect() {
 			c.log.Error("whatsapp: 3 consecutive keep-alive timeouts, forcing reconnect")
-			c.keepAliveFailures = 0
+			c.keepAlive.Reset()
 			go func() {
 				c.WA.Disconnect()
 				// The resulting Disconnected event will fire and trigger scheduleReconnect.
@@ -80,7 +82,7 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 		}
 
 	case *events.KeepAliveRestored:
-		c.keepAliveFailures = 0
+		c.keepAlive.Reset()
 		c.log.Info("whatsapp: keep-alive restored")
 
 	case *events.Message:
@@ -138,7 +140,7 @@ func (c *Client) processMessage(evt *events.Message) {
 		c.log.Warn("failed to update chat preview", "err", err)
 	}
 
-	msg := &MessageRow{
+	msg := &store.MessageRow{
 		ID:                evt.Info.ID,
 		ChatJID:           chatJID,
 		Sender:            sender,
@@ -244,7 +246,7 @@ func (c *Client) processHistorySync(evt *events.HistorySync) {
 				msgID = wm.GetKey().GetID()
 			}
 
-			msg := &MessageRow{
+			msg := &store.MessageRow{
 				ID:                msgID,
 				ChatJID:           chatJID,
 				Sender:            sender,
@@ -360,7 +362,10 @@ func extractTextContent(msg *waE2E.Message) (text, quotedID, quotedParticipant s
 
 	// Also capture quoted message context from non-text messages.
 	if quotedID == "" {
-		var ci interface{ GetStanzaID() string; GetParticipant() string }
+		var ci interface {
+			GetStanzaID() string
+			GetParticipant() string
+		}
 		switch {
 		case msg.GetImageMessage() != nil:
 			ci = msg.GetImageMessage().GetContextInfo()

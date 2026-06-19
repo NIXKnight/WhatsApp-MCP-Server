@@ -9,7 +9,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 
-	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/bridge"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
 // DownloadResult holds the local file path and metadata for a downloaded media file.
@@ -25,7 +25,7 @@ type DownloadResult struct {
 // outDir defaults to dataDir/media when the caller passes the bridge data dir,
 // but can be any writable directory.
 // If the file already exists locally it is returned without re-downloading.
-func Download(ctx context.Context, client *whatsmeow.Client, msg *bridge.MessageRow, outDir string) (*DownloadResult, error) {
+func Download(ctx context.Context, client *whatsmeow.Client, msg *store.MessageRow, outDir string) (*DownloadResult, error) {
 	if msg.MediaType == "" {
 		return nil, fmt.Errorf("message has no media")
 	}

@@ -25,8 +25,9 @@ import (
 	"time"
 
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/api"
-	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/bridge"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/client"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/config"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
 // cooldownDuration is the delay imposed after a permanent disconnect before
@@ -100,17 +101,17 @@ func main() {
 	}
 
 	// ---- Message store -----------------------------------------------------
-	store, err := bridge.NewStore(cfg.DatabaseURL, log.With("component", "store"))
+	st, err := store.NewStore(cfg.DatabaseURL, log.With("component", "store"))
 	if err != nil {
 		log.Error("failed to open message store", "err", err)
 		os.Exit(1)
 	}
 
 	// ---- WhatsApp client ---------------------------------------------------
-	client, err := bridge.NewClient(cfg.DatabaseURL, cfg.DataDir, store, log.With("component", "client"))
+	waClient, err := client.NewClient(cfg.DatabaseURL, cfg.DataDir, st, log.With("component", "client"))
 	if err != nil {
 		log.Error("failed to create WhatsApp client", "err", err)
-		store.Close()
+		st.Close()
 		os.Exit(1)
 	}
 
@@ -119,7 +120,7 @@ func main() {
 	// is reachable during QR code scanning. Docker health checks and other
 	// probes will get a 200 response with state=QR_WAITING instead of a
 	// "connection refused" error.
-	h := api.NewHandler(client, store, log.With("component", "api"))
+	h := api.NewHandler(waClient, st, log.With("component", "api"))
 	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"))
 
 	srvErrCh := make(chan error, 1)
@@ -137,7 +138,7 @@ func main() {
 
 	connectErrCh := make(chan error, 1)
 	go func() {
-		connectErrCh <- client.Connect(connectCtx)
+		connectErrCh <- waClient.Connect(connectCtx)
 	}()
 
 	// Wait for connection, a fatal HTTP server error, or a signal.
@@ -148,7 +149,7 @@ func main() {
 			// If the client ended up in a permanently disconnected state (ban,
 			// logged out, client outdated, etc.) write a cooldown marker so that
 			// a supervisor restart does not immediately hammer the server again.
-			if client.State() == bridge.StatePermanentlyDisconnected {
+			if waClient.State() == client.StatePermanentlyDisconnected {
 				writeCooldownMarker(cfg.DataDir)
 				log.Error("permanent disconnect detected, cooldown marker written",
 					"cooldown", cooldownDuration.String(),
@@ -156,29 +157,29 @@ func main() {
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer shutdownCancel()
 				_ = srv.Shutdown(shutdownCtx)
-				store.Close()
+				st.Close()
 				os.Exit(2) // exit code 2: tell supervisor not to restart yet
 			}
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer shutdownCancel()
 			_ = srv.Shutdown(shutdownCtx)
-			store.Close()
+			st.Close()
 			os.Exit(1)
 		}
 	case sig := <-sigCh:
 		log.Info("received signal before connection established, shutting down", "signal", sig)
 		connectCancel()
-		client.Disconnect()
+		waClient.Disconnect()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer shutdownCancel()
 		_ = srv.Shutdown(shutdownCtx)
-		store.Close()
+		st.Close()
 		os.Exit(0)
 	case err := <-srvErrCh:
 		log.Error("HTTP server error before connection established", "err", err)
 		connectCancel()
-		client.Disconnect()
-		store.Close()
+		waClient.Disconnect()
+		st.Close()
 		os.Exit(1)
 	}
 
@@ -205,11 +206,11 @@ func main() {
 	log.Info("HTTP server stopped")
 
 	// 2. Disconnect from WhatsApp.
-	client.Disconnect()
+	waClient.Disconnect()
 	log.Info("WhatsApp client disconnected")
 
 	// 3. Close the message store.
-	if err := store.Close(); err != nil {
+	if err := st.Close(); err != nil {
 		log.Warn("store close error", "err", err)
 	}
 	log.Info("shutdown complete")
