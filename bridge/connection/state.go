@@ -1,4 +1,4 @@
-// Package connection manages the WhatsApp transport lifecycle: the QR pairing
+// Package connection implements the L2 transport lifecycle: the QR pairing
 // flow, automatic reconnection with exponential back-off, connection state
 // tracking, and keepalive failure accounting.
 package connection

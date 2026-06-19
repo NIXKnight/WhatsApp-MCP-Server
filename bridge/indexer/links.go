@@ -1,5 +1,6 @@
-// Package indexer extracts and classifies structured signals (URLs, and in
-// later phases other entities) from raw message text at capture time.
+// Package indexer is part of L2 capture: it extracts and classifies structured
+// signals (URLs, and in later phases other entities) from raw message text at
+// capture time.
 package indexer
 
 import (

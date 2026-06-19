@@ -1,4 +1,4 @@
-"""FastAPI dashboard application (read-only).
+"""FastAPI dashboard application (read-only, L6 operations and observability).
 
 Serves an HTMX-driven operations view of the WhatsApp bridge:
 bridge health (via the bridge ``GET /api/status`` endpoint) plus recent

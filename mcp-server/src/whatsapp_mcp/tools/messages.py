@@ -1,4 +1,4 @@
-"""Message-related MCP tools.
+"""Message-related MCP tools (L4 tool/contract).
 
 Provides ten tools:
 

@@ -1,4 +1,4 @@
-"""Media-related MCP tools.
+"""Media-related MCP tools (L4 tool/contract).
 
 Provides two tools:
 

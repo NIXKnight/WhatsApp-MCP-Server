@@ -1,8 +1,8 @@
-// Package client wraps a whatsmeow.Client with the application's message store
-// and connection state machine, and translates whatsmeow events into store
-// writes. It re-exports the connection-state constants and Client.State so that
-// callers (the HTTP API and main) depend on this package rather than reaching
-// into the connection package directly.
+// Package client implements L2 capture: it wraps a whatsmeow.Client with the
+// application's message store and connection state machine, and translates
+// whatsmeow events into store writes. It re-exports the connection-state
+// constants and Client.State so that callers (the HTTP API and main) depend on
+// this package rather than reaching into the connection package directly.
 package client
 
 import (

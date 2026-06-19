@@ -1,4 +1,4 @@
-"""Search-related MCP tools.
+"""Search-related MCP tools (L4 tool/contract).
 
 Provides one tool:
 

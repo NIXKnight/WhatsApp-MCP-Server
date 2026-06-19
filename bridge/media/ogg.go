@@ -1,4 +1,5 @@
-// Package media handles WhatsApp media upload, download, and OGG Opus analysis.
+// Package media is part of L2: it handles WhatsApp media upload, on-demand
+// download, and OGG Opus analysis for the bridge.
 package media
 
 import (
