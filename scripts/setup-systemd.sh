@@ -45,6 +45,7 @@ Environment=BRIDGE_DATA_DIR=%h/.local/share/whatsapp-bridge/data
 Environment=BRIDGE_ADDR=127.0.0.1:8080
 Environment=BRIDGE_LOG_LEVEL=info
 Environment=EMBEDDER_URL=http://127.0.0.1:8000
+Environment=ANALYZER_URL=http://127.0.0.1:8500
 EnvironmentFile=-%h/.config/whatsapp-bridge/env
 Restart=on-failure
 RestartSec=5
@@ -133,6 +134,7 @@ ExecStart=${REPO_ROOT}/transcriber/.venv/bin/python -m whatsapp_transcriber
 WorkingDirectory=${REPO_ROOT}/transcriber
 Environment=BRIDGE_URL=http://127.0.0.1:8080
 Environment=WHISPER_URL=http://127.0.0.1:8443
+Environment=ANALYZER_HTTP_ADDR=127.0.0.1:8500
 EnvironmentFile=-%h/.config/whatsapp-bridge/env
 Restart=on-failure
 RestartSec=5

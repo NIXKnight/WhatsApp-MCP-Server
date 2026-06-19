@@ -22,6 +22,7 @@ services:
       BRIDGE_DATA_DIR: "/data"
       DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
       EMBEDDER_URL: "http://embedder:8000"
+      ANALYZER_URL: "http://transcriber:8500"
     volumes:
       - bridge-data:/data
       - ${WORKSPACE_PATH:-./workspace}:/workspace
@@ -88,6 +89,9 @@ services:
       WHISPER_LANGUAGE: "${WHISPER_LANGUAGE:-ur}"
       TRANSCRIBE_BATCH_SIZE: "${TRANSCRIBE_BATCH_SIZE:-20}"
       TRANSCRIBE_POLL_INTERVAL: "${TRANSCRIBE_POLL_INTERVAL:-30}"
+      # Bind all interfaces inside the container so the bridge can reach it over
+      # the compose network. NOT published to the host (internal network only).
+      ANALYZER_HTTP_ADDR: "0.0.0.0:8500"
       # Re-downloaded media must land in the shared bridge data volume so both
       # the bridge (writer) and this worker (reader) see the same path.
       REDOWNLOAD_DIR: "/data"
