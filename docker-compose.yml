@@ -55,6 +55,51 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  embedder:
+    build: ./embedder
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}"
+      EMBED_BATCH_SIZE: "${EMBED_BATCH_SIZE:-100}"
+      EMBED_POLL_INTERVAL: "${EMBED_POLL_INTERVAL:-30}"
+      HF_HOME: "/home/bridge/.cache/huggingface"
+    volumes:
+      - embedder-cache:/home/bridge/.cache/huggingface
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+  transcriber:
+    build: ./transcriber
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
+      BRIDGE_URL: "http://bridge:8080"
+      # Whisper runs as an external HOST process; reach it via the host gateway.
+      WHISPER_URL: "${WHISPER_URL:-http://host.docker.internal:8443}"
+      WHISPER_MODEL: "${WHISPER_MODEL:-large-v3}"
+      WHISPER_LANGUAGE: "${WHISPER_LANGUAGE:-ur}"
+      TRANSCRIBE_BATCH_SIZE: "${TRANSCRIBE_BATCH_SIZE:-20}"
+      TRANSCRIBE_POLL_INTERVAL: "${TRANSCRIBE_POLL_INTERVAL:-30}"
+      # Re-downloaded media must land in the shared bridge data volume so both
+      # the bridge (writer) and this worker (reader) see the same path.
+      REDOWNLOAD_DIR: "/data"
+    volumes:
+      - bridge-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bridge:
+        condition: service_healthy
+    stop_grace_period: 20s
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   bridge-data:
+  embedder-cache:

@@ -13,9 +13,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
-mcp-server/.venv/
-mcp-server/*.egg-info/
+.venv/
+*.egg-info/
 .eggs/
+.ruff_cache/
 dist/
 build/
 bridge/whatsapp-bridge
