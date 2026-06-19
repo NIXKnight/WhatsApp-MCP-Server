@@ -211,6 +211,162 @@ func buildTextMessage(text, quotedID, quotedParticipant string, mentions []strin
 	return &waE2E.Message{ExtendedTextMessage: ext}
 }
 
+// ---- POST /api/send/reaction --------------------------------------------
+
+// SendReaction reacts to a target message with an emoji. An empty emoji removes
+// a previously sent reaction. The request body mirrors the MCP client contract:
+// chat_jid, message_id, emoji, and optional sender (the author of the target
+// message; omit for one's own message).
+func (h *Handler) SendReaction(w http.ResponseWriter, r *http.Request) {
+	if h.client.State() != client.StateConnected {
+		writeError(w, http.StatusServiceUnavailable, "not connected to WhatsApp", "NOT_CONNECTED")
+		return
+	}
+
+	var req ReactRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON")
+		return
+	}
+	if req.ChatJID == "" || req.MessageID == "" {
+		writeError(w, http.StatusBadRequest, "chat_jid and message_id are required", "MISSING_FIELD")
+		return
+	}
+
+	chatJID := normaliseJID(req.ChatJID)
+	if !jidRe.MatchString(chatJID) {
+		writeError(w, http.StatusBadRequest, "invalid chat_jid format", "INVALID_JID")
+		return
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "cannot parse chat_jid", "INVALID_JID")
+		return
+	}
+
+	sender := types.EmptyJID
+	if req.Sender != "" {
+		senderJID := normaliseJID(req.Sender)
+		if !jidRe.MatchString(senderJID) {
+			writeError(w, http.StatusBadRequest, "invalid sender format", "INVALID_JID")
+			return
+		}
+		sender, err = types.ParseJID(senderJID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "cannot parse sender", "INVALID_JID")
+			return
+		}
+	}
+
+	resp, err := h.client.React(r.Context(), chat, sender, req.MessageID, req.Emoji)
+	if err != nil {
+		h.log.Error("send reaction", "chat", chatJID, "target", req.MessageID, "err", err)
+		writeError(w, http.StatusInternalServerError, "send failed", "SEND_ERROR")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, SendResponse{Success: true, MessageID: resp.ID})
+}
+
+// ---- POST /api/send/edit ------------------------------------------------
+
+// EditMessage edits a previously sent message, replacing its text. Only
+// messages sent by this account can be edited. The request body is chat_jid,
+// message_id, and new_text.
+func (h *Handler) EditMessage(w http.ResponseWriter, r *http.Request) {
+	if h.client.State() != client.StateConnected {
+		writeError(w, http.StatusServiceUnavailable, "not connected to WhatsApp", "NOT_CONNECTED")
+		return
+	}
+
+	var req EditRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON")
+		return
+	}
+	if req.ChatJID == "" || req.MessageID == "" || req.NewText == "" {
+		writeError(w, http.StatusBadRequest, "chat_jid, message_id, and new_text are required", "MISSING_FIELD")
+		return
+	}
+
+	chatJID := normaliseJID(req.ChatJID)
+	if !jidRe.MatchString(chatJID) {
+		writeError(w, http.StatusBadRequest, "invalid chat_jid format", "INVALID_JID")
+		return
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "cannot parse chat_jid", "INVALID_JID")
+		return
+	}
+
+	resp, err := h.client.Edit(r.Context(), chat, req.MessageID, req.NewText)
+	if err != nil {
+		h.log.Error("edit message", "chat", chatJID, "target", req.MessageID, "err", err)
+		writeError(w, http.StatusInternalServerError, "send failed", "SEND_ERROR")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, SendResponse{Success: true, MessageID: resp.ID})
+}
+
+// ---- POST /api/send/revoke ----------------------------------------------
+
+// RevokeMessage revokes (deletes for everyone) a target message. Omit sender to
+// revoke one's own message; supply the original sender when a group admin
+// revokes another member's message. The request body is chat_jid, message_id,
+// and optional sender.
+func (h *Handler) RevokeMessage(w http.ResponseWriter, r *http.Request) {
+	if h.client.State() != client.StateConnected {
+		writeError(w, http.StatusServiceUnavailable, "not connected to WhatsApp", "NOT_CONNECTED")
+		return
+	}
+
+	var req RevokeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON")
+		return
+	}
+	if req.ChatJID == "" || req.MessageID == "" {
+		writeError(w, http.StatusBadRequest, "chat_jid and message_id are required", "MISSING_FIELD")
+		return
+	}
+
+	chatJID := normaliseJID(req.ChatJID)
+	if !jidRe.MatchString(chatJID) {
+		writeError(w, http.StatusBadRequest, "invalid chat_jid format", "INVALID_JID")
+		return
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "cannot parse chat_jid", "INVALID_JID")
+		return
+	}
+
+	sender := types.EmptyJID
+	if req.Sender != "" {
+		senderJID := normaliseJID(req.Sender)
+		if !jidRe.MatchString(senderJID) {
+			writeError(w, http.StatusBadRequest, "invalid sender format", "INVALID_JID")
+			return
+		}
+		sender, err = types.ParseJID(senderJID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "cannot parse sender", "INVALID_JID")
+			return
+		}
+	}
+
+	resp, err := h.client.Revoke(r.Context(), chat, sender, req.MessageID)
+	if err != nil {
+		h.log.Error("revoke message", "chat", chatJID, "target", req.MessageID, "err", err)
+		writeError(w, http.StatusInternalServerError, "send failed", "SEND_ERROR")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, SendResponse{Success: true, MessageID: resp.ID})
+}
+
 // injectEphemeralExpiry sets ContextInfo.Expiration on the inner media message
 // proto so that the message participates in the chat's disappearing timer.
 func injectEphemeralExpiry(msg *waE2E.Message, expiry uint32) {

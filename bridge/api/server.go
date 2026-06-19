@@ -29,6 +29,12 @@ func NewServer(addr string, h *Handler, log *slog.Logger) *Server {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
+	// Token-bucket limiter applied only to outbound send routes. WhatsApp
+	// penalises bursts of automated sends, so the bridge self-throttles and
+	// adds small human-timing jitter. Conservative anti-ban defaults: ~2 sends
+	// per second sustained, burst of 5, up to 300 ms jitter.
+	rl := NewRateLimiter(2.0, 5, 300)
+
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/status", h.Status)
 		r.Get("/messages", h.ListMessages)
@@ -46,9 +52,19 @@ func NewServer(addr string, h *Handler, log *slog.Logger) *Server {
 		r.Get("/groups/{jid}", h.GetGroup)
 		r.Get("/unread", h.ListUnread)
 		r.Get("/check", h.CheckNewMessages)
-		r.Post("/send", h.SendMessage)
-		r.Post("/send/media", h.SendMedia)
+		r.Post("/check/triggers", h.CheckTriggers)
 		r.Post("/download", h.DownloadMedia)
+		r.Post("/telemetry/tool", h.RecordToolCall)
+
+		// Send routes (rate-limited, anti-ban).
+		r.Group(func(r chi.Router) {
+			r.Use(rl.Middleware)
+			r.Post("/send", h.SendMessage)
+			r.Post("/send/media", h.SendMedia)
+			r.Post("/send/reaction", h.SendReaction)
+			r.Post("/send/edit", h.EditMessage)
+			r.Post("/send/revoke", h.RevokeMessage)
+		})
 	})
 
 	srv := &http.Server{

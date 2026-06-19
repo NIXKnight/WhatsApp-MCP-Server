@@ -207,6 +207,61 @@ func (h *Handler) CheckNewMessages(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---- POST /api/check/triggers -------------------------------------------
+
+// CheckTriggers performs a batch trigger check across multiple chats. For each
+// JID it returns the inbound messages received since that chat's server-side
+// watermark, optionally filtered by sender and mention, then advances the
+// watermark. When dry_run is true the watermarks are not advanced, so the same
+// messages would be returned on a subsequent call.
+func (h *Handler) CheckTriggers(w http.ResponseWriter, r *http.Request) {
+	var req TriggerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON")
+		return
+	}
+	if len(req.JIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "jids is required and must not be empty", "MISSING_FIELD")
+		return
+	}
+	for _, jid := range req.JIDs {
+		if !jidRe.MatchString(jid) {
+			writeError(w, http.StatusBadRequest, "invalid jid: "+jid, "INVALID_JID")
+			return
+		}
+	}
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	filters := store.TriggerFilters{
+		MentionJID: req.Filters.MentionJID,
+		SenderJIDs: req.Filters.SenderJIDs,
+	}
+
+	res, err := h.store.CheckTriggersMulti(req.JIDs, filters, limit, req.DryRun)
+	if err != nil {
+		h.log.Error("check triggers", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to check triggers", "DB_ERROR")
+		return
+	}
+
+	groups := make(map[string]TriggerGroupResult, len(res.Groups))
+	for jid, gr := range res.Groups {
+		groups[jid] = TriggerGroupResult{
+			Count:    gr.Count,
+			Messages: toMessageResponses(gr.Messages),
+		}
+	}
+
+	writeJSON(w, http.StatusOK, TriggerResponse{
+		Total:  res.Total,
+		Groups: groups,
+	})
+}
+
 // ---- PUT /api/messages/{id}/embedding -----------------------------------
 
 // UpsertEmbedding stores or replaces the vector embedding for a message.

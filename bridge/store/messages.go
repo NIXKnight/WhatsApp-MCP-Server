@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -347,4 +348,165 @@ func (s *Store) CountMessages() (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n)
 	return n, err
+}
+
+// ---- Trigger check (batch, watermark-based) -----------------------------
+
+// TriggerFilters narrows the messages returned by CheckTriggersMulti.
+// MentionJID, when set, keeps only messages whose content references that JID.
+// SenderJIDs, when non-empty, keeps only messages from those senders.
+type TriggerFilters struct {
+	MentionJID string
+	SenderJIDs []string
+}
+
+// TriggerGroupResult holds the unseen messages for a single chat JID.
+type TriggerGroupResult struct {
+	Count    int          `json:"count"`
+	Messages []MessageRow `json:"messages"`
+}
+
+// TriggerCheckResult is the aggregate result of CheckTriggersMulti.
+type TriggerCheckResult struct {
+	Total  int
+	Groups map[string]TriggerGroupResult
+}
+
+// CheckTriggersMulti checks multiple chat JIDs for messages received since each
+// chat's server-side watermark, in a single call. For every JID it returns the
+// unseen, inbound (is_from_me = false) messages, applying the optional sender
+// and mention filters, then advances that chat's watermark to the timestamp of
+// the newest returned message.
+//
+// When dryRun is true, watermarks are never created or advanced: the call is a
+// pure read that reports what a real check would return without consuming it.
+//
+// All watermark writes are serialised through the single-writer goroutine.
+func (s *Store) CheckTriggersMulti(jids []string, filters TriggerFilters, limit int, dryRun bool) (*TriggerCheckResult, error) {
+	result := &TriggerCheckResult{Groups: make(map[string]TriggerGroupResult)}
+	if len(jids) == 0 {
+		return result, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	// 1. Batch-read existing watermarks for the requested JIDs.
+	watermarks := make(map[string]time.Time, len(jids))
+	{
+		al := &argList{}
+		ph := make([]string, len(jids))
+		for i, jid := range jids {
+			ph[i] = al.add(jid)
+		}
+		q := "SELECT jid, last_seen FROM watermarks WHERE jid IN (" + strings.Join(ph, ", ") + ")"
+		rows, err := s.db.Query(q, al.args...)
+		if err != nil {
+			return nil, fmt.Errorf("batch read watermarks: %w", err)
+		}
+		for rows.Next() {
+			var jid string
+			var ls time.Time
+			if err := rows.Scan(&jid, &ls); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan watermark: %w", err)
+			}
+			watermarks[jid] = ls
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate watermarks: %w", err)
+		}
+		rows.Close()
+	}
+
+	// 2. Initialise missing watermarks to "now" so the first check on a chat
+	//    does not dump the entire history. In dry-run mode the marker is held in
+	//    memory only and never persisted.
+	now := time.Now().UTC()
+	missing := make([]string, 0, len(jids))
+	for _, jid := range jids {
+		if _, ok := watermarks[jid]; !ok {
+			watermarks[jid] = now
+			missing = append(missing, jid)
+		}
+	}
+	if !dryRun && len(missing) > 0 {
+		if err := s.submit(func(tx *sql.Tx) error {
+			for _, jid := range missing {
+				if _, err := tx.Exec(
+					`INSERT INTO watermarks (jid, last_seen) VALUES ($1, $2)
+					 ON CONFLICT (jid) DO NOTHING`,
+					jid, now,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("init watermarks: %w", err)
+		}
+	}
+
+	// 3. Per-JID query for unseen inbound messages, applying optional filters.
+	advances := make(map[string]time.Time)
+	for _, jid := range jids {
+		wm := watermarks[jid]
+
+		al := &argList{}
+		where := "m.chat_jid = " + al.add(jid) +
+			" AND m.timestamp > " + al.add(wm) +
+			" AND m.is_from_me = FALSE"
+		if len(filters.SenderJIDs) > 0 {
+			where += " AND m.sender = ANY(" + al.add(filters.SenderJIDs) + ")"
+		}
+		if filters.MentionJID != "" {
+			where += " AND m.content ILIKE " + al.add("%"+filters.MentionJID+"%")
+		}
+
+		q := `SELECT m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp,
+		       m.is_from_me, m.media_type, m.filename, m.url, m.media_key,
+		       m.file_sha256, m.file_enc_sha256, m.file_length, m.push_name,
+		       m.quoted_message_id, m.quoted_participant, '' AS snippet
+		       FROM messages m
+		       WHERE ` + where + `
+		       ORDER BY m.timestamp ASC LIMIT ` + al.add(limit)
+
+		rows, err := s.db.Query(q, al.args...)
+		if err != nil {
+			return nil, fmt.Errorf("query triggers for %s: %w", jid, err)
+		}
+		msgs, err := scanMessages(rows)
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("scan triggers for %s: %w", jid, err)
+		}
+		if len(msgs) == 0 {
+			continue
+		}
+
+		result.Groups[jid] = TriggerGroupResult{Count: len(msgs), Messages: msgs}
+		result.Total += len(msgs)
+		advances[jid] = msgs[len(msgs)-1].Timestamp
+	}
+
+	// 4. Advance watermarks for chats that produced messages (skip on dry-run).
+	if !dryRun && len(advances) > 0 {
+		if err := s.submit(func(tx *sql.Tx) error {
+			for jid, ts := range advances {
+				if _, err := tx.Exec(
+					`INSERT INTO watermarks (jid, last_seen) VALUES ($1, $2)
+					 ON CONFLICT (jid) DO UPDATE SET last_seen = EXCLUDED.last_seen`,
+					jid, ts,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("advance watermarks: %w", err)
+		}
+	}
+
+	return result, nil
 }
