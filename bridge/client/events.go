@@ -10,6 +10,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/indexer"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
@@ -184,6 +185,59 @@ func (c *Client) processMessage(evt *events.Message) {
 			"content", truncate(content, 80),
 		)
 	}
+
+	// Enrichment capture: populate messages_media (for the downloader/transcriber
+	// workers) and extract links from the text body. These never auto-download;
+	// they only persist rows the workers poll.
+	c.captureMedia(evt.Message, evt.Info.ID, chatJID, mediaType, filename, url, fileLength)
+	c.captureLinks(content, evt.Info.ID, chatJID, sender, evt.Info.Timestamp)
+}
+
+// captureMedia writes the normalized messages_media row for a media message.
+// It is a no-op for non-media messages. The messages_media FK references
+// messages(id, chat_jid), so the parent message must already be upserted.
+func (c *Client) captureMedia(msg *waE2E.Message, msgID, chatJID, mediaType, filename, url string, fileLength uint64) {
+	if mediaType == "" {
+		return
+	}
+	mediaKey, fileSHA256, fileEncSHA256 := extractMediaCrypto(msg)
+	media := &store.MediaRow{
+		MessageID:     msgID,
+		ChatJID:       chatJID,
+		MediaType:     mediaType,
+		MimeType:      extractMediaMime(msg),
+		Filename:      filename,
+		FileLength:    int64(fileLength),
+		MediaKey:      mediaKey,
+		FileSHA256:    fileSHA256,
+		FileEncSHA256: fileEncSHA256,
+		URL:           url,
+		DirectPath:    extractMediaDirectPath(msg),
+	}
+	if err := c.Store.UpsertMessageMedia(media); err != nil {
+		c.log.Warn("failed to upsert messages_media", "id", msgID, "err", err)
+	}
+}
+
+// captureLinks extracts URLs from message text and persists one links row per
+// distinct URL. Non-text or link-free messages produce no rows.
+func (c *Client) captureLinks(content, msgID, chatJID, sender string, ts time.Time) {
+	if content == "" {
+		return
+	}
+	for _, l := range indexer.ExtractLinks(content) {
+		row := &store.LinkRow{
+			URL:       l.URL,
+			Platform:  l.Platform,
+			SenderJID: sender,
+			ChatJID:   chatJID,
+			MessageID: msgID,
+			Timestamp: ts,
+		}
+		if err := c.Store.InsertLink(row); err != nil {
+			c.log.Warn("failed to insert link", "id", msgID, "url", l.URL, "err", err)
+		}
+	}
 }
 
 // processHistorySync iterates over synced conversations and stores messages.
@@ -271,6 +325,10 @@ func (c *Client) processHistorySync(evt *events.HistorySync) {
 				continue
 			}
 			stored++
+
+			// Enrichment capture for historically-synced media and links.
+			c.captureMedia(wm.GetMessage(), msgID, chatJID, mediaType, filename, url, fileLength)
+			c.captureLinks(content, msgID, chatJID, sender, ts)
 
 			if ts.After(latestTime) {
 				latestTime = ts
@@ -422,6 +480,74 @@ func extractMediaInfo(msg *waE2E.Message) (
 	}
 
 	return
+}
+
+// extractMediaCrypto returns the decryption material for whichever media
+// sub-message is present, mirroring the set captured by extractMediaInfo.
+func extractMediaCrypto(msg *waE2E.Message) (mediaKey, fileSHA256, fileEncSHA256 []byte) {
+	if msg == nil {
+		return
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		m := msg.GetImageMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	case msg.GetVideoMessage() != nil:
+		m := msg.GetVideoMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	case msg.GetAudioMessage() != nil:
+		m := msg.GetAudioMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	case msg.GetDocumentMessage() != nil:
+		m := msg.GetDocumentMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	case msg.GetStickerMessage() != nil:
+		m := msg.GetStickerMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	}
+	return
+}
+
+// extractMediaMime returns the MIME type of whichever media sub-message is present.
+func extractMediaMime(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetMimetype()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetMimetype()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetMimetype()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetMimetype()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetMimetype()
+	}
+	return ""
+}
+
+// extractMediaDirectPath returns the server-side direct path of whichever media
+// sub-message is present. The downloader prefers this over a re-derivation from
+// the public URL.
+func extractMediaDirectPath(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetDirectPath()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetDirectPath()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetDirectPath()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetDirectPath()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetDirectPath()
+	}
+	return ""
 }
 
 func nowStamp() string {
