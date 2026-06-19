@@ -56,6 +56,15 @@ func NewServer(addr string, h *Handler, log *slog.Logger) *Server {
 		r.Post("/download", h.DownloadMedia)
 		r.Post("/telemetry/tool", h.RecordToolCall)
 
+		// Media analysis is a thin proxy to the L3 transcriber, whose frame
+		// extraction + transcription can take well over a minute. Give this one
+		// route a 190s timeout (overriding the global 60s middleware) so the
+		// request is bounded by the analyzer client timeout rather than chi.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(190 * time.Second))
+			r.Post("/media/analyze", h.HandleMediaAnalyze)
+		})
+
 		// Send routes (rate-limited, anti-ban).
 		r.Group(func(r chi.Router) {
 			r.Use(rl.Middleware)
@@ -68,10 +77,15 @@ func NewServer(addr string, h *Handler, log *slog.Logger) *Server {
 	})
 
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:        addr,
+		Handler:     r,
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout must exceed the slowest route. POST /api/media/analyze
+		// proxies the L3 transcriber (frame extraction + transcription), which
+		// can run well past a minute; chi cannot exempt a single route from the
+		// server-wide write deadline, so it is widened to 200s for all routes.
+		// Safe because the bridge binds loopback / compose-internal with no auth.
+		WriteTimeout: 200 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

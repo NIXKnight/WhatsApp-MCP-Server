@@ -15,6 +15,11 @@ import (
 // so it is kept short to avoid stalling interactive searches.
 const defaultEmbedderTimeout = 2 * time.Second
 
+// defaultAnalyzerTimeout bounds each media-analysis request to the L3
+// transcriber service. Analysis is heavy (video frame extraction, audio
+// transcription) so the deadline is generous relative to other outbound calls.
+const defaultAnalyzerTimeout = 180 * time.Second
+
 // Config holds all runtime configuration for the bridge.
 type Config struct {
 	// Addr is the TCP address to bind the HTTP server to (default: 127.0.0.1:8080).
@@ -30,6 +35,11 @@ type Config struct {
 	EmbedderURL string
 	// EmbedderTimeout bounds each outbound embedding request.
 	EmbedderTimeout time.Duration
+	// AnalyzerURL is the base URL of the L3 transcriber service used for
+	// on-demand media analysis (default: http://transcriber:8500).
+	AnalyzerURL string
+	// AnalyzerTimeout bounds each outbound media-analysis request.
+	AnalyzerTimeout time.Duration
 }
 
 // Load reads configuration from environment variables, applying defaults for
@@ -40,6 +50,7 @@ func Load() (*Config, error) {
 	dataDir := getEnv("BRIDGE_DATA_DIR", "./data")
 	logLevelStr := getEnv("BRIDGE_LOG_LEVEL", "info")
 	embedderURL := getEnv("EMBEDDER_URL", "http://embedder:8000")
+	analyzerURL := getEnv("ANALYZER_URL", "http://transcriber:8500")
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
@@ -77,6 +88,8 @@ func Load() (*Config, error) {
 		LogLevel:        logLevel,
 		EmbedderURL:     embedderURL,
 		EmbedderTimeout: defaultEmbedderTimeout,
+		AnalyzerURL:     analyzerURL,
+		AnalyzerTimeout: defaultAnalyzerTimeout,
 	}, nil
 }
 
