@@ -1,11 +1,23 @@
-"""Transcription worker: polls PostgreSQL for untranscribed audio, sends to Whisper, updates DB.
+"""Transcription worker (L3 enrichment): polls PostgreSQL for untranscribed audio, calls a persistent whisper.cpp ``whisper-server`` over HTTP, updates DB.
 
 The database schema is owned by the bridge migrations (``bridge/migrations``).
 This worker is strictly a data plane: it never creates tables or alters columns.
 It reads/writes the bridge-owned ``messages_media`` table only.
 
+Transcription backend:
+  Audio is transcribed by a persistent whisper.cpp ``whisper-server`` reached
+  over HTTP (``WHISPER_URL``, default ``http://127.0.0.1:8443``). The model
+  (ggml-large-v3) stays resident in the server process, so each request is a
+  warm inference — no per-file 3 GB model reload. The worker POSTs the raw
+  audio file to ``/inference`` as multipart/form-data; the server runs with
+  ``--convert`` and ffmpeg-decodes ogg/opus/etc. server-side, so the file is
+  sent as-is with NO client-side pre-conversion. Language auto-detection is
+  left to the server (chats are Urdu/English/Punjabi).
+
 Resilience:
-  * If Whisper is down, back off exponentially and retry next cycle.
+  * If a transcription request fails with a connection error (server not up, or
+    the model is still loading), treat it as transient: back off and retry on a
+    later cycle. A down/warming server never permanent-fails a row.
   * If the local audio file is missing, re-download via the bridge API.
   * Flip ``download_permanently_failed`` on terminal HTTP codes (403/404/410) or
     after N attempts so dead media (expired WhatsApp blobs) leaves the pool.
@@ -17,18 +29,17 @@ Target schema (bridge-owned ``messages_media``):
     transcription, transcription_lang, transcribed_at
 
 Usage:
-    whatsapp-transcriber --pg "$DATABASE_URL" --whisper "$WHISPER_URL"
+    whatsapp-transcriber --pg "$DATABASE_URL" --whisper-url "$WHISPER_URL"
 
 Environment variables (CLI args take precedence):
     DATABASE_URL        - PostgreSQL DSN (bridge convention; required)
     PG_DSN              - fallback DSN if DATABASE_URL is unset
     BRIDGE_URL          - bridge API base for re-download (default: http://bridge:8080)
-    WHISPER_URL         - Whisper API endpoint (default: http://127.0.0.1:8443)
-    WHISPER_MODEL       - Whisper model name (default: large-v3)
-    WHISPER_LANGUAGE    - forced transcription language (default: ur)
+    WHISPER_URL         - whisper.cpp whisper-server base URL
+                          (default: http://127.0.0.1:8443); the worker POSTs
+                          audio to ``{WHISPER_URL}/inference``
     TRANSCRIBE_BATCH_SIZE    - rows per cycle (default: 20)
     TRANSCRIBE_POLL_INTERVAL - seconds between polls when idle (default: 30)
-    REDOWNLOAD_DIR      - shared dir for re-downloaded media (default: /data)
 """
 
 from __future__ import annotations
@@ -36,11 +47,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import shutil
 import signal
-import subprocess
 import sys
-import tempfile
 import time
 from types import FrameType
 
@@ -50,21 +58,20 @@ import psycopg2
 logger = logging.getLogger("whatsapp_transcriber")
 
 DEFAULT_WHISPER_URL = "http://127.0.0.1:8443"
-DEFAULT_WHISPER_MODEL = "large-v3"
 DEFAULT_BRIDGE_URL = "http://bridge:8080"
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_POLL_INTERVAL = 30
-DEFAULT_REDOWNLOAD_DIR = "/data"
 MAX_DOWNLOAD_ATTEMPTS = 8
 MAX_BACKOFF = 300  # 5 minutes
 RECONNECT_BACKOFF = 5
+TRANSCRIBE_TIMEOUT = 300  # generous: whisper.cpp on a long voice note
 
-# Sentinel: a present-but-unconvertible audio file. Distinct from None (transient
-# whisper/download failure -> retry) so the loop gives up instead of retrying forever.
+# Sentinel: a present-but-unprocessable audio file (server rejects the input as
+# undecodable). Distinct from None (transient server failure -> retry) so the
+# loop gives up instead of retrying forever.
 UNPROCESSABLE = object()
 
 running = True
-whisper_available = True
 consecutive_failures = 0
 
 
@@ -166,110 +173,83 @@ def record_redownload_failure(
         )
 
 
-def check_whisper(whisper_url: str) -> bool:
-    """Return True if the Whisper API is reachable."""
-    try:
-        resp = httpx.get(f"{whisper_url}/", timeout=5.0)
-        return resp.status_code < 500
-    except Exception:
-        return False
+def transcribe_file(file_path: str, whisper_url: str):
+    """Transcribe audio via the persistent whisper.cpp ``whisper-server``.
 
-
-def convert_to_wav(file_path: str) -> str | None:
-    """Convert audio to WAV via opusdec (preferred), ffmpeg, or afconvert (macOS).
-
-    whisper.cpp requires WAV input — it rejects raw ogg/opus. Returns the path to
-    a temporary WAV file, or None on failure.
-    """
-    fd, wav_path = tempfile.mkstemp(suffix=".wav")  # mkstemp is TOCTOU-safe
-    os.close(fd)
-
-    # opusdec handles ogg/opus natively.
-    if shutil.which("opusdec"):
-        try:
-            subprocess.run(["opusdec", file_path, wav_path], capture_output=True, timeout=30)
-            if os.path.isfile(wav_path) and os.path.getsize(wav_path) > 0:
-                return wav_path
-        except Exception as e:
-            logger.debug("opusdec failed: %s", e)
-
-    # ffmpeg fallback (Linux containers).
-    if shutil.which("ffmpeg"):
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", file_path, "-ar", "16000", "-ac", "1", wav_path],
-                capture_output=True,
-                timeout=30,
-            )
-            if os.path.isfile(wav_path) and os.path.getsize(wav_path) > 0:
-                return wav_path
-        except Exception as e:
-            logger.debug("ffmpeg failed: %s", e)
-
-    # afconvert fallback (macOS built-in).
-    if shutil.which("afconvert"):
-        try:
-            subprocess.run(
-                ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", file_path, wav_path],
-                capture_output=True,
-                timeout=30,
-            )
-            if os.path.isfile(wav_path) and os.path.getsize(wav_path) > 0:
-                return wav_path
-        except Exception as e:
-            logger.debug("afconvert failed: %s", e)
-
-    if os.path.isfile(wav_path):
-        os.unlink(wav_path)
-    return None
-
-
-def transcribe_file(file_path: str, whisper_url: str, model: str):
-    """Convert audio to WAV and POST to the whisper.cpp /inference endpoint.
+    POSTs the raw audio file to ``{whisper_url}/inference`` as
+    multipart/form-data (``file``, ``response_format=json``,
+    ``temperature=0.0``). The server runs with ``--convert`` and ffmpeg-decodes
+    the input server-side, so the file is sent as-is — no pre-conversion here.
+    Success response is ``{"text": " ...\\n"}``; we return ``text.strip()``.
 
     Returns:
         str          - transcription text (possibly empty for silence)
-        None         - transient failure (whisper down / network) -> retry
-        UNPROCESSABLE- file present but cannot be converted -> give up
+        None         - transient failure (server down / model loading / timeout
+                       / 5xx) -> retry on a later cycle. A connection error is
+                       explicitly transient so a warming server never wedges.
+        UNPROCESSABLE- server rejected the input as undecodable (4xx that is not
+                       a transient condition) -> give up so the row leaves the
+                       pending pool instead of retrying forever.
     """
     if not os.path.isfile(file_path):
         return None
 
-    wav_path = convert_to_wav(file_path)
-    if not wav_path:
-        logger.warning("WAV conversion failed (unprocessable) for %s", file_path)
+    try:
+        with open(file_path, "rb") as audio:
+            resp = httpx.post(
+                f"{whisper_url}/inference",
+                files={"file": (os.path.basename(file_path), audio, "application/octet-stream")},
+                data={"response_format": "json", "temperature": "0.0"},
+                timeout=TRANSCRIBE_TIMEOUT,
+            )
+    except httpx.ConnectError as e:
+        # Server not up yet, or the 3 GB model is still loading. Transient by
+        # definition — do NOT permanent-fail; retry on a later cycle.
+        logger.warning("whisper-server unreachable (%s): %s", whisper_url, e)
+        return None
+    except httpx.TimeoutException:
+        logger.warning("transcription timed out after %ds: %s", TRANSCRIBE_TIMEOUT, file_path)
+        return None
+    except httpx.HTTPError as e:
+        logger.warning("transcription request error: %s", e)
+        return None
+
+    if resp.status_code >= 500:
+        # Server-side fault (e.g. transient model/decoder hiccup) — retry later.
+        logger.warning(
+            "whisper-server %d for %s: %s",
+            resp.status_code,
+            file_path,
+            resp.text[:500],
+        )
+        return None
+    if resp.status_code >= 400:
+        # Client error: the server could not decode/accept this input. The file
+        # itself will never transcribe — mark unprocessable so it drains.
+        logger.warning(
+            "whisper-server rejected %s (%d): %s",
+            file_path,
+            resp.status_code,
+            resp.text[:500],
+        )
         return UNPROCESSABLE
 
     try:
-        with open(wav_path, "rb") as f:
-            resp = httpx.post(
-                f"{whisper_url}/inference",
-                files={"file": (os.path.basename(wav_path), f, "audio/wav")},
-                data={
-                    "temperature": "0.0",
-                    "response_format": "json",
-                    "language": os.environ.get("WHISPER_LANGUAGE", "ur"),
-                },
-                timeout=120.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("text", "").strip()
+        data = resp.json()
     except Exception as e:
-        logger.warning("transcription failed: %s", e)
+        logger.warning("whisper-server returned non-JSON for %s: %s", file_path, e)
         return None
-    finally:
-        if os.path.isfile(wav_path):
-            os.unlink(wav_path)
+
+    return (data.get("text") or "").strip()
 
 
-def redownload_audio(
-    msg_id: str, chat_jid: str, bridge_url: str, output_dir: str
-) -> tuple[str | None, str]:
+def redownload_audio(msg_id: str, chat_jid: str, bridge_url: str) -> tuple[str | None, str]:
     """Re-download audio via the bridge ``POST /api/download`` when the local file is missing.
 
     Request body matches the bridge DownloadRequest struct
-    (bridge/api/types.go): ``{message_id, chat_jid, output_dir}``.
+    (bridge/api/types.go): ``{message_id, chat_jid}``. ``output_dir`` is omitted
+    deliberately — the bridge then writes into its own data dir, and the worker
+    (same host/user as the bridge) reads the returned ``file_path`` directly.
     Response is DownloadResponse: ``{file_path, media_type, file_size}``.
 
     Returns (file_path, "") on success, (None, "<error>") on failure. The error
@@ -277,10 +257,9 @@ def redownload_audio(
     download_permanently_failed.
     """
     try:
-        os.makedirs(output_dir, exist_ok=True)
         resp = httpx.post(
             f"{bridge_url}/api/download",
-            json={"message_id": msg_id, "chat_jid": chat_jid, "output_dir": output_dir},
+            json={"message_id": msg_id, "chat_jid": chat_jid},
             timeout=60.0,
         )
         if resp.status_code >= 400:
@@ -337,42 +316,37 @@ def update_local_path(
 def run_loop(
     pg_dsn: str,
     whisper_url: str,
-    model: str,
     bridge_url: str,
     batch_size: int,
     poll_interval: int,
-    redownload_dir: str,
 ) -> None:
     """Main transcription loop."""
-    global whisper_available, consecutive_failures
+    global consecutive_failures
 
     pg_conn = connect(pg_dsn)
-    lang = os.environ.get("WHISPER_LANGUAGE", "ur")
 
     logger.info(
-        "transcription worker started (whisper=%s, model=%s, bridge=%s, poll=%ds)",
+        "transcription worker started (whisper_url=%s, bridge=%s, poll=%ds)",
         whisper_url,
-        model,
         bridge_url,
         poll_interval,
     )
 
     while running:
         try:
-            # Periodic Whisper availability gate with exponential backoff.
-            if not whisper_available or consecutive_failures >= 3:
-                if check_whisper(whisper_url):
-                    if not whisper_available:
-                        logger.info("Whisper is back online")
-                    whisper_available = True
-                    consecutive_failures = 0
-                else:
-                    if whisper_available:
-                        logger.warning("Whisper is offline, will retry")
-                    whisper_available = False
-                    backoff = min(poll_interval * (2**consecutive_failures), MAX_BACKOFF)
-                    time.sleep(backoff)
-                    continue
+            # Repeated request failures (server down, model loading, GPU
+            # contention) back off exponentially so we do not spin on a backend
+            # that is not ready yet.
+            if consecutive_failures >= 3:
+                backoff = min(poll_interval * (2 ** (consecutive_failures - 2)), MAX_BACKOFF)
+                logger.warning(
+                    "%d consecutive transcription failures, backing off %ds",
+                    consecutive_failures,
+                    backoff,
+                )
+                time.sleep(backoff)
+                consecutive_failures = 0
+                continue
 
             messages = fetch_untranscribed(pg_conn, batch_size)
             if not messages:
@@ -392,7 +366,7 @@ def run_loop(
 
                 # Prefer the on-disk file; re-download via bridge when missing.
                 if not local_path or not os.path.isfile(local_path):
-                    new_path, err = redownload_audio(msg_id, chat_jid, bridge_url, redownload_dir)
+                    new_path, err = redownload_audio(msg_id, chat_jid, bridge_url)
                     if new_path:
                         local_path = new_path
                         update_local_path(pg_conn, msg_id, chat_jid, local_path)
@@ -402,10 +376,11 @@ def run_loop(
                         failed += 1
                         continue
 
-                text = transcribe_file(local_path, whisper_url, model)
+                text = transcribe_file(local_path, whisper_url)
                 if text is UNPROCESSABLE:
-                    # Present file that won't convert — give up so it leaves the pool.
-                    update_transcription(pg_conn, msg_id, chat_jid, "[unprocessable]", lang)
+                    # Present file the server cannot decode — give up so it
+                    # leaves the pool instead of retrying forever.
+                    update_transcription(pg_conn, msg_id, chat_jid, "[unprocessable]")
                     logger.warning("marked unprocessable: %s", msg_id)
                     consecutive_failures = 0
                     transcribed += 1
@@ -421,12 +396,15 @@ def run_loop(
                 consecutive_failures = 0
 
                 if text:
-                    update_transcription(pg_conn, msg_id, chat_jid, text, lang)
+                    # transcription_lang left NULL: the server auto-detects and
+                    # does not report the detected language back to us.
+                    update_transcription(pg_conn, msg_id, chat_jid, text)
                     logger.info("transcribed %s: %s", msg_id, text[:80])
                     transcribed += 1
                 else:
-                    # Empty transcription (silence) — stamp so it isn't retried.
-                    update_transcription(pg_conn, msg_id, chat_jid, "[silence]", lang)
+                    # Empty text (silence / no speech) — stamp so it is not
+                    # retried and leaves the pending pool.
+                    update_transcription(pg_conn, msg_id, chat_jid, "[no speech]")
                     transcribed += 1
 
             if transcribed or failed:
@@ -470,8 +448,11 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="WhatsApp voice note transcription worker")
     parser.add_argument("--pg", default="")
-    parser.add_argument("--whisper", default=os.environ.get("WHISPER_URL", DEFAULT_WHISPER_URL))
-    parser.add_argument("--model", default=os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL))
+    parser.add_argument(
+        "--whisper-url",
+        default=os.environ.get("WHISPER_URL", DEFAULT_WHISPER_URL),
+        help="whisper.cpp whisper-server base URL; audio is POSTed to /inference",
+    )
     parser.add_argument("--bridge", default=os.environ.get("BRIDGE_URL", DEFAULT_BRIDGE_URL))
     parser.add_argument(
         "--batch-size",
@@ -483,10 +464,6 @@ def main() -> None:
         type=int,
         default=int(os.environ.get("TRANSCRIBE_POLL_INTERVAL", DEFAULT_POLL_INTERVAL)),
     )
-    parser.add_argument(
-        "--redownload-dir",
-        default=os.environ.get("REDOWNLOAD_DIR", DEFAULT_REDOWNLOAD_DIR),
-    )
     args = parser.parse_args()
 
     dsn = resolve_dsn(args.pg)
@@ -496,12 +473,10 @@ def main() -> None:
 
     run_loop(
         dsn,
-        args.whisper,
-        args.model,
+        args.whisper_url,
         args.bridge,
         args.batch_size,
         args.poll_interval,
-        args.redownload_dir,
     )
 
 
