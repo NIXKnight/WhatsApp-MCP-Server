@@ -58,6 +58,9 @@ Requires=whatsapp-bridge.service
 Type=simple
 ExecStart=%h/.local/share/whatsapp-mcp-server-venv/bin/whatsapp-mcp
 WorkingDirectory=%h/.local/share/whatsapp-mcp-server
+Environment=MCP_TRANSPORT=http
+Environment=MCP_HOST=127.0.0.1
+Environment=MCP_PORT=3000
 EnvironmentFile=-%h/.config/whatsapp-bridge/env
 Restart=on-failure
 RestartSec=5
