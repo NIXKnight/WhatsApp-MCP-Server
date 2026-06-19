@@ -34,6 +34,11 @@ _READ_TIMEOUT = 30.0
 _WRITE_TIMEOUT = 30.0
 _POOL_TIMEOUT = 5.0
 
+# Media analysis (frame sampling + audio transcription) on the bridge can run
+# for up to ~3 minutes; the default 30s read timeout would abort it.  Applied
+# per-call by :meth:`BridgeClient.analyze_media`.
+_ANALYZE_READ_TIMEOUT = 200.0
+
 
 class BridgeUnavailableError(RuntimeError):
     """Raised when the Go WhatsApp bridge cannot be reached."""
@@ -188,7 +193,12 @@ class BridgeClient:
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"Bridge request timed out: {exc}") from exc
 
-    async def _post_raw(self, path: str, json: dict[str, Any] | None = None) -> Any:
+    async def _post_raw(
+        self,
+        path: str,
+        json: dict[str, Any] | None = None,
+        timeout: httpx.Timeout | None = None,
+    ) -> Any:
         """Execute a POST without the inter-send throttle.  Never retried.
 
         Shared request + error-translation core for both :meth:`post` (which
@@ -199,6 +209,10 @@ class BridgeClient:
         Args:
             path: URL path relative to the bridge base URL.
             json: Request body serialised as JSON.
+            timeout: Optional per-request timeout override.  When ``None`` the
+                client's default timeout applies.  Used by long-running
+                endpoints (e.g. media analysis) that exceed the default read
+                timeout.
 
         Returns:
             Parsed JSON response body (dict, list, or scalar).
@@ -208,7 +222,10 @@ class BridgeClient:
                 request timeout.  503 is translated to "WhatsApp not connected.".
         """
         try:
-            resp = await self._client.post(path, json=json)
+            if timeout is not None:
+                resp = await self._client.post(path, json=json, timeout=timeout)
+            else:
+                resp = await self._client.post(path, json=json)
             resp.raise_for_status()
             return resp.json()
         except httpx.ConnectError as exc:
@@ -439,6 +456,37 @@ class BridgeClient:
         if dry_run:
             body["dry_run"] = True
         return await self._post_raw("/api/check/triggers", json=body)
+
+    async def analyze_media(self, chat_jid: str, message_id: str) -> Any:
+        """Analyze a message's media via ``POST /api/media/analyze``.
+
+        Triggers bridge-side media analysis: the bridge samples video frames
+        and transcribes the audio track, returning the on-disk frame image
+        paths and the transcript.  Not a send route — bypasses the inter-send
+        throttle via :meth:`_post_raw` and is never retried.
+
+        Analysis can run for up to ~3 minutes, so a longer per-call read
+        timeout (:data:`_ANALYZE_READ_TIMEOUT`) is applied; the connect, write,
+        and pool timeouts keep their defaults.
+
+        Args:
+            chat_jid: JID of the chat the message belongs to.
+            message_id: ID of the message whose media is analyzed.
+
+        Returns:
+            Parsed JSON: ``{"frame_paths": [...], "transcription": "...",
+            "duration": N, "frame_count": N}``.
+        """
+        return await self._post_raw(
+            "/api/media/analyze",
+            json={"chat_jid": chat_jid, "message_id": message_id},
+            timeout=httpx.Timeout(
+                connect=_CONNECT_TIMEOUT,
+                read=_ANALYZE_READ_TIMEOUT,
+                write=_WRITE_TIMEOUT,
+                pool=_POOL_TIMEOUT,
+            ),
+        )
 
     async def record_tool_call(
         self,
