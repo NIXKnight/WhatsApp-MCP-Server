@@ -99,6 +99,23 @@ services:
     stop_grace_period: 20s
     restart: unless-stopped
 
+  dashboard:
+    build: ./dashboard
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "9090:9090"
+    environment:
+      DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
+      BRIDGE_URL: "http://bridge:8080"
+      DASHBOARD_HOST: "0.0.0.0"
+      DASHBOARD_PORT: "9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bridge:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   bridge-data:

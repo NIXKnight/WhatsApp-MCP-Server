@@ -1,0 +1,110 @@
+name: Nightly Dependency Update
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 3 AM UTC daily
+  workflow_dispatch:       # Allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-go-deps:
+    name: Update Go Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Update Go dependencies
+        working-directory: bridge
+        run: |
+          go get -u ./...
+          go mod tidy
+
+      - name: Build and test
+        working-directory: bridge
+        run: |
+          CGO_ENABLED=0 go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: Check for changes
+        id: go-changes
+        working-directory: bridge
+        run: |
+          if git diff --quiet go.mod go.sum; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR for Go deps
+        if: steps.go-changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(deps): update Go dependencies"
+          title: "chore(deps): nightly Go dependency update"
+          body: |
+            Automated nightly update of Go dependencies.
+
+            - `go get -u ./...` + `go mod tidy`
+            - Build: passing
+            - Vet: passing
+            - Tests: passing
+          branch: deps/go-nightly
+          delete-branch: true
+          labels: dependencies
+
+  update-python-deps:
+    name: Update Python Dependencies
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [mcp-server, embedder, transcriber, dashboard]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Update and check Python dependencies
+        working-directory: ${{ matrix.project }}
+        run: |
+          uv lock --upgrade
+
+      - name: Check for changes
+        id: py-changes
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR for Python deps
+        if: steps.py-changes.outputs.changed == 'true'
+        env:
+          PROJECT_NAME: ${{ matrix.project }}
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(deps): update Python dependencies (${{ matrix.project }})"
+          title: "chore(deps): nightly Python dependency update (${{ matrix.project }})"
+          body: |
+            Automated nightly update of Python dependencies for `${{ matrix.project }}`.
+
+            - `uv lock --upgrade`
+          branch: deps/python-${{ matrix.project }}-nightly
+          delete-branch: true
+          labels: dependencies

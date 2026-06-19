@@ -1,0 +1,39 @@
+<h2>Connection</h2>
+<div class="stat">
+    <span class="stat-label">State</span>
+    <span class="stat-value">
+        {% if status.is_connected %}
+        <span class="badge badge-green">{{ status.state }}</span>
+        {% elif status.state == 'UNREACHABLE' %}
+        <span class="badge badge-red">UNREACHABLE</span>
+        {% else %}
+        <span class="badge badge-yellow">{{ status.state }}</span>
+        {% endif %}
+    </span>
+</div>
+{% if status.identity %}
+<div class="stat">
+    <span class="stat-label">Phone</span>
+    <span class="stat-value">{{ status.identity.phone }}</span>
+</div>
+<div class="stat">
+    <span class="stat-label">JID</span>
+    <span class="stat-value ts">{{ status.identity.jid }}</span>
+</div>
+<div class="stat">
+    <span class="stat-label">Name</span>
+    <span class="stat-value">{{ status.identity.push_name or '-' }}</span>
+</div>
+{% endif %}
+<div class="stat">
+    <span class="stat-label">Uptime</span>
+    <span class="stat-value ts">{{ status.uptime or '-' }}</span>
+</div>
+<div class="stat">
+    <span class="stat-label">Messages</span>
+    <span class="stat-value">{{ status.message_count or 0 }}</span>
+</div>
+<div class="stat">
+    <span class="stat-label">Chats</span>
+    <span class="stat-value">{{ status.chat_count or 0 }}</span>
+</div>

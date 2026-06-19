@@ -1,0 +1,34 @@
+<h2>Recent Messages</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Group/Chat</th>
+            <th>Sender</th>
+            <th>Content</th>
+            <th>Type</th>
+            <th>Time</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for m in recent_messages %}
+        <tr>
+            <td>{{ m.chat_name or m.chat_jid[:20] }}</td>
+            <td>{{ m.resolved_name or m.push_name or m.sender_name or m.sender[:15] }}</td>
+            <td class="truncate">{{ m.content[:80] if m.content else ('[' + m.media_type + ']' if m.media_type else '-') }}</td>
+            <td>
+                {% if m.media_type %}
+                <span class="badge badge-purple">{{ m.media_type }}</span>
+                {% elif m.is_from_me %}
+                <span class="badge badge-blue">sent</span>
+                {% else %}
+                <span class="ts">text</span>
+                {% endif %}
+            </td>
+            <td class="ts">{{ m.time_fmt or m.timestamp }}</td>
+        </tr>
+        {% endfor %}
+        {% if not recent_messages %}
+        <tr><td colspan="5" class="ts">No messages yet</td></tr>
+        {% endif %}
+    </tbody>
+</table>
