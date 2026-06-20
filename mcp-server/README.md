@@ -1,10 +1,10 @@
 # WhatsApp MCP Server
 
-Python FastMCP server exposing 12 WhatsApp tools over the Model Context Protocol. Communicates with the Go WhatsApp bridge via REST HTTP, allowing Claude Code and Claude Desktop to send messages, check unread chats, download media, and more.
+Python FastMCP server exposing 20 WhatsApp tools over the Model Context Protocol. Communicates with the Go WhatsApp bridge via REST HTTP, allowing Claude Code and Claude Desktop to send messages, check unread chats, react to / edit / revoke messages, search history, download and analyze media, and more.
 
 ## Overview
 
-This is a [FastMCP](https://github.com/modelcontextprotocol/python-sdk) implementation that bridges the Python/Claude ecosystem to WhatsApp via the Go bridge. It supports both MCP stdio transport and SSE transport (for Docker).
+This is a [FastMCP](https://github.com/jlowin/fastmcp) implementation (the `fastmcp>=2.0` package) that bridges the Python/Claude ecosystem to WhatsApp via the Go bridge. It supports three MCP transports: `stdio` (default, for Claude Code / Desktop), `sse`, and `http` (streamable-HTTP) for containerized deployments.
 
 **Prerequisites:**
 - Python 3.11+
@@ -66,11 +66,11 @@ Configure your MCP client:
 |----------|---------|-------------|
 | `BRIDGE_URL` | `http://localhost:8080` | Base URL of the Go WhatsApp bridge. Must be running and accessible. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Invalid values revert to `INFO`. |
-| `MCP_TRANSPORT` | `stdio` | Transport protocol: `stdio` or `sse`. |
-| `MCP_HOST` | `0.0.0.0` | Bind address for SSE transport. |
-| `MCP_PORT` | `3000` | Port for SSE transport. |
-| `WORKSPACE_DIR` | `/workspace` | Container workspace directory for media files. |
-| `WORKSPACE_HOST_PATH` | (none) | Host path prefix for automatic path translation. |
+| `MCP_TRANSPORT` | `stdio` | Transport protocol: `stdio`, `sse`, or `http` (streamable-HTTP). |
+| `MCP_HOST` | `0.0.0.0` | Bind address for the `sse` / `http` network transports. |
+| `MCP_PORT` | `3000` | Port for the `sse` / `http` network transports. |
+| `WORKSPACE_DIR` | `/workspace` | Container workspace directory for media files. `download_media` saves into this directory. |
+| `WORKSPACE_HOST_PATH` | (none) | Host path prefix for automatic `send_media` path translation. |
 
 Example:
 
@@ -125,18 +125,22 @@ Add this to `~/.claude/claude_desktop_config.json`:
 
 ## MCP Tools Reference
 
-All tools communicate with the Go bridge and return JSON strings. Errors raise `RuntimeError` with descriptive messages.
+20 tools across five modules (`src/whatsapp_mcp/tools/`). All tools communicate with the Go bridge and return JSON strings. Errors raise `RuntimeError` with descriptive messages.
 
-### Message Tools (5 tools)
+### Message Tools (10 tools)
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
-| `send_message` | `to`, `text`, `mentions?`, `quoted_message_id?`, `quoted_participant?` | Send a plain-text message to an individual contact; supports optional `mentions` list for @-mentions |
-| `send_group_message` | `to`, `text`, `mentions?`, `quoted_message_id?`, `quoted_participant?` | Send a plain-text message to a group chat; supports optional `mentions` list for @-mentions |
-| `check_new_messages` | `since` (Unix ms), `limit?` (1-500, default 100) | Poll for new messages since a Unix millisecond timestamp |
-| `get_messages` | `jid`, `limit?` (default 20, max 500) | Retrieve recent messages from a specific chat (individual or group) |
+| `send_message` | `to`, `text`, `quoted_message_id?`, `quoted_participant?`, `mentions?` | Send a plain-text message to an individual contact; supports optional `mentions` list for @-mentions |
+| `check_new_messages` | `since` (Unix ms), `limit?` (1-500, default 100), `chat_jid?` | Poll for new messages since a Unix millisecond timestamp; optionally restrict to a single chat |
+| `get_messages` | `jid`, `limit?` (default 20, max 500) | Retrieve recent messages from a specific chat (individual or group), newest first |
 | `get_unread_chats` | `message_limit?` (default 5) | List all chats with unread messages and recent message previews |
 | `get_unread_messages` | None | Flat list of all unread messages across all chats |
+| `get_group_context` | `jid`, `limit?` (default 20) | Compact recent-turn window for a group chat in chronological order; strips own messages and empty content |
+| `send_reaction` | `chat_jid`, `message_id`, `emoji`, `sender?` | React to a message with an emoji; pass an empty `emoji` string to remove a prior reaction |
+| `edit_message` | `chat_jid`, `message_id`, `new_text` | Edit the text of a message previously sent by this account |
+| `revoke_message` | `chat_jid`, `message_id`, `sender?` | Revoke (delete for everyone) a message; supply `sender` only when an admin revokes another member's message |
+| `check_triggers` | `jids`, `mention_jid?`, `sender_jids?`, `limit?` (default 100), `dry_run?` (default False) | Batched multi-chat check using per-chat server-side watermarks; advances each watermark unless `dry_run` |
 
 ### Contact Tools (2 tools)
 
@@ -145,20 +149,28 @@ All tools communicate with the Go bridge and return JSON strings. Errors raise `
 | `list_contacts` | None | Return all known WhatsApp contacts from the bridge store |
 | `get_contact` | `jid` | Retrieve metadata for a single contact by JID |
 
-### Group Tools (3 tools)
+### Group Tools (4 tools)
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
 | `list_groups` | None | List all group chats the account belongs to |
 | `get_group` | `jid` | Fetch full group metadata including participant list and admin flags |
-| `send_group_message` | `to`, `text`, `quoted_message_id?`, `quoted_participant?` | Send a message to a group chat |
+| `send_group_message` | `jid`, `text`, `quoted_message_id?`, `quoted_participant?`, `mentions?` | Send a plain-text message to a group chat (`jid` must end with `@g.us`); supports optional `mentions` list |
+| `send_auto_message` | `jid`, `text`, `quoted_message_id?`, `quoted_participant?`, `mentions?` | Send to any JID, auto-routing to individual or group by suffix (bare numbers are treated as individuals) |
 
-### Media Tools (2 tools)
+### Media Tools (3 tools)
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
 | `send_media` | `to`, `file_path`, `caption?`, `media_type?` (auto-detect), `ptt?` (default False) | Send image, video, audio, or document to a contact or group |
-| `download_media` | `message_id`, `chat_jid`, `output_dir?` | Download and decrypt media from a received message |
+| `download_media` | `message_id`, `chat_jid` | Download and decrypt media from a received message into `WORKSPACE_DIR` |
+| `analyze_media` | `chat_jid`, `message_id` | Sample video frames + transcribe audio on the bridge; returns `frame_paths` / `transcription` / `duration` / `frame_count` |
+
+### Search Tools (1 tool)
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `semantic_search` | `query`, `chat_jid?`, `sender?`, `limit?` (default 10, bridge clamps 1-100) | Hybrid full-text + vector RRF search via `POST /api/search`; the query is embedded at query time by the bridge |
 
 ## Tool Details
 
@@ -173,9 +185,11 @@ All message tools accept recipient JIDs in two formats:
 **Group chats:**
 - Group JID: `120363039783372408@g.us`
 
+`send_message` and `send_auto_message` accept either form. `send_group_message` requires a `@g.us` JID and rejects anything else. `send_auto_message` inspects the JID suffix and routes individual versus group automatically.
+
 ### Timestamps
 
-`check_new_messages` uses Unix milliseconds (13-digit timestamps, e.g., `1700000000000`). Pass `since=0` on the first call to retrieve recent history.
+`check_new_messages` uses Unix milliseconds (13-digit timestamps, e.g., `1700000000000`). Pass `since=0` on the first call to retrieve recent history. `check_triggers` does not take a timestamp — it tracks per-chat watermarks server-side, so each call returns only messages unseen since the previous call (unless `dry_run=True`).
 
 ### Quoting/Replying
 
@@ -193,6 +207,10 @@ Example:
   "quotedParticipant": "923009876543@s.whatsapp.net"
 }
 ```
+
+### Mentions
+
+`send_message`, `send_group_message`, and `send_auto_message` accept an optional `mentions` list of JIDs (use phone JIDs, e.g. `["923224387030@s.whatsapp.net"]`). The message text should contain matching `@phone` placeholders (e.g. `@923224387030`) so WhatsApp renders them as display names.
 
 ### Media Types
 
@@ -215,6 +233,23 @@ To send a WhatsApp voice note (push-to-talk):
 
 The bridge marks the audio with the PTT flag so it appears as a voice note in WhatsApp.
 
+### Downloading vs Analyzing Media
+
+`download_media` only fetches and decrypts the raw attachment bytes to a file under `WORKSPACE_DIR`; the output directory is fixed internally and is not a tool parameter.
+
+`analyze_media` is a higher-level operation: the bridge samples video frames to disk and transcribes the audio track, returning:
+
+```json
+{
+  "frame_paths": ["/abs/path/frame_000.jpg", "..."],
+  "transcription": "...",
+  "duration": 42.0,
+  "frame_count": 8
+}
+```
+
+The tool returns this result verbatim — it does **not** read the frames. To inspect visual content, the caller must **Read** each absolute path in `frame_paths` (they are image files) and combine what they show with `transcription`. Analysis runs on the bridge and can take a few minutes for longer clips; the call blocks until it finishes (a longer per-call read timeout is applied for this route).
+
 ## Architecture
 
 ### Lifespan Pattern
@@ -227,14 +262,18 @@ The server uses FastMCP's lifespan context to manage the bridge client lifecycle
 
 If the bridge is not reachable during startup, the server fails immediately with a clear error message rather than confusing tool-level errors.
 
+### Telemetry Middleware
+
+A single `TelemetryMiddleware` (registered on the server in `server.py`) wraps every `tools/call`. For each invocation it records the tool name, wall-clock duration in milliseconds, success flag, and error message to the bridge via `POST /api/telemetry/tool`. This is fire-and-forget: timing and recording are handled in one cross-cutting place (no per-tool boilerplate), the tool's return value is never altered, tool exceptions propagate unchanged, and any telemetry failure is swallowed so it can never break a tool call.
+
 ### HTTP Retries
 
 - **GET requests**: Retried up to 3 times on transient network errors (ConnectError, TimeoutException) using exponential backoff (0.5s–5s)
-- **POST requests**: Never retried to prevent duplicate messages or media uploads
+- **POST requests**: Never retried to prevent duplicate messages, media uploads, reactions, edits, or revokes
 
 ### Send Throttling
 
-Send operations (POST) are throttled with a randomized 2-7 second delay between consecutive sends to avoid WhatsApp anti-spam detection.
+Outbound send operations (`send_message`, `send_group_message`, `send_auto_message`, `send_media`, `send_reaction`, `edit_message`, `revoke_message`) are throttled with a randomized 2-7 second delay between consecutive sends to avoid WhatsApp anti-spam detection. Read-only and telemetry POSTs (`semantic_search`, `check_triggers`, `analyze_media`, telemetry) bypass the throttle.
 
 ### Error Handling
 
@@ -303,23 +342,22 @@ mcp-server/
 ├── pyproject.toml                          Project metadata and dependencies
 └── src/whatsapp_mcp/
     ├── __init__.py                         Package marker
-    ├── main.py                             Entry point (logging, print patching, server startup)
-    ├── server.py                           FastMCP server definition and lifespan
-    ├── bridge_client.py                    HTTP client for the Go bridge (retries, timeouts)
-    ├── models.py                           Pydantic models for requests/responses (if used)
+    ├── main.py                             Entry point (logging, print patching, transport selection, server startup)
+    ├── server.py                           FastMCP server definition, lifespan, telemetry middleware, tool registration
+    ├── middleware.py                       TelemetryMiddleware (per-tool-call telemetry to the bridge)
+    ├── bridge_client.py                    HTTP client for the Go bridge (retries, timeouts, send throttle)
     └── tools/
         ├── __init__.py
-        ├── messages.py                     Message tools (send, check, get, unread)
+        ├── messages.py                     Message tools (send, check, get, unread, group context, reaction, edit, revoke, triggers)
         ├── contacts.py                     Contact tools (list, get)
-        ├── groups.py                       Group tools (list, get, send)
-        └── media.py                        Media tools (send, download)
+        ├── groups.py                       Group tools (list, get, send, auto-send)
+        ├── media.py                        Media tools (send, download, analyze)
+        └── search.py                       Search tools (semantic_search)
 ```
 
 ## Development
 
 ### Run Tests
-
-(Tests would be implemented in `tests/` directory)
 
 ```bash
 uv run pytest

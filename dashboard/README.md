@@ -1,9 +1,6 @@
 # WhatsApp Bridge Dashboard
 
-A read-only operations dashboard for the WhatsApp bridge. FastAPI serves an
-HTMX-driven page that shows bridge health and recent activity. It reads
-PostgreSQL directly (queries only — never writes) and polls the bridge's
-`/api/status` endpoint for connection state.
+A read-only operations dashboard for the WhatsApp bridge. FastAPI serves an HTMX-driven page that shows bridge health and recent activity. It reads PostgreSQL directly (queries only — never writes) and polls the bridge's `/api/status` endpoint for connection state.
 
 ## Panels
 
@@ -14,6 +11,7 @@ PostgreSQL directly (queries only — never writes) and polls the bridge's
 | Monitored Groups | `chats` | on page load |
 | Recent Messages | `messages` + `chats` + `contacts` | every 30s (HTMX) |
 | Indexed Links | `links` + `chats` | on page load |
+| Per-platform link counts | `links` (`SELECT platform, COUNT(*) ... GROUP BY platform`) | on page load |
 | Recent Tool Calls | `telemetry_tool_calls` | on page load |
 
 All timestamps are rendered in `Asia/Karachi`.
@@ -27,10 +25,9 @@ All timestamps are rendered in `Asia/Karachi`.
 | `BRIDGE_URL` | `http://127.0.0.1:8080` | Base URL of the Go bridge. |
 | `DASHBOARD_HOST` | `127.0.0.1` | Bind host (the container image sets `0.0.0.0`). |
 | `DASHBOARD_PORT` | `9090` | Listen port. |
-| `CONFIG_PATH` | `../config.toml` | Optional. If present, `bridge.monitoring.watched_group_jids` curates the Monitored Groups panel. |
+| `CONFIG_PATH` | repo-root `config.toml` (four levels up from `app.py`) | Optional. If present, `bridge.monitoring.watched_group_jids` curates the Monitored Groups panel. |
 
-When no `config.toml` is found, the Monitored Groups panel lists every group
-chat (`chats.is_group = TRUE`).
+When no `config.toml` is found, the Monitored Groups panel lists every group chat (`chats.is_group = TRUE`).
 
 ## Run locally
 
@@ -46,8 +43,7 @@ Open http://127.0.0.1:9090.
 
 ## Run with Docker Compose
 
-From the repository root the `dashboard` service is wired to start after
-PostgreSQL and the bridge are healthy:
+From the repository root the `dashboard` service is wired to start after PostgreSQL and the bridge are healthy:
 
 ```bash
 docker compose up -d dashboard
@@ -57,6 +53,4 @@ Open http://localhost:9090.
 
 ## Read-only guarantee
 
-`db.py` opens every pooled connection with `set_session(readonly=True)`, so any
-accidental write fails at the database. The application issues `SELECT`
-statements exclusively.
+`db.py` opens every pooled connection with `set_session(readonly=True, autocommit=True)`, so any accidental write fails at the database. The application issues `SELECT` statements exclusively.

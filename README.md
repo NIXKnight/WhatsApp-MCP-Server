@@ -1,9 +1,6 @@
 # WhatsApp MCP Server
 
-A self-hosted WhatsApp **data platform** with a Model Context Protocol (MCP)
-interface. A Go bridge captures every WhatsApp event into PostgreSQL, Python
-enrichment workers add embeddings and transcriptions, and a Python FastMCP
-server exposes the data and send actions to any MCP/LLM host.
+A self-hosted WhatsApp **data platform** with a Model Context Protocol (MCP) interface. A Go bridge captures every WhatsApp event into PostgreSQL, Python enrichment workers add embeddings and transcriptions, and a Python FastMCP server exposes the data and send actions to any MCP/LLM host.
 
 ---
 
@@ -28,6 +25,7 @@ L2  Capture & Gateway
 L3  Persistence & Enrichment
     bridge/store/         PostgreSQL read/write via pgx pool
     bridge/migrations/    9 golang-migrate pairs (001, 003-010)
+    bridge/mediaretry/    media re-download (retry) worker
     embedder/             poll worker + on-demand /embed server
     transcriber/          poll worker + on-demand /analyze server
 
@@ -40,7 +38,6 @@ L5  Intelligence & Control
 L6  Operations & Observability
     docker-compose.yml    5-service stack
     dashboard/            FastAPI + HTMX read-only view
-    .github/workflows/    nightly dependency CI
     Makefile / scripts/   build, systemd, deploy
 ```
 
@@ -119,7 +116,6 @@ Claude / MCP client  (L5)
 | `embedder/` | L3 | Poll worker + on-demand HTTP server: embeds messages into `vector(384)` using `paraphrase-multilingual-MiniLM-L12-v2` |
 | `transcriber/` | L3 | Poll worker + on-demand HTTP server: transcribes voice notes via whisper.cpp, on-demand video frame extraction via ffmpeg |
 | `dashboard/` | L6 | Read-only FastAPI + HTMX ops view, Tailwind v3.4 / Tremor design language, dark/light toggle, self-hosted FontAwesome |
-| `.github/workflows/nightly-deps.yml` | L6 | Nightly dependency-refresh CI for Go + all 4 Python projects |
 
 ---
 
@@ -139,9 +135,7 @@ Claude / MCP client  (L5)
 
 ### Option A: Docker Compose (recommended)
 
-All six services start with a single command. PostgreSQL, the bridge, the MCP
-server, the embedder, the transcriber, and the dashboard are all provisioned
-automatically.
+All six services start with a single command. PostgreSQL, the bridge, the MCP server, the embedder, the transcriber, and the dashboard are all provisioned automatically.
 
 ```bash
 # Build and start everything
@@ -189,8 +183,7 @@ TRANSCRIBE_POLL_INTERVAL=30
 
 ### Option B: Bare-metal with systemd
 
-The `Makefile` and `scripts/` handle build, venv setup, and systemd unit
-creation. Each component gets its own user-level systemd service.
+The `Makefile` and `scripts/` handle build, venv setup, and systemd unit creation. Each component gets its own user-level systemd service.
 
 ```bash
 # Build and install the Go bridge
@@ -223,13 +216,11 @@ Systemd units are placed in `~/.config/systemd/user/` and named:
 - `whatsapp-dashboard.service`
 - `whatsapp-whisper.service`
 
-Each unit reads an optional env file at `~/.config/whatsapp-bridge/env`; place
-`DATABASE_URL` and other secrets there.
+Each unit reads an optional env file at `~/.config/whatsapp-bridge/env`; place `DATABASE_URL` and other secrets there.
 
 ### Option C: stdio transport (Claude Code / Desktop)
 
-Add to your `.mcp.json` (Claude Code) or `claude_desktop_config.json` (Claude
-Desktop):
+Add to your `.mcp.json` (Claude Code) or `claude_desktop_config.json` (Claude Desktop):
 
 ```json
 {
@@ -266,6 +257,10 @@ All bridge settings are read from environment variables at startup.
 | `BRIDGE_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error`. |
 | `EMBEDDER_URL` | `http://embedder:8000` | Base URL of the L3 embedder (query-time embedding). |
 | `ANALYZER_URL` | `http://transcriber:8500` | Base URL of the L3 transcriber (on-demand media analysis). |
+| `MEDIA_RETRY_ENABLED` | `true` | Enable the background media-retry worker. |
+| `MEDIA_RETRY_INTERVAL` | `3m` | Poll cadence / per-row backoff. |
+| `MEDIA_MAX_DOWNLOAD_ATTEMPTS` | `3` | Attempts before a row is marked permanently failed. |
+| `MEDIA_RETRY_BATCH_SIZE` | `10` | Rows retried per cycle. |
 
 ---
 
@@ -285,9 +280,7 @@ All bridge settings are read from environment variables at startup.
 
 ## MCP Tools
 
-20 tools across five modules (`mcp-server/src/whatsapp_mcp/tools/`).
-Source: `@mcp.tool` decorator count — messages.py:10, groups.py:4, media.py:3,
-contacts.py:2, search.py:1.
+20 tools across five modules (`mcp-server/src/whatsapp_mcp/tools/`). Source: `@mcp.tool` decorator count — messages.py:10, groups.py:4, media.py:3, contacts.py:2, search.py:1.
 
 | Tool | Module | Description |
 |---|---|---|
@@ -316,9 +309,7 @@ contacts.py:2, search.py:1.
 
 ## Bridge HTTP API
 
-25 routes registered in `bridge/api/server.go`. The API binds to
-`127.0.0.1:8080` by default. It has **no authentication** and must not be
-exposed off-host.
+25 routes registered in `bridge/api/server.go`. The API binds to `127.0.0.1:8080` by default. It has **no authentication** and must not be exposed off-host.
 
 ```
 GET    /api/status
@@ -338,7 +329,7 @@ GET    /api/groups/{jid}
 GET    /api/unread
 GET    /api/check
 POST   /api/check/triggers
-POST   /api/download
+POST   /api/download         (200 on hit; 410 MEDIA_PERMANENTLY_UNAVAILABLE terminal / 503 DOWNLOAD_RETRY_PENDING transient; records a download attempt)
 POST   /api/telemetry/tool
 POST   /api/media/analyze    (190s route timeout; proxies L3 transcriber)
 POST   /api/send             (rate-limited: ~2/s sustained, burst 5)
@@ -354,9 +345,7 @@ POST   /api/send/revoke      (rate-limited)
 
 ### PostgreSQL + pgvector
 
-PostgreSQL 17 with the `pgvector` extension is the single source of truth.
-The bridge runs [golang-migrate](https://github.com/golang-migrate/migrate)
-migrations at startup automatically.
+PostgreSQL 17 with the `pgvector` extension is the single source of truth. The bridge runs [golang-migrate](https://github.com/golang-migrate/migrate) migrations at startup automatically.
 
 Migrations: `bridge/migrations/000001`, `000003`–`000010` (9 pairs; no `000002`).
 
@@ -378,16 +367,12 @@ Key tables:
 
 Located in `embedder/`. Runs two concurrent functions:
 
-1. **Poll loop** — reads `messages` where `embedded_at IS NULL AND content <> ''`,
-   encodes in batches, writes `message_embeddings.embedding vector(384)`, stamps
-   `messages.embedded_at`.
-2. **On-demand HTTP server** — listens on `EMBED_HTTP_ADDR` (default
-   `127.0.0.1:8000`):
+1. **Poll loop** — reads `messages` where `embedded_at IS NULL AND content <> ''`, encodes in batches, writes `message_embeddings.embedding vector(384)`, stamps `messages.embedded_at`.
+2. **On-demand HTTP server** — listens on `EMBED_HTTP_ADDR` (default `127.0.0.1:8000`):
    - `POST /embed`   `{"text":"..."}` -> `{"embedding":[384 floats]}`
    - `GET  /health`  -> `{"status":"ok","model":"...","dim":384}`
 
-Model: `paraphrase-multilingual-MiniLM-L12-v2` (sentence-transformers).
-Dimension: 384 — matches the `vector(384)` schema column.
+Model: `paraphrase-multilingual-MiniLM-L12-v2` (sentence-transformers). Dimension: 384 — matches the `vector(384)` schema column.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -401,18 +386,12 @@ Dimension: 384 — matches the `vector(384)` schema column.
 
 Located in `transcriber/`. Runs two concurrent functions:
 
-1. **Poll loop** — reads `messages_media` where `media_type = 'audio' AND
-   transcribed_at IS NULL`, re-downloads missing files via the bridge if needed,
-   posts raw audio to whisper.cpp `/inference`, writes `messages_media.transcription`.
-2. **On-demand HTTP server** — listens on `ANALYZER_HTTP_ADDR` (default
-   `127.0.0.1:8500`):
-   - `POST /analyze` `{"chat_jid":"...","message_id":"..."}` ->
-     `{"frame_paths":[...],"transcription":"...","duration":<float>,"frame_count":<int>}`
+1. **Poll loop** — reads `messages_media` where `media_type = 'audio' AND transcribed_at IS NULL AND NOT download_permanently_failed`, re-downloads missing files via the bridge if needed, posts raw audio to whisper.cpp `/inference`, writes `messages_media.transcription`.
+2. **On-demand HTTP server** — listens on `ANALYZER_HTTP_ADDR` (default `127.0.0.1:8500`):
+   - `POST /analyze` `{"chat_jid":"...","message_id":"..."}` -> `{"frame_paths":[...],"transcription":"...","duration":<float>,"frame_count":<int>}`
    - `GET  /health`  -> `{"status":"ok"}`
 
-The `/analyze` handler downloads the video via the bridge, extracts up to 8 keyframes
-at 1 fps with ffmpeg, demuxes audio to 16 kHz mono WAV, and transcribes with
-Whisper. Videos longer than 600 seconds are rejected.
+The `/analyze` handler downloads the video via the bridge, extracts up to 8 keyframes at 1 fps with ffmpeg, demuxes audio to 16 kHz mono WAV, and transcribes with Whisper. Videos longer than 600 seconds are rejected.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -420,24 +399,24 @@ Whisper. Videos longer than 600 seconds are rejected.
 | `BRIDGE_URL` | `http://bridge:8080` | Bridge base URL (for media re-download) |
 | `WHISPER_URL` | `http://127.0.0.1:8443` | whisper.cpp server base URL; audio posted to `{WHISPER_URL}/inference` |
 | `WHISPER_MODEL` | `large-v3` | Informational only; the model is loaded by whisper-server |
-| `WHISPER_LANGUAGE` | `ur` | Language hint (compose default) |
+| `WHISPER_LANGUAGE` | `ur` | Informational; the whisper-server auto-detects; set in compose only |
 | `TRANSCRIBE_BATCH_SIZE` | `20` | Rows per cycle |
 | `TRANSCRIBE_POLL_INTERVAL` | `30` | Seconds between idle polls |
 | `ANALYZER_HTTP_ADDR` | `127.0.0.1:8500` | Bind address for on-demand /analyze + /health |
+
+### Media-retry worker (L3)
+
+A bridge-co-resident Go worker (`bridge/mediaretry/`, co-resident because re-download needs the live whatsmeow session). It polls `messages_media` for previously-requested media that failed to download (`download_attempts > 0`, requested-only — captured-but-never-requested media is left untouched), retries at the `MEDIA_RETRY_INTERVAL` cadence up to `MEDIA_MAX_DOWNLOAD_ATTEMPTS`, then sets `download_permanently_failed`. Scope is non-audio media (image, video, sticker, document); audio stays with the transcriber.
 
 ### Hybrid Search
 
 `POST /api/search` accepts `{"query":"...","chat_jid":"...","limit":20}`.
 
-When the caller supplies only `query` text, the bridge calls
-`POST http://embedder:8000/embed` to obtain a query vector at query time,
-then runs hybrid Reciprocal Rank Fusion over:
+When the caller supplies only `query` text, the bridge calls `POST http://embedder:8000/embed` to obtain a query vector at query time, then runs hybrid Reciprocal Rank Fusion over:
 - PostgreSQL full-text search (`plainto_tsquery('simple', ...)` on `content_fts`)
 - pgvector cosine distance (`<=>`) on `message_embeddings`
 
-If the embedder is unreachable (2-second timeout), search degrades to FTS-only
-without erroring the request. Results carry a `match_type` field: `"fts"`,
-`"semantic"`, or `"both"`.
+If the embedder is unreachable (2-second timeout), search degrades to FTS-only without erroring the request. Results carry a `match_type` field: `"fts"`, `"semantic"`, or `"both"`.
 
 ---
 
@@ -472,15 +451,11 @@ transcriber/worker.py  analyze_video()
  "frame_count":8}
 ```
 
-The MCP tool returns the result verbatim. The LLM host must **Read** each path
-in `frame_paths` (they are absolute image files) to inspect visual content.
+The MCP tool returns the result verbatim. The LLM host must **Read** each path in `frame_paths` (they are absolute image files) to inspect visual content.
 
 ### Voice Note Duration Fix
 
-`bridge/media/ogg.go` parses the OGG Opus container in-process (no external
-commands) to derive the real audio duration and a 64-sample waveform from the
-granule position. Previously sent voice notes reported a hardcoded 30-second
-duration; they now report the real duration.
+`bridge/media/ogg.go` parses the OGG Opus container in-process (no external commands) to derive the real audio duration and a 64-sample waveform from the granule position. Previously sent voice notes reported a hardcoded 30-second duration; they now report the real duration.
 
 ---
 
@@ -488,13 +463,9 @@ duration; they now report the real duration.
 
 ### Dashboard
 
-`dashboard/` is a FastAPI + HTMX application running on port 9090 (default).
-It is read-only: all SQL is SELECT-only via psycopg2.
+`dashboard/` is a FastAPI + HTMX application running on port 9090 (default). It is read-only: all SQL is SELECT-only via psycopg2.
 
-**Recent restyle:** Tailwind v3.4 built with the standalone Tailwind CLI (no
-Node required), Tremor design language color tokens, dark/light mode toggle with
-no-flash script (respects OS preference and `localStorage.theme`), self-hosted
-FontAwesome icons served from `/static/fontawesome/`.
+**Recent restyle:** Tailwind v3.4 built with the standalone Tailwind CLI (no Node required), Tremor design language color tokens, dark/light mode toggle with no-flash script (respects OS preference and `localStorage.theme`), self-hosted FontAwesome icons served from `/static/fontawesome/`.
 
 Views and HTMX partials (auto-refresh every 30 seconds):
 
@@ -516,37 +487,22 @@ Dashboard env vars:
 
 ### Telemetry Tables
 
-The MCP server's `TelemetryMiddleware` records every tool call to
-`POST /api/telemetry/tool` on the bridge, which writes to PostgreSQL:
+The MCP server's `TelemetryMiddleware` records every tool call to `POST /api/telemetry/tool` on the bridge, which writes to PostgreSQL:
 
-- `telemetry_daily` — daily rolling counters: `messages_sent`,
-  `messages_received`, `media_downloaded`, `media_sent`, `links_indexed`.
-- `telemetry_tool_calls` — per-call rows: `tool_name`, `duration_ms`,
-  `success`, `error_msg`, `called_at`.
-
-### CI
-
-`.github/workflows/nightly-deps.yml` runs at 03:00 UTC daily. It updates Go
-dependencies (`go get -u ./... && go mod tidy`), builds and vets the bridge,
-and runs `uv lock --upgrade` for each Python project (mcp-server, embedder,
-transcriber, dashboard). Passing updates are opened as pull requests.
+- `telemetry_daily` — daily rolling counters: `messages_sent`, `messages_received`, `media_downloaded`, `media_sent`, `links_indexed`.
+- `telemetry_tool_calls` — per-call rows: `tool_name`, `duration_ms`, `success`, `error_msg`, `called_at`.
 
 ---
 
 ## Connection Handling
 
-The Go bridge implements a supervised connection state machine in
-`bridge/connection/`:
+The Go bridge implements a supervised connection state machine in `bridge/connection/`:
 
 - Exponential backoff reconnection: 1s, 2s, 4s, 8s, 16s, 32s, 60s (repeating).
-- Handles `TemporaryBan`, `ClientOutdated`, `ConnectFailure`, and
-  `StreamReplaced` events from whatsmeow.
-- Cooldown marker (10-minute file on disk, exit code 2) prevents supervisor
-  restart loops after bans.
-- Keepalive monitor (`bridge/connection/keepalive.go`) forces reconnect after 3
-  consecutive timeouts.
-- Outbound send routes are rate-limited (token-bucket: ~2 sends/s sustained,
-  burst 5, up to 300 ms human-timing jitter) and are never retried.
+- Handles `TemporaryBan`, `ClientOutdated`, `ConnectFailure`, and `StreamReplaced` events from whatsmeow.
+- Cooldown marker (10-minute file on disk, exit code 2) prevents supervisor restart loops after bans.
+- Keepalive monitor (`bridge/connection/keepalive.go`) forces reconnect after 3 consecutive timeouts.
+- Outbound send routes are rate-limited (token-bucket: ~2 sends/s sustained, burst 5, up to 300 ms human-timing jitter) and are never retried.
 
 ---
 
@@ -564,18 +520,13 @@ python -m py_compile <path/to/changed/file.py>
 
 ## Contributor Guide
 
-See [`CLAUDE.md`](CLAUDE.md) for the 6-layer model, the directory-to-layer map,
-where to place new code, and the hard rules (PostgreSQL-only, schema
-bridge-owned, no DB driver in L4, send routes never retried).
+See [`CLAUDE.md`](CLAUDE.md) for the 6-layer model, the directory-to-layer map, where to place new code, and the hard rules (PostgreSQL-only, schema bridge-owned, no DB driver in L4, send routes never retried).
 
 ---
 
 ## Acknowledgements
 
-The work done in [PR #1](https://github.com/NIXKnight/WhatsApp-MCP-Server/pull/1) is
-inspired by the open-source
-[`asimzeeshan/WhatsApp-bridge`](https://github.com/asimzeeshan/WhatsApp-bridge),
-reimplemented and extended for this stack.
+The work done in [PR #1](https://github.com/NIXKnight/WhatsApp-MCP-Server/pull/1) is inspired by the open-source [`asimzeeshan/WhatsApp-bridge`](https://github.com/asimzeeshan/WhatsApp-bridge), reimplemented and extended for this stack.
 
 ## License
 
