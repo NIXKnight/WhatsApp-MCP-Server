@@ -20,3 +20,4 @@ __pycache__/
 dist/
 build/
 bridge/whatsapp-bridge
+.playwright*
