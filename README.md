@@ -572,7 +572,8 @@ bridge-owned, no DB driver in L4, send routes never retried).
 
 ## Acknowledgements
 
-This work is inspired by the open-source
+The work done in [PR #1](https://github.com/NIXKnight/WhatsApp-MCP-Server/pull/1) is
+inspired by the open-source
 [`asimzeeshan/WhatsApp-bridge`](https://github.com/asimzeeshan/WhatsApp-bridge),
 reimplemented and extended for this stack.
 
