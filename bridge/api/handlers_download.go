@@ -53,9 +53,40 @@ func (h *Handler) DownloadMedia(w http.ResponseWriter, r *http.Request) {
 
 	result, err := media.Download(r.Context(), h.client.WA, msg, outDir)
 	if err != nil {
-		h.log.Error("download media", "message_id", req.MessageID, "err", err)
-		writeError(w, http.StatusInternalServerError, "download failed", "DOWNLOAD_ERROR")
+		// Seed the retry queue: bump the attempt counter and let the store decide
+		// permanence atomically. The background media-retry worker will pick this
+		// row up on its next cycle (download_attempts is now > 0). The cross-cycle
+		// time gap is the recovery mechanism for transient 403/410 (stale URL).
+		structural := media.ClassifyDownloadError(err)
+		permanent, derr := h.store.MarkMediaDownloadFailed(
+			req.MessageID, req.ChatJID, err.Error(), structural, h.maxDownloadAttempts,
+		)
+		if derr != nil {
+			h.log.Error("record download failure", "message_id", req.MessageID, "err", derr)
+		}
+
+		// Log only a short error class — never the URL, direct path, or media key.
+		h.log.Warn("download media failed",
+			"message_id", req.MessageID,
+			"class", media.DownloadErrorClass(err),
+			"permanent", permanent,
+		)
+
+		if permanent {
+			writeError(w, http.StatusGone,
+				"media is permanently unavailable and will not be retried",
+				"MEDIA_PERMANENTLY_UNAVAILABLE")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable,
+			"media download failed; a background retry is pending",
+			"DOWNLOAD_RETRY_PENDING")
 		return
+	}
+
+	// Success: stamp local_path so the retry worker skips this row.
+	if err := h.store.MarkMediaDownloaded(req.MessageID, req.ChatJID, result.Path); err != nil {
+		h.log.Warn("record successful download", "message_id", req.MessageID, "err", err)
 	}
 
 	writeJSON(w, http.StatusOK, DownloadResponse{

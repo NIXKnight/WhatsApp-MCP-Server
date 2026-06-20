@@ -21,18 +21,27 @@ type Handler struct {
 	analyzer  *analyzer.Client
 	log       *slog.Logger
 	startedAt time.Time
+	// maxDownloadAttempts mirrors the media-retry worker's attempt budget so a
+	// failed on-demand download retires the row at the same threshold the worker
+	// uses, keeping the two paths consistent.
+	maxDownloadAttempts int
 }
 
 // NewHandler creates a Handler bound to the given client, store, embedder, and
-// analyzer.
-func NewHandler(c *client.Client, s *store.Store, e *embed.Client, a *analyzer.Client, log *slog.Logger) *Handler {
+// analyzer. maxDownloadAttempts bounds the on-demand download retry budget,
+// shared with the background media-retry worker.
+func NewHandler(c *client.Client, s *store.Store, e *embed.Client, a *analyzer.Client, maxDownloadAttempts int, log *slog.Logger) *Handler {
+	if maxDownloadAttempts <= 0 {
+		maxDownloadAttempts = 3
+	}
 	return &Handler{
-		client:    c,
-		store:     s,
-		embedder:  e,
-		analyzer:  a,
-		log:       log,
-		startedAt: time.Now(),
+		client:              c,
+		store:               s,
+		embedder:            e,
+		analyzer:            a,
+		log:                 log,
+		startedAt:           time.Now(),
+		maxDownloadAttempts: maxDownloadAttempts,
 	}
 }
 

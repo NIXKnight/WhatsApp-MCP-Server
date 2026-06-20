@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/client"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/config"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/embed"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/mediaretry"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
@@ -124,7 +126,7 @@ func main() {
 	// "connection refused" error.
 	embedder := embed.New(cfg.EmbedderURL, cfg.EmbedderTimeout)
 	analyzer := analyzer.New(cfg.AnalyzerURL, cfg.AnalyzerTimeout)
-	h := api.NewHandler(waClient, st, embedder, analyzer, log.With("component", "api"))
+	h := api.NewHandler(waClient, st, embedder, analyzer, cfg.MediaMaxDownloadAttempts, log.With("component", "api"))
 	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"))
 
 	srvErrCh := make(chan error, 1)
@@ -191,6 +193,30 @@ func main() {
 	clearCooldownMarker(cfg.DataDir)
 	log.Info("WhatsApp connection established")
 
+	// ---- Background media-retry worker -------------------------------------
+	// Re-download non-audio media that was requested on-demand and failed. It is
+	// started only after the session is up (downloading needs the live whatsmeow
+	// client) and is cancelled + awaited during graceful shutdown. When disabled
+	// the goroutine never starts.
+	var mediaRetryCancel context.CancelFunc
+	var mediaRetryWG sync.WaitGroup
+	if cfg.MediaRetryEnabled {
+		mrCtx, cancel := context.WithCancel(context.Background())
+		mediaRetryCancel = cancel
+		worker := mediaretry.New(
+			waClient, st,
+			cfg.MediaRetryInterval, cfg.MediaMaxDownloadAttempts, cfg.MediaRetryBatchSize,
+			log.With("component", "mediaretry"),
+		)
+		mediaRetryWG.Add(1)
+		go func() {
+			defer mediaRetryWG.Done()
+			worker.Run(mrCtx)
+		}()
+	} else {
+		log.Info("media-retry worker disabled")
+	}
+
 	// ---- Wait for termination signal ---------------------------------------
 	select {
 	case sig := <-sigCh:
@@ -209,11 +235,19 @@ func main() {
 	}
 	log.Info("HTTP server stopped")
 
-	// 2. Disconnect from WhatsApp.
+	// 2. Stop the media-retry worker before disconnecting/closing, so no
+	//    in-flight download races the WhatsApp disconnect or the store close.
+	if mediaRetryCancel != nil {
+		mediaRetryCancel()
+		mediaRetryWG.Wait()
+		log.Info("media-retry worker stopped")
+	}
+
+	// 3. Disconnect from WhatsApp.
 	waClient.Disconnect()
 	log.Info("WhatsApp client disconnected")
 
-	// 3. Close the message store.
+	// 4. Close the message store.
 	if err := st.Close(); err != nil {
 		log.Warn("store close error", "err", err)
 	}

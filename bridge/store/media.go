@@ -93,21 +93,33 @@ func (s *Store) MarkMediaDownloaded(messageID, chatJID, localPath string) error 
 	})
 }
 
-// MarkMediaDownloadFailed increments the attempt counter and records the error.
-// When permanent is true the row is flagged so polling workers skip it.
-func (s *Store) MarkMediaDownloadFailed(messageID, chatJID, errMsg string, permanent bool) error {
-	return s.submit(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
+// MarkMediaDownloadFailed increments the attempt counter, records a (truncated)
+// error string, and atomically decides permanence in SQL to avoid a
+// read-then-write race: the row is flagged download_permanently_failed when the
+// error is structurally hopeless (structural == true, e.g. a missing media
+// descriptor) OR the attempt about to be recorded reaches maxAttempts. It
+// returns the resulting permanence so callers can signal a terminal vs.
+// retry-pending outcome.
+//
+// Transient HTTP failures (403/404/410 — usually a stale signed URL) are NOT
+// structural; they are retried across cycles and only retired once they exhaust
+// maxAttempts.
+func (s *Store) MarkMediaDownloadFailed(messageID, chatJID, errMsg string, structural bool, maxAttempts int) (bool, error) {
+	var permanent bool
+	err := s.submit(func(tx *sql.Tx) error {
+		return tx.QueryRow(
 			`UPDATE messages_media
 			    SET download_attempts = download_attempts + 1,
-			        download_last_error = $1,
+			        download_last_error = LEFT($1, 500),
 			        download_last_attempt_at = NOW(),
-			        download_permanently_failed = $2
-			  WHERE message_id = $3 AND chat_jid = $4`,
-			errMsg, permanent, messageID, chatJID,
-		)
-		return err
+			        download_permanently_failed =
+			            (download_permanently_failed OR $2 OR download_attempts + 1 >= $3)
+			  WHERE message_id = $4 AND chat_jid = $5
+			  RETURNING download_permanently_failed`,
+			errMsg, structural, maxAttempts, messageID, chatJID,
+		).Scan(&permanent)
 	})
+	return permanent, err
 }
 
 // SetMediaTranscription stores a transcription result and stamps transcribed_at.
@@ -168,6 +180,53 @@ func (s *Store) ListPendingTranscriptions(limit int) ([]MediaRow, error) {
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list pending transcriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []MediaRow
+	for rows.Next() {
+		m, err := scanMediaRowFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+// ListRetryableMedia returns non-audio media rows that were already requested
+// on-demand and failed (download_attempts > 0), have no local file yet, have not
+// permanently failed, and have not yet exhausted maxAttempts. Oldest first.
+//
+// Scope is REQUESTED-ONLY: the download_attempts > 0 predicate ensures the
+// worker never eagerly downloads media that was merely captured. The WHERE
+// clause is a superset of idx_mm_pending_download (local_path IS NULL,
+// NOT download_permanently_failed, the non-audio media_type set) so that partial
+// index is eligible; audio is owned by the Python transcriber.
+func (s *Store) ListRetryableMedia(maxAttempts, limit int) ([]MediaRow, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.Query(
+		`SELECT message_id, chat_jid, media_type,
+		        COALESCE(mime_type, ''), COALESCE(filename, ''), COALESCE(file_length, 0),
+		        media_key, file_sha256, file_enc_sha256,
+		        COALESCE(url, ''), COALESCE(direct_path, ''),
+		        COALESCE(local_path, ''), downloaded_at, download_attempts,
+		        download_permanently_failed,
+		        COALESCE(transcription, ''), COALESCE(transcription_lang, ''), transcribed_at
+		   FROM messages_media
+		  WHERE local_path IS NULL
+		    AND NOT download_permanently_failed
+		    AND media_type IN ('image','video','sticker','document')
+		    AND download_attempts > 0
+		    AND download_attempts < $1
+		  ORDER BY created_at ASC
+		  LIMIT $2`,
+		maxAttempts, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list retryable media: %w", err)
 	}
 	defer rows.Close()
 
