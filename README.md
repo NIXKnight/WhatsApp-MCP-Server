@@ -195,6 +195,10 @@ The Go bridge implements a connection state machine:
 - Keepalive monitoring with forced reconnect after 3 consecutive timeouts
 - Outbound send routes are rate-limited (token bucket) and never retried
 
+## Acknowledgements
+
+This work is inspired by the open-source [`asimzeeshan/WhatsApp-bridge`](https://github.com/asimzeeshan/WhatsApp-bridge), reimplemented and extended for this stack.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
