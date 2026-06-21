@@ -30,18 +30,16 @@ func Download(ctx context.Context, client *whatsmeow.Client, msg *store.MessageR
 		return nil, fmt.Errorf("message has no media")
 	}
 
-	// If outDir looks like the bridge dataDir (no "media" suffix), append it.
-	if !strings.HasSuffix(filepath.ToSlash(outDir), "/media") {
-		outDir = filepath.Join(outDir, "media")
+	localPath := ResolveLocalPath(outDir, msg.ChatJID, msg.Filename)
+	destDir := filepath.Dir(localPath)
+	if err := os.MkdirAll(destDir, 0700); err != nil {
+		// LOCAL destination failure: the caller-supplied output dir cannot be
+		// created (unwritable mount, denied permission, full disk). This is NOT
+		// a media-availability failure — return a typed LocalDestError so the
+		// handler skips the retry/permanent-fail bookkeeping and tells the
+		// caller its output_dir is the problem.
+		return nil, newLocalDestError("create media dir", destDir, err)
 	}
-
-	// Build a safe subdirectory name from the chat JID.
-	chatDir := filepath.Join(outDir, sanitizeJID(msg.ChatJID))
-	if err := os.MkdirAll(chatDir, 0700); err != nil {
-		return nil, fmt.Errorf("create media dir: %w", err)
-	}
-
-	localPath := filepath.Join(chatDir, filepath.Base(msg.Filename))
 
 	// Return the cached file if it already exists.
 	if info, err := os.Stat(localPath); err == nil {
@@ -82,7 +80,10 @@ func Download(ctx context.Context, client *whatsmeow.Client, msg *store.MessageR
 	}
 
 	if err := os.WriteFile(localPath, data, 0600); err != nil {
-		return nil, fmt.Errorf("write file %q: %w", localPath, err)
+		// The media decrypted fine (client.Download succeeded above); only the
+		// local write failed. Treat it as a destination problem, not a media
+		// failure, so an unwritable target never poisons availability state.
+		return nil, newLocalDestError("write file", destDir, err)
 	}
 
 	return &DownloadResult{
@@ -126,6 +127,20 @@ func extractDirectPath(rawURL string) string {
 		pathPart = pathPart[:idx]
 	}
 	return "/" + pathPart
+}
+
+// ResolveLocalPath computes the on-disk path where media for chatJID/filename
+// lives under outDir, applying the same rules Download uses to write it:
+// outDir gains a trailing "media" segment unless it already ends in one, the
+// chat JID is sanitised into a sub-directory, and only the base name of
+// filename is used. Sharing this between Download and callers that want to find
+// or place a cached copy keeps the two from drifting apart.
+func ResolveLocalPath(outDir, chatJID, filename string) string {
+	// If outDir looks like the bridge dataDir (no "media" suffix), append it.
+	if !strings.HasSuffix(filepath.ToSlash(outDir), "/media") {
+		outDir = filepath.Join(outDir, "media")
+	}
+	return filepath.Join(outDir, sanitizeJID(chatJID), filepath.Base(filename))
 }
 
 // sanitizeJID replaces characters that are invalid in file system paths.

@@ -77,13 +77,21 @@ func (s *Store) UpsertMessageMedia(m *MediaRow) error {
 }
 
 // MarkMediaDownloaded records a successful download: stores the local path,
-// stamps downloaded_at, and resets the failure state.
+// stamps downloaded_at, and clears the failure state.
+//
+// A success supersedes every prior failed attempt, so the failure bookkeeping
+// is fully reset: download_attempts back to 0, download_last_error to NULL, and
+// download_permanently_failed to FALSE. This is what lets a successful
+// cache-serve self-heal a row that a transient destination error had wrongly
+// flagged download_permanently_failed: replaying the existing local_path here
+// clears the false-permanent without disturbing the canonical pointer.
 func (s *Store) MarkMediaDownloaded(messageID, chatJID, localPath string) error {
 	return s.submit(func(tx *sql.Tx) error {
 		_, err := tx.Exec(
 			`UPDATE messages_media
 			    SET local_path = $1,
 			        downloaded_at = NOW(),
+			        download_attempts = 0,
 			        download_last_error = NULL,
 			        download_permanently_failed = FALSE
 			  WHERE message_id = $2 AND chat_jid = $3`,

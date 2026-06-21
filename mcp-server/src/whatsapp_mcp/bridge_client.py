@@ -44,6 +44,33 @@ class BridgeUnavailableError(RuntimeError):
     """Raised when the Go WhatsApp bridge cannot be reached."""
 
 
+def _bridge_error_code(response: httpx.Response) -> str:
+    """Extract the bridge's machine-readable error ``code`` from a response.
+
+    The bridge returns a structured JSON envelope for every error response::
+
+        {"error": "<human message>", "code": "<MACHINE_CODE>"}
+
+    Parsing is defensive: a non-JSON body, a JSON body that is not an object,
+    or a missing/non-string ``code`` all yield an empty string rather than
+    raising, so callers can fall back to status-only handling.
+
+    Args:
+        response: The error response carried by an ``httpx.HTTPStatusError``.
+
+    Returns:
+        The ``code`` string if present and well-formed, otherwise ``""``.
+    """
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    code = body.get("code", "")
+    return code if isinstance(code, str) else ""
+
+
 class BridgeClient:
     """Async HTTP client wrapping the Go WhatsApp bridge REST API.
 
@@ -193,6 +220,55 @@ class BridgeClient:
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"Bridge request timed out: {exc}") from exc
 
+    def _translate_http_error(
+        self, exc: httpx.HTTPStatusError, path: str
+    ) -> RuntimeError:
+        """Map a bridge HTTP error to a precise, caller-facing RuntimeError.
+
+        The bridge overloads HTTP 503 for two unrelated conditions, so status
+        alone is ambiguous.  Disambiguation is driven by the structured ``code``
+        field in the bridge's JSON error envelope:
+
+        * ``NOT_CONNECTED`` (503) — the WhatsApp session is genuinely down.
+        * ``DOWNLOAD_RETRY_PENDING`` (503) — a *transient* media-download miss;
+          the bridge is retrying in the background and the call self-heals.
+        * ``MEDIA_PERMANENTLY_UNAVAILABLE`` (410) — the media can never be
+          re-downloaded.
+
+        A 503 carrying no recognized code falls back to a generic "HTTP 503"
+        message rather than the misleading "WhatsApp not connected." assertion,
+        so a stuck download is never reported as a session disconnect.
+
+        Args:
+            exc: The raised status error whose ``response`` carries the body.
+            path: Request path, included in the generic fallback message.
+
+        Returns:
+            A :class:`RuntimeError` (not raised) for the caller to ``raise``.
+        """
+        status = exc.response.status_code
+        code = _bridge_error_code(exc.response)
+
+        if status == 503 and code == "DOWNLOAD_RETRY_PENDING":
+            return RuntimeError(
+                "Media download is pending: the bridge could not fetch it this "
+                "moment and is retrying in the background. Try again shortly."
+            )
+        if status == 410 and code == "MEDIA_PERMANENTLY_UNAVAILABLE":
+            return RuntimeError(
+                "Media is permanently unavailable and cannot be re-downloaded."
+            )
+        if status == 503 and code == "NOT_CONNECTED":
+            return RuntimeError("WhatsApp not connected.")
+        if status == 503:
+            # Unknown 503 — do NOT assert a disconnect.  Surface the raw body so
+            # the cause is visible instead of guessed.
+            return RuntimeError(f"Bridge returned HTTP 503: {exc.response.text}")
+
+        return RuntimeError(
+            f"Bridge returned HTTP {status} for POST {path}: {exc.response.text}"
+        )
+
     async def _post_raw(
         self,
         path: str,
@@ -219,7 +295,12 @@ class BridgeClient:
 
         Raises:
             RuntimeError: On connection failure, non-2xx HTTP status, or
-                request timeout.  503 is translated to "WhatsApp not connected.".
+                request timeout.  HTTP errors are disambiguated by the bridge's
+                ``code`` field: ``NOT_CONNECTED`` (503) -> "WhatsApp not
+                connected."; ``DOWNLOAD_RETRY_PENDING`` (503) -> a transient
+                media-pending message; ``MEDIA_PERMANENTLY_UNAVAILABLE`` (410)
+                -> a permanent-media message.  A 503 with no recognized code
+                yields a generic "HTTP 503" message, not a false disconnect.
         """
         try:
             if timeout is not None:
@@ -234,12 +315,7 @@ class BridgeClient:
                 "Ensure the Go bridge is running."
             ) from exc
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 503:
-                raise RuntimeError("WhatsApp not connected.") from exc
-            raise RuntimeError(
-                f"Bridge returned HTTP {exc.response.status_code} for POST {path}: "
-                f"{exc.response.text}"
-            ) from exc
+            raise self._translate_http_error(exc, path) from exc
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"Bridge request timed out: {exc}") from exc
 
@@ -293,12 +369,7 @@ class BridgeClient:
                 "Ensure the Go bridge is running."
             ) from exc
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 503:
-                raise RuntimeError("WhatsApp not connected.") from exc
-            raise RuntimeError(
-                f"Bridge returned HTTP {exc.response.status_code} for POST {path}: "
-                f"{exc.response.text}"
-            ) from exc
+            raise self._translate_http_error(exc, path) from exc
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"Bridge request timed out: {exc}") from exc
 
