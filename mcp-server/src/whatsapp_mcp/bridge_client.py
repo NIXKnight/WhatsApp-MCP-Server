@@ -34,9 +34,41 @@ _READ_TIMEOUT = 30.0
 _WRITE_TIMEOUT = 30.0
 _POOL_TIMEOUT = 5.0
 
+# Media analysis (frame sampling + audio transcription) on the bridge can run
+# for up to ~3 minutes; the default 30s read timeout would abort it.  Applied
+# per-call by :meth:`BridgeClient.analyze_media`.
+_ANALYZE_READ_TIMEOUT = 200.0
+
 
 class BridgeUnavailableError(RuntimeError):
     """Raised when the Go WhatsApp bridge cannot be reached."""
+
+
+def _bridge_error_code(response: httpx.Response) -> str:
+    """Extract the bridge's machine-readable error ``code`` from a response.
+
+    The bridge returns a structured JSON envelope for every error response::
+
+        {"error": "<human message>", "code": "<MACHINE_CODE>"}
+
+    Parsing is defensive: a non-JSON body, a JSON body that is not an object,
+    or a missing/non-string ``code`` all yield an empty string rather than
+    raising, so callers can fall back to status-only handling.
+
+    Args:
+        response: The error response carried by an ``httpx.HTTPStatusError``.
+
+    Returns:
+        The ``code`` string if present and well-formed, otherwise ``""``.
+    """
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    code = body.get("code", "")
+    return code if isinstance(code, str) else ""
 
 
 class BridgeClient:
@@ -188,8 +220,112 @@ class BridgeClient:
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"Bridge request timed out: {exc}") from exc
 
+    def _translate_http_error(
+        self, exc: httpx.HTTPStatusError, path: str
+    ) -> RuntimeError:
+        """Map a bridge HTTP error to a precise, caller-facing RuntimeError.
+
+        The bridge overloads HTTP 503 for two unrelated conditions, so status
+        alone is ambiguous.  Disambiguation is driven by the structured ``code``
+        field in the bridge's JSON error envelope:
+
+        * ``NOT_CONNECTED`` (503) — the WhatsApp session is genuinely down.
+        * ``DOWNLOAD_RETRY_PENDING`` (503) — a *transient* media-download miss;
+          the bridge is retrying in the background and the call self-heals.
+        * ``MEDIA_PERMANENTLY_UNAVAILABLE`` (410) — the media can never be
+          re-downloaded.
+
+        A 503 carrying no recognized code falls back to a generic "HTTP 503"
+        message rather than the misleading "WhatsApp not connected." assertion,
+        so a stuck download is never reported as a session disconnect.
+
+        Args:
+            exc: The raised status error whose ``response`` carries the body.
+            path: Request path, included in the generic fallback message.
+
+        Returns:
+            A :class:`RuntimeError` (not raised) for the caller to ``raise``.
+        """
+        status = exc.response.status_code
+        code = _bridge_error_code(exc.response)
+
+        if status == 503 and code == "DOWNLOAD_RETRY_PENDING":
+            return RuntimeError(
+                "Media download is pending: the bridge could not fetch it this "
+                "moment and is retrying in the background. Try again shortly."
+            )
+        if status == 410 and code == "MEDIA_PERMANENTLY_UNAVAILABLE":
+            return RuntimeError(
+                "Media is permanently unavailable and cannot be re-downloaded."
+            )
+        if status == 503 and code == "NOT_CONNECTED":
+            return RuntimeError("WhatsApp not connected.")
+        if status == 503:
+            # Unknown 503 — do NOT assert a disconnect.  Surface the raw body so
+            # the cause is visible instead of guessed.
+            return RuntimeError(f"Bridge returned HTTP 503: {exc.response.text}")
+
+        return RuntimeError(
+            f"Bridge returned HTTP {status} for POST {path}: {exc.response.text}"
+        )
+
+    async def _post_raw(
+        self,
+        path: str,
+        json: dict[str, Any] | None = None,
+        timeout: httpx.Timeout | None = None,
+    ) -> Any:
+        """Execute a POST without the inter-send throttle.  Never retried.
+
+        Shared request + error-translation core for both :meth:`post` (which
+        wraps this with :meth:`_throttle_send` for outbound sends) and the
+        read/telemetry POST endpoints (search, trigger checks, telemetry) that
+        must not incur the 2-7 second anti-ban delay.
+
+        Args:
+            path: URL path relative to the bridge base URL.
+            json: Request body serialised as JSON.
+            timeout: Optional per-request timeout override.  When ``None`` the
+                client's default timeout applies.  Used by long-running
+                endpoints (e.g. media analysis) that exceed the default read
+                timeout.
+
+        Returns:
+            Parsed JSON response body (dict, list, or scalar).
+
+        Raises:
+            RuntimeError: On connection failure, non-2xx HTTP status, or
+                request timeout.  HTTP errors are disambiguated by the bridge's
+                ``code`` field: ``NOT_CONNECTED`` (503) -> "WhatsApp not
+                connected."; ``DOWNLOAD_RETRY_PENDING`` (503) -> a transient
+                media-pending message; ``MEDIA_PERMANENTLY_UNAVAILABLE`` (410)
+                -> a permanent-media message.  A 503 with no recognized code
+                yields a generic "HTTP 503" message, not a false disconnect.
+        """
+        try:
+            if timeout is not None:
+                resp = await self._client.post(path, json=json, timeout=timeout)
+            else:
+                resp = await self._client.post(path, json=json)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.ConnectError as exc:
+            raise RuntimeError(
+                f"Bridge unavailable — could not connect to {self._base_url}{path}. "
+                "Ensure the Go bridge is running."
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise self._translate_http_error(exc, path) from exc
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(f"Bridge request timed out: {exc}") from exc
+
     async def post(self, path: str, json: dict[str, Any] | None = None) -> Any:
-        """Perform a POST request against the bridge.  Never retried.
+        """Perform a throttled POST against the bridge.  Never retried.
+
+        Enforces the randomized 2-7 second inter-send delay before issuing the
+        request — used for outbound message/media sends and message mutations
+        (reaction, edit, revoke) where WhatsApp penalises bursts.  Read-only and
+        telemetry POSTs bypass the throttle via :meth:`_post_raw`.
 
         Args:
             path: URL path relative to the bridge base URL (e.g. ``/api/send``).
@@ -202,24 +338,7 @@ class BridgeClient:
             RuntimeError: On connection failure or on a non-2xx HTTP status code.
         """
         await self._throttle_send()
-        try:
-            resp = await self._client.post(path, json=json)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.ConnectError as exc:
-            raise RuntimeError(
-                f"Bridge unavailable — could not connect to {self._base_url}{path}. "
-                "Ensure the Go bridge is running."
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 503:
-                raise RuntimeError("WhatsApp not connected.") from exc
-            raise RuntimeError(
-                f"Bridge returned HTTP {exc.response.status_code} for POST {path}: "
-                f"{exc.response.text}"
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise RuntimeError(f"Bridge request timed out: {exc}") from exc
+        return await self._post_raw(path, json=json)
 
     async def post_multipart(self, path: str, data: dict[str, Any], files: dict[str, Any]) -> Any:
         """Perform a multipart/form-data POST request.  Never retried.
@@ -250,11 +369,225 @@ class BridgeClient:
                 "Ensure the Go bridge is running."
             ) from exc
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 503:
-                raise RuntimeError("WhatsApp not connected.") from exc
-            raise RuntimeError(
-                f"Bridge returned HTTP {exc.response.status_code} for POST {path}: "
-                f"{exc.response.text}"
-            ) from exc
+            raise self._translate_http_error(exc, path) from exc
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"Bridge request timed out: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Typed endpoint wrappers
+    # ------------------------------------------------------------------
+
+    async def search(
+        self,
+        query: str,
+        chat_jid: str | None = None,
+        sender: str | None = None,
+        limit: int = 20,
+    ) -> Any:
+        """Hybrid (RRF) message search via ``POST /api/search``.
+
+        Routes through the bridge's hybrid search endpoint (full-text +
+        optional vector RRF), never a direct database connection.  No embedding
+        is supplied, so the bridge performs a full-text/lexical search.
+
+        Args:
+            query: Natural-language / keyword search string.  Required.
+            chat_jid: Optional JID to restrict the search to a single chat.
+            sender: Optional sender JID filter.  Forwarded to the bridge for
+                forward-compatibility; the bridge ignores fields it does not
+                yet support.
+            limit: Maximum results (bridge clamps to 1-100, default 20).
+
+        Returns:
+            Parsed JSON: ``{"results": [...], "total": N}`` where each result
+            has ``id``, ``chat_jid``, ``content``, ``timestamp``,
+            ``sender_name``, ``score``, ``snippet``, ``match_type``.
+        """
+        body: dict[str, Any] = {"query": query, "limit": limit}
+        if chat_jid:
+            body["chat_jid"] = chat_jid
+        if sender:
+            body["sender"] = sender
+        return await self._post_raw("/api/search", json=body)
+
+    async def send_reaction(
+        self,
+        chat_jid: str,
+        message_id: str,
+        emoji: str,
+        sender: str | None = None,
+    ) -> Any:
+        """React to a message via ``POST /api/send/reaction`` (throttled send).
+
+        Args:
+            chat_jid: Chat containing the target message.
+            message_id: ID of the message being reacted to.
+            emoji: Reaction emoji.  An empty string removes a prior reaction.
+            sender: Author JID of the target message.  Omit for one's own
+                message.
+
+        Returns:
+            Parsed JSON: ``{"success": true, "message_id": "..."}``.
+        """
+        body: dict[str, Any] = {
+            "chat_jid": chat_jid,
+            "message_id": message_id,
+            "emoji": emoji,
+        }
+        if sender:
+            body["sender"] = sender
+        return await self.post("/api/send/reaction", json=body)
+
+    async def edit_message(
+        self,
+        chat_jid: str,
+        message_id: str,
+        new_text: str,
+    ) -> Any:
+        """Edit a previously sent message via ``POST /api/send/edit`` (throttled).
+
+        Only messages sent by this account can be edited.
+
+        Args:
+            chat_jid: Chat containing the message to edit.
+            message_id: ID of the message to edit.
+            new_text: Replacement message body.
+
+        Returns:
+            Parsed JSON: ``{"success": true, "message_id": "..."}``.
+        """
+        body: dict[str, Any] = {
+            "chat_jid": chat_jid,
+            "message_id": message_id,
+            "new_text": new_text,
+        }
+        return await self.post("/api/send/edit", json=body)
+
+    async def revoke_message(
+        self,
+        chat_jid: str,
+        message_id: str,
+        sender: str | None = None,
+    ) -> Any:
+        """Revoke (delete for everyone) a message via ``POST /api/send/revoke``.
+
+        Throttled send route.
+
+        Args:
+            chat_jid: Chat containing the message to revoke.
+            message_id: ID of the message to revoke.
+            sender: Author JID of the target message.  Omit to revoke one's own
+                message; supply it when a group admin revokes another member's
+                message.
+
+        Returns:
+            Parsed JSON: ``{"success": true, "message_id": "..."}``.
+        """
+        body: dict[str, Any] = {
+            "chat_jid": chat_jid,
+            "message_id": message_id,
+        }
+        if sender:
+            body["sender"] = sender
+        return await self.post("/api/send/revoke", json=body)
+
+    async def check_triggers(
+        self,
+        jids: list[str],
+        mention_jid: str | None = None,
+        sender_jids: list[str] | None = None,
+        limit: int = 100,
+        dry_run: bool = False,
+    ) -> Any:
+        """Batch trigger check via ``POST /api/check/triggers``.
+
+        Not a send route — bypasses the inter-send throttle.  Returns, per JID,
+        the inbound messages since that chat's server-side watermark and (unless
+        ``dry_run``) advances the watermark.
+
+        Args:
+            jids: Chats to check (required, non-empty).
+            mention_jid: When set, keep only messages mentioning this JID.
+            sender_jids: When non-empty, keep only messages from these senders.
+            limit: Maximum messages per chat (default 100).
+            dry_run: When ``True``, report unseen messages without advancing
+                watermarks.
+
+        Returns:
+            Parsed JSON: ``{"total": N, "groups": {jid: {"count": N,
+            "messages": [...]}}}``.
+        """
+        filters: dict[str, Any] = {}
+        if mention_jid:
+            filters["mention_jid"] = mention_jid
+        if sender_jids:
+            filters["sender_jids"] = sender_jids
+
+        body: dict[str, Any] = {"jids": jids, "limit": limit, "filters": filters}
+        if dry_run:
+            body["dry_run"] = True
+        return await self._post_raw("/api/check/triggers", json=body)
+
+    async def analyze_media(self, chat_jid: str, message_id: str) -> Any:
+        """Analyze a message's media via ``POST /api/media/analyze``.
+
+        Triggers bridge-side media analysis: the bridge samples video frames
+        and transcribes the audio track, returning the on-disk frame image
+        paths and the transcript.  Not a send route — bypasses the inter-send
+        throttle via :meth:`_post_raw` and is never retried.
+
+        Analysis can run for up to ~3 minutes, so a longer per-call read
+        timeout (:data:`_ANALYZE_READ_TIMEOUT`) is applied; the connect, write,
+        and pool timeouts keep their defaults.
+
+        Args:
+            chat_jid: JID of the chat the message belongs to.
+            message_id: ID of the message whose media is analyzed.
+
+        Returns:
+            Parsed JSON: ``{"frame_paths": [...], "transcription": "...",
+            "duration": N, "frame_count": N}``.
+        """
+        return await self._post_raw(
+            "/api/media/analyze",
+            json={"chat_jid": chat_jid, "message_id": message_id},
+            timeout=httpx.Timeout(
+                connect=_CONNECT_TIMEOUT,
+                read=_ANALYZE_READ_TIMEOUT,
+                write=_WRITE_TIMEOUT,
+                pool=_POOL_TIMEOUT,
+            ),
+        )
+
+    async def record_tool_call(
+        self,
+        tool_name: str,
+        duration_ms: int,
+        success: bool,
+        error_msg: str = "",
+    ) -> None:
+        """Record one tool invocation via ``POST /api/telemetry/tool``.
+
+        Fire-and-forget: this method **never** raises.  Any transport, HTTP, or
+        serialisation error is swallowed so that telemetry can never affect a
+        tool's result or surface an error to the caller.  Bypasses the
+        inter-send throttle.
+
+        Args:
+            tool_name: Name of the invoked MCP tool.
+            duration_ms: Wall-clock duration of the tool call in milliseconds.
+            success: Whether the tool call completed without raising.
+            error_msg: Error text when ``success`` is ``False``; empty otherwise.
+        """
+        try:
+            await self._post_raw(
+                "/api/telemetry/tool",
+                json={
+                    "tool_name": tool_name,
+                    "duration_ms": duration_ms,
+                    "success": success,
+                    "error_msg": error_msg,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry must never propagate.
+            logger.debug("Telemetry record_tool_call failed (ignored): %s", exc)

@@ -1,4 +1,5 @@
-// Package media handles WhatsApp media upload, download, and OGG Opus analysis.
+// Package media is part of L2: it handles WhatsApp media upload, on-demand
+// download, and OGG Opus analysis for the bridge.
 package media
 
 import (
@@ -70,8 +71,14 @@ func AnalyzeOggOpus(data []byte) (durationSeconds uint32, waveform []byte, err e
 			headPos := bytes.Index(pagePayload, []byte("OpusHead"))
 			if headPos >= 0 {
 				hp := headPos + 8 // skip "OpusHead"
-				if hp+12 <= len(pagePayload) {
-					// Version (1B), Channels (1B), PreSkip (2B LE), SampleRate (4B LE)
+				// Layout after the magic: Version (1B), Channels (1B),
+				// PreSkip (2B LE), SampleRate (4B LE), ... A minimal OpusHead
+				// with channel mapping family 0 is only 19 bytes total (11 after
+				// the magic), so we must only require the 4 bytes up through
+				// PreSkip — the field we actually read. Requiring more (the old
+				// hp+12 check) rejected every real voice note and forced the
+				// hardcoded 30 s fallback in buildMessage.
+				if hp+4 <= len(pagePayload) {
 					preSkip = binary.LittleEndian.Uint16(pagePayload[hp+2 : hp+4])
 					foundOpusHead = true
 				}

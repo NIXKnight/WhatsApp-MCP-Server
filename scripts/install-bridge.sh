@@ -33,6 +33,10 @@ info "Build complete."
 # Install binary
 # -------------------------------------------------------------------
 mkdir -p "${INSTALL_BIN}"
+# Unlink first so install succeeds while the bridge is running (a running ELF
+# can't be overwritten in place — ETXTBSY — but the inode can be unlinked; the
+# live process keeps its open inode until restart).
+rm -f "${INSTALL_BIN}/${BINARY_NAME}"
 cp "${BRIDGE_DIR}/${BINARY_NAME}" "${INSTALL_BIN}/${BINARY_NAME}"
 info "Installed ${BINARY_NAME} -> ${INSTALL_BIN}/${BINARY_NAME}"
 

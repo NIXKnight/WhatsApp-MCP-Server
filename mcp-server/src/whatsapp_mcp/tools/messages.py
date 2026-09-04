@@ -1,6 +1,6 @@
-"""Message-related MCP tools.
+"""Message-related MCP tools (L4 tool/contract).
 
-Provides seven tools:
+Provides ten tools:
 
 * :func:`send_message` — Send a plain-text message to an individual contact.
 * :func:`check_new_messages` — Poll for new messages since a given Unix timestamp.
@@ -8,6 +8,10 @@ Provides seven tools:
 * :func:`get_unread_chats` — List all chats that have unread messages.
 * :func:`get_unread_messages` — Flat list of all unread messages across all chats.
 * :func:`get_group_context` — Compact recent-turn window for a group chat.
+* :func:`send_reaction` — React to a message with an emoji (or remove a reaction).
+* :func:`edit_message` — Edit a previously sent message's text.
+* :func:`revoke_message` — Revoke (delete for everyone) a message.
+* :func:`check_triggers` — Batch trigger check across multiple chats.
 """
 
 from __future__ import annotations
@@ -280,3 +284,173 @@ def register_message_tools(mcp: FastMCP) -> None:
             })
 
         return json.dumps(chronological)
+
+    # ------------------------------------------------------------------
+    # send_reaction
+    # ------------------------------------------------------------------
+
+    @mcp.tool
+    async def send_reaction(
+        ctx: Context,
+        chat_jid: str,
+        message_id: str,
+        emoji: str,
+        sender: str | None = None,
+    ) -> str:
+        """React to a WhatsApp message with an emoji.
+
+        Sends a reaction to an existing message.  Pass an empty ``emoji`` string
+        to remove a reaction previously sent to the same message.
+
+        Args:
+            ctx: FastMCP context.
+            chat_jid: JID of the chat containing the target message, e.g.
+                ``120363039783372408@g.us`` or ``923001234567@s.whatsapp.net``.
+            message_id: ID of the message being reacted to.  Obtain it from
+                :func:`get_messages`, :func:`check_new_messages`, or
+                :func:`get_unread_messages`.
+            emoji: Reaction emoji (e.g. ``👍``).  An empty string removes a
+                prior reaction.
+            sender: Optional JID of the target message's author.  Omit when
+                reacting to one's own message.
+
+        Returns:
+            JSON string ``{"success": true, "message_id": "..."}`` on success.
+            Raises :class:`RuntimeError` on bridge error.
+        """
+        bridge: BridgeClient = ctx.lifespan_context["bridge"]
+        result = await bridge.send_reaction(
+            chat_jid=chat_jid,
+            message_id=message_id,
+            emoji=emoji,
+            sender=sender,
+        )
+        return json.dumps(result)
+
+    # ------------------------------------------------------------------
+    # edit_message
+    # ------------------------------------------------------------------
+
+    @mcp.tool
+    async def edit_message(
+        ctx: Context,
+        chat_jid: str,
+        message_id: str,
+        new_text: str,
+    ) -> str:
+        """Edit the text of a message previously sent by this account.
+
+        Only messages sent by this account can be edited.  WhatsApp also limits
+        edits to a short window after sending; the bridge surfaces any rejection
+        as an error.
+
+        Args:
+            ctx: FastMCP context.
+            chat_jid: JID of the chat containing the message to edit.
+            message_id: ID of the message to edit (must be one this account
+                sent).
+            new_text: Replacement message body.  Must be non-empty.
+
+        Returns:
+            JSON string ``{"success": true, "message_id": "..."}`` on success.
+            Raises :class:`RuntimeError` on validation failure or bridge error.
+        """
+        if not new_text or not new_text.strip():
+            raise RuntimeError("new_text must be a non-empty message body.")
+
+        bridge: BridgeClient = ctx.lifespan_context["bridge"]
+        result = await bridge.edit_message(
+            chat_jid=chat_jid,
+            message_id=message_id,
+            new_text=new_text,
+        )
+        return json.dumps(result)
+
+    # ------------------------------------------------------------------
+    # revoke_message
+    # ------------------------------------------------------------------
+
+    @mcp.tool
+    async def revoke_message(
+        ctx: Context,
+        chat_jid: str,
+        message_id: str,
+        sender: str | None = None,
+    ) -> str:
+        """Revoke (delete for everyone) a WhatsApp message.
+
+        Omit ``sender`` to revoke one's own message.  Supply the original
+        sender's JID when a group admin revokes another member's message.
+
+        Args:
+            ctx: FastMCP context.
+            chat_jid: JID of the chat containing the message to revoke.
+            message_id: ID of the message to revoke.
+            sender: Optional JID of the target message's author.  Required only
+                when an admin revokes another member's message.
+
+        Returns:
+            JSON string ``{"success": true, "message_id": "..."}`` on success.
+            Raises :class:`RuntimeError` on bridge error.
+        """
+        bridge: BridgeClient = ctx.lifespan_context["bridge"]
+        result = await bridge.revoke_message(
+            chat_jid=chat_jid,
+            message_id=message_id,
+            sender=sender,
+        )
+        return json.dumps(result)
+
+    # ------------------------------------------------------------------
+    # check_triggers
+    # ------------------------------------------------------------------
+
+    @mcp.tool
+    async def check_triggers(
+        ctx: Context,
+        jids: list[str],
+        mention_jid: str | None = None,
+        sender_jids: list[str] | None = None,
+        limit: int = 100,
+        dry_run: bool = False,
+    ) -> str:
+        """Check multiple chats for new messages in a single batched call.
+
+        A batch version of :func:`check_new_messages` that uses per-chat
+        server-side watermarks.  For each JID it returns only the inbound
+        messages received since that chat's watermark, optionally filtered by
+        mention or sender, then advances the watermark (unless ``dry_run``).
+
+        Args:
+            ctx: FastMCP context.
+            jids: List of chat JIDs to check.  Must be non-empty.
+            mention_jid: Optional JID — keep only messages mentioning it.
+            sender_jids: Optional list of sender JIDs — keep only messages from
+                these senders.
+            limit: Maximum messages returned per chat.  Defaults to 100.
+            dry_run: When ``True``, report unseen messages without advancing the
+                watermarks (a subsequent call returns the same messages).
+
+        Returns:
+            JSON string ``{"total": N, "groups": {jid: {"count": N,
+            "messages": [...]}}}``.  Returns ``"No new messages."`` when nothing
+            is unseen.  Raises :class:`RuntimeError` when ``jids`` is empty or on
+            bridge error.
+        """
+        if not jids:
+            raise RuntimeError("jids must be a non-empty list of chat JIDs.")
+
+        bridge: BridgeClient = ctx.lifespan_context["bridge"]
+        result = await bridge.check_triggers(
+            jids=jids,
+            mention_jid=mention_jid,
+            sender_jids=sender_jids,
+            limit=limit,
+            dry_run=dry_run,
+        )
+
+        total = result.get("total", 0) if isinstance(result, dict) else 0
+        if not total:
+            return "No new messages."
+
+        return json.dumps(result)

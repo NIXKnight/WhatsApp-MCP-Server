@@ -9,6 +9,7 @@ require (
 	github.com/mdp/qrterminal v1.0.1
 	github.com/pgvector/pgvector-go v0.3.0
 	go.mau.fi/whatsmeow v0.0.0-20260322133016-ce4daa5e5a86
+	golang.org/x/time v0.15.0
 	google.golang.org/protobuf v1.36.11
 )
 

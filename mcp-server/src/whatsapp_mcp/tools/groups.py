@@ -1,4 +1,4 @@
-"""Group-related MCP tools.
+"""Group-related MCP tools (L4 tool/contract).
 
 Provides four tools:
 

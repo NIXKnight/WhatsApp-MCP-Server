@@ -1,4 +1,4 @@
-package bridge
+package client
 
 import (
 	"context"
@@ -9,6 +9,9 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/indexer"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
 // handleEvent is the central event dispatcher registered with whatsmeow.
@@ -17,19 +20,19 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 
 	case *events.Connected:
 		c.log.Info("whatsapp: connected")
-		c.conn.handleConnected()
+		c.conn.HandleConnected()
 
 	case *events.Disconnected:
 		c.log.Warn("whatsapp: disconnected (transient)")
-		c.conn.handleDisconnected()
+		c.conn.HandleDisconnected()
 
 	case *events.LoggedOut:
 		c.log.Warn("whatsapp: logged out", "reason", evt.Reason)
-		c.conn.handleLoggedOut()
+		c.conn.HandleLoggedOut()
 
 	case *events.StreamError:
 		c.log.Warn("whatsapp: stream error", "code", evt.Code)
-		c.conn.handleStreamError()
+		c.conn.HandleStreamError()
 
 	case *events.ConnectFailure:
 		// ConnectFailure carries reason codes covering bans, outdated clients,
@@ -41,7 +44,7 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 			"reason", evt.Reason.String(),
 			"message", evt.Message,
 		)
-		c.conn.handlePermanentDisconnect("connect failure: " + evt.Reason.String())
+		c.conn.HandlePermanentDisconnect("connect failure: " + evt.Reason.String())
 
 	case *events.TemporaryBan:
 		// Account temporarily banned. The ban reason and remaining duration are
@@ -51,28 +54,28 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 			"code", evt.Code.String(),
 			"expire", evt.Expire,
 		)
-		c.conn.handlePermanentDisconnect("temporary ban: " + evt.Code.String())
+		c.conn.HandlePermanentDisconnect("temporary ban: " + evt.Code.String())
 
 	case *events.ClientOutdated:
 		// WhatsApp rejected the connection because the client version is too
 		// old. Reconnecting will not help until the whatsmeow dependency is
 		// updated and the binary is redeployed.
 		c.log.Error("whatsapp: client outdated — update whatsmeow dependency and redeploy")
-		c.conn.handlePermanentDisconnect("client outdated")
+		c.conn.HandlePermanentDisconnect("client outdated")
 
 	case *events.StreamReplaced:
 		// Another device connected with the same session keys and took over the
 		// stream. Auto-reconnecting would create a reconnect fight between the
 		// two instances. Require a manual operator restart.
 		c.log.Error("whatsapp: session replaced by another device — manual restart required")
-		c.conn.handlePermanentDisconnect("stream replaced by another device")
+		c.conn.HandlePermanentDisconnect("stream replaced by another device")
 
 	case *events.KeepAliveTimeout:
-		c.keepAliveFailures++
-		c.log.Warn("whatsapp: keep-alive timeout", "consecutive", c.keepAliveFailures)
-		if c.keepAliveFailures >= 3 {
+		consecutive := c.keepAlive.RecordFailure()
+		c.log.Warn("whatsapp: keep-alive timeout", "consecutive", consecutive)
+		if c.keepAlive.ShouldReconnect() {
 			c.log.Error("whatsapp: 3 consecutive keep-alive timeouts, forcing reconnect")
-			c.keepAliveFailures = 0
+			c.keepAlive.Reset()
 			go func() {
 				c.WA.Disconnect()
 				// The resulting Disconnected event will fire and trigger scheduleReconnect.
@@ -80,7 +83,7 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 		}
 
 	case *events.KeepAliveRestored:
-		c.keepAliveFailures = 0
+		c.keepAlive.Reset()
 		c.log.Info("whatsapp: keep-alive restored")
 
 	case *events.Message:
@@ -138,7 +141,7 @@ func (c *Client) processMessage(evt *events.Message) {
 		c.log.Warn("failed to update chat preview", "err", err)
 	}
 
-	msg := &MessageRow{
+	msg := &store.MessageRow{
 		ID:                evt.Info.ID,
 		ChatJID:           chatJID,
 		Sender:            sender,
@@ -181,6 +184,59 @@ func (c *Client) processMessage(evt *events.Message) {
 			"sender", sender,
 			"content", truncate(content, 80),
 		)
+	}
+
+	// Enrichment capture: populate messages_media (for the downloader/transcriber
+	// workers) and extract links from the text body. These never auto-download;
+	// they only persist rows the workers poll.
+	c.captureMedia(evt.Message, evt.Info.ID, chatJID, mediaType, filename, url, fileLength)
+	c.captureLinks(content, evt.Info.ID, chatJID, sender, evt.Info.Timestamp)
+}
+
+// captureMedia writes the normalized messages_media row for a media message.
+// It is a no-op for non-media messages. The messages_media FK references
+// messages(id, chat_jid), so the parent message must already be upserted.
+func (c *Client) captureMedia(msg *waE2E.Message, msgID, chatJID, mediaType, filename, url string, fileLength uint64) {
+	if mediaType == "" {
+		return
+	}
+	mediaKey, fileSHA256, fileEncSHA256 := extractMediaCrypto(msg)
+	media := &store.MediaRow{
+		MessageID:     msgID,
+		ChatJID:       chatJID,
+		MediaType:     mediaType,
+		MimeType:      extractMediaMime(msg),
+		Filename:      filename,
+		FileLength:    int64(fileLength),
+		MediaKey:      mediaKey,
+		FileSHA256:    fileSHA256,
+		FileEncSHA256: fileEncSHA256,
+		URL:           url,
+		DirectPath:    extractMediaDirectPath(msg),
+	}
+	if err := c.Store.UpsertMessageMedia(media); err != nil {
+		c.log.Warn("failed to upsert messages_media", "id", msgID, "err", err)
+	}
+}
+
+// captureLinks extracts URLs from message text and persists one links row per
+// distinct URL. Non-text or link-free messages produce no rows.
+func (c *Client) captureLinks(content, msgID, chatJID, sender string, ts time.Time) {
+	if content == "" {
+		return
+	}
+	for _, l := range indexer.ExtractLinks(content) {
+		row := &store.LinkRow{
+			URL:       l.URL,
+			Platform:  l.Platform,
+			SenderJID: sender,
+			ChatJID:   chatJID,
+			MessageID: msgID,
+			Timestamp: ts,
+		}
+		if err := c.Store.InsertLink(row); err != nil {
+			c.log.Warn("failed to insert link", "id", msgID, "url", l.URL, "err", err)
+		}
 	}
 }
 
@@ -244,7 +300,7 @@ func (c *Client) processHistorySync(evt *events.HistorySync) {
 				msgID = wm.GetKey().GetID()
 			}
 
-			msg := &MessageRow{
+			msg := &store.MessageRow{
 				ID:                msgID,
 				ChatJID:           chatJID,
 				Sender:            sender,
@@ -269,6 +325,10 @@ func (c *Client) processHistorySync(evt *events.HistorySync) {
 				continue
 			}
 			stored++
+
+			// Enrichment capture for historically-synced media and links.
+			c.captureMedia(wm.GetMessage(), msgID, chatJID, mediaType, filename, url, fileLength)
+			c.captureLinks(content, msgID, chatJID, sender, ts)
 
 			if ts.After(latestTime) {
 				latestTime = ts
@@ -360,7 +420,10 @@ func extractTextContent(msg *waE2E.Message) (text, quotedID, quotedParticipant s
 
 	// Also capture quoted message context from non-text messages.
 	if quotedID == "" {
-		var ci interface{ GetStanzaID() string; GetParticipant() string }
+		var ci interface {
+			GetStanzaID() string
+			GetParticipant() string
+		}
 		switch {
 		case msg.GetImageMessage() != nil:
 			ci = msg.GetImageMessage().GetContextInfo()
@@ -417,6 +480,74 @@ func extractMediaInfo(msg *waE2E.Message) (
 	}
 
 	return
+}
+
+// extractMediaCrypto returns the decryption material for whichever media
+// sub-message is present, mirroring the set captured by extractMediaInfo.
+func extractMediaCrypto(msg *waE2E.Message) (mediaKey, fileSHA256, fileEncSHA256 []byte) {
+	if msg == nil {
+		return
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		m := msg.GetImageMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	case msg.GetVideoMessage() != nil:
+		m := msg.GetVideoMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	case msg.GetAudioMessage() != nil:
+		m := msg.GetAudioMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	case msg.GetDocumentMessage() != nil:
+		m := msg.GetDocumentMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	case msg.GetStickerMessage() != nil:
+		m := msg.GetStickerMessage()
+		return m.GetMediaKey(), m.GetFileSHA256(), m.GetFileEncSHA256()
+	}
+	return
+}
+
+// extractMediaMime returns the MIME type of whichever media sub-message is present.
+func extractMediaMime(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetMimetype()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetMimetype()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetMimetype()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetMimetype()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetMimetype()
+	}
+	return ""
+}
+
+// extractMediaDirectPath returns the server-side direct path of whichever media
+// sub-message is present. The downloader prefers this over a re-derivation from
+// the public URL.
+func extractMediaDirectPath(msg *waE2E.Message) string {
+	if msg == nil {
+		return ""
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetDirectPath()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetDirectPath()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetDirectPath()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetDirectPath()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetDirectPath()
+	}
+	return ""
 }
 
 func nowStamp() string {

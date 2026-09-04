@@ -1,0 +1,12 @@
+# Tailwind build output — regenerated from assets/input.css at build time.
+# (See README / Dockerfile for the build step. FontAwesome under
+# src/whatsapp_dashboard/static/fontawesome/ IS committed.)
+src/whatsapp_dashboard/static/app.css
+
+# Tailwind standalone CLI binary (downloaded, never committed).
+/tailwindcss
+/tailwindcss-linux-*
+
+# Python build / cache artifacts.
+__pycache__/
+*.pyc

@@ -29,6 +29,12 @@ func NewServer(addr string, h *Handler, log *slog.Logger) *Server {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
+	// Token-bucket limiter applied only to outbound send routes. WhatsApp
+	// penalises bursts of automated sends, so the bridge self-throttles and
+	// adds small human-timing jitter. Conservative anti-ban defaults: ~2 sends
+	// per second sustained, burst of 5, up to 300 ms jitter.
+	rl := NewRateLimiter(2.0, 5, 300)
+
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/status", h.Status)
 		r.Get("/messages", h.ListMessages)
@@ -46,16 +52,40 @@ func NewServer(addr string, h *Handler, log *slog.Logger) *Server {
 		r.Get("/groups/{jid}", h.GetGroup)
 		r.Get("/unread", h.ListUnread)
 		r.Get("/check", h.CheckNewMessages)
-		r.Post("/send", h.SendMessage)
-		r.Post("/send/media", h.SendMedia)
+		r.Post("/check/triggers", h.CheckTriggers)
 		r.Post("/download", h.DownloadMedia)
+		r.Post("/telemetry/tool", h.RecordToolCall)
+
+		// Media analysis is a thin proxy to the L3 transcriber, whose frame
+		// extraction + transcription can take well over a minute. Give this one
+		// route a 190s timeout (overriding the global 60s middleware) so the
+		// request is bounded by the analyzer client timeout rather than chi.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(190 * time.Second))
+			r.Post("/media/analyze", h.HandleMediaAnalyze)
+		})
+
+		// Send routes (rate-limited, anti-ban).
+		r.Group(func(r chi.Router) {
+			r.Use(rl.Middleware)
+			r.Post("/send", h.SendMessage)
+			r.Post("/send/media", h.SendMedia)
+			r.Post("/send/reaction", h.SendReaction)
+			r.Post("/send/edit", h.EditMessage)
+			r.Post("/send/revoke", h.RevokeMessage)
+		})
 	})
 
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:        addr,
+		Handler:     r,
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout must exceed the slowest route. POST /api/media/analyze
+		// proxies the L3 transcriber (frame extraction + transcription), which
+		// can run well past a minute; chi cannot exempt a single route from the
+		// server-wide write deadline, so it is widened to 200s for all routes.
+		// Safe because the bridge binds loopback / compose-internal with no auth.
+		WriteTimeout: 200 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

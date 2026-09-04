@@ -183,7 +183,12 @@ func buildMessage(
 		}, nil
 
 	case "audio":
-		var seconds uint32 = 30
+		// Real duration is computed from the OGG Opus stream below. Leave the
+		// default at 0 (not a hardcoded placeholder) so that if analysis fails
+		// for a non-Opus audio file, WhatsApp does not display a misleading
+		// fixed length. For PTT voice notes the consumer always sends
+		// pre-encoded OGG/Opus, so AnalyzeOggOpus populates the true value.
+		var seconds uint32
 		var waveform []byte
 
 		// Attempt OGG Opus analysis for accurate duration and waveform.

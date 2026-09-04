@@ -1,0 +1,166 @@
+/*
+ * L6 dashboard stylesheet — build INPUT for the Tailwind standalone CLI.
+ *
+ * Compiled with:
+ *   ./tailwindcss -i assets/input.css \
+ *       -o src/whatsapp_dashboard/static/app.css --minify
+ *
+ * The component layer maps Tremor primitives onto the dashboard's existing
+ * semantic class names (.card, .stat, .badge, .platform-tag, …) so the Jinja
+ * templates barely change. Tremor colour tokens live in tailwind.config.js.
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply h-full;
+  }
+
+  body {
+    @apply min-h-full bg-tremor-background-muted text-tremor-content antialiased dark:bg-dark-tremor-background-muted dark:text-dark-tremor-content;
+    font-family: theme("fontFamily.sans");
+  }
+
+  /* Page title. */
+  h1 {
+    @apply text-tremor-title font-semibold text-tremor-content-strong dark:text-dark-tremor-content-strong;
+  }
+
+  /* Panel headers — small, uppercase, muted; flex so a FontAwesome icon and
+     the label align on one baseline. */
+  h2 {
+    @apply mb-3 flex items-center gap-2 text-tremor-label font-semibold uppercase tracking-wider text-tremor-content dark:text-dark-tremor-content;
+  }
+
+  a {
+    @apply text-tremor-brand hover:underline dark:text-dark-tremor-brand;
+  }
+}
+
+@layer components {
+  /* ---- Card -------------------------------------------------------------- */
+  .card {
+    @apply rounded-tremor-default border border-tremor-border bg-tremor-background p-6 shadow-tremor-card dark:border-dark-tremor-border dark:bg-dark-tremor-background;
+  }
+
+  .card-full {
+    @apply col-span-full;
+  }
+
+  /* ---- Stat rows --------------------------------------------------------- */
+  .stat {
+    @apply flex items-center justify-between border-b border-tremor-border py-1.5 last:border-b-0 dark:border-dark-tremor-border;
+  }
+
+  .stat-label {
+    @apply text-tremor-default text-tremor-content dark:text-dark-tremor-content;
+  }
+
+  .stat-value {
+    @apply text-tremor-default font-semibold tabular-nums text-tremor-content-strong dark:text-dark-tremor-content-strong;
+  }
+
+  /* ---- Badges (soft Tremor pills) --------------------------------------- */
+  .badge {
+    @apply inline-flex items-center rounded-tremor-small px-2 py-0.5 text-tremor-label font-medium ring-1 ring-inset;
+  }
+
+  .badge-green {
+    @apply bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-400/10 dark:text-emerald-400 dark:ring-emerald-400/20;
+  }
+
+  .badge-red {
+    @apply bg-rose-50 text-rose-700 ring-rose-600/20 dark:bg-rose-400/10 dark:text-rose-400 dark:ring-rose-400/20;
+  }
+
+  .badge-yellow {
+    @apply bg-amber-50 text-amber-700 ring-amber-600/20 dark:bg-amber-400/10 dark:text-amber-400 dark:ring-amber-400/20;
+  }
+
+  .badge-blue {
+    @apply bg-blue-50 text-blue-700 ring-blue-600/20 dark:bg-blue-400/10 dark:text-blue-400 dark:ring-blue-400/20;
+  }
+
+  .badge-purple {
+    @apply bg-violet-50 text-violet-700 ring-violet-600/20 dark:bg-violet-400/10 dark:text-violet-400 dark:ring-violet-400/20;
+  }
+
+  /* ---- Tables ------------------------------------------------------------ */
+  table {
+    @apply w-full border-collapse text-tremor-default;
+  }
+
+  th {
+    @apply border-b border-tremor-border px-3 py-2 text-left text-tremor-label font-medium uppercase tracking-wide text-tremor-content dark:border-dark-tremor-border dark:text-dark-tremor-content;
+  }
+
+  td {
+    @apply border-b border-tremor-border px-3 py-2 align-top text-tremor-content-emphasis dark:border-dark-tremor-border dark:text-dark-tremor-content-emphasis;
+  }
+
+  tbody tr {
+    @apply transition-colors hover:bg-tremor-background-muted dark:hover:bg-dark-tremor-background-muted;
+  }
+
+  /* ---- Misc text helpers ------------------------------------------------- */
+  .truncate {
+    @apply max-w-xs overflow-hidden text-ellipsis whitespace-nowrap;
+  }
+
+  .ts {
+    @apply text-tremor-label tabular-nums text-tremor-content-subtle dark:text-dark-tremor-content-subtle;
+  }
+
+  /* ---- Layout helpers ---------------------------------------------------- */
+  /* `.grid` shares its name with Tailwind's own `grid` display utility, so
+     `@apply grid` would be a circular reference. Set `display:grid` directly
+     and `@apply` only the spacing / column utilities. */
+  .grid {
+    display: grid;
+    @apply mb-6 grid-cols-1 gap-6 lg:grid-cols-2;
+  }
+
+  .section {
+    @apply mb-6;
+  }
+
+  .refresh-note {
+    @apply text-tremor-label text-tremor-content-subtle dark:text-dark-tremor-content-subtle;
+  }
+
+  /* ---- Platform pills ---------------------------------------------------- */
+  .platform-tag {
+    @apply inline-flex items-center rounded-tremor-small px-1.5 py-0.5 text-tremor-label font-semibold ring-1 ring-inset;
+  }
+
+  .p-youtube {
+    @apply bg-red-50 text-red-700 ring-red-600/20 dark:bg-red-500/10 dark:text-red-400 dark:ring-red-500/20;
+  }
+
+  .p-github {
+    @apply bg-tremor-background-subtle text-tremor-content-strong ring-tremor-border dark:bg-dark-tremor-background-subtle dark:text-dark-tremor-content-strong dark:ring-dark-tremor-border;
+  }
+
+  .p-twitter {
+    @apply bg-sky-50 text-sky-700 ring-sky-600/20 dark:bg-sky-400/10 dark:text-sky-400 dark:ring-sky-400/20;
+  }
+
+  .p-facebook {
+    @apply bg-indigo-50 text-indigo-700 ring-indigo-600/20 dark:bg-indigo-400/10 dark:text-indigo-400 dark:ring-indigo-400/20;
+  }
+
+  .p-instagram {
+    @apply bg-fuchsia-50 text-fuchsia-700 ring-fuchsia-600/20 dark:bg-fuchsia-400/10 dark:text-fuchsia-400 dark:ring-fuchsia-400/20;
+  }
+
+  .p-other {
+    @apply bg-tremor-background-subtle text-tremor-content ring-tremor-border dark:bg-dark-tremor-background-subtle dark:text-dark-tremor-content dark:ring-dark-tremor-border;
+  }
+
+  /* ---- Theme toggle button ---------------------------------------------- */
+  .theme-toggle {
+    @apply inline-flex h-9 w-9 items-center justify-center rounded-tremor-default border border-tremor-border bg-tremor-background text-tremor-content shadow-tremor-input transition-colors hover:bg-tremor-background-muted hover:text-tremor-content-strong dark:border-dark-tremor-border dark:bg-dark-tremor-background dark:text-dark-tremor-content dark:hover:bg-dark-tremor-background-muted dark:hover:text-dark-tremor-content-strong;
+  }
+}

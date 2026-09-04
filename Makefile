@@ -1,6 +1,7 @@
-.PHONY: bridge mcp-server install bridge-unit mcp-unit start stop restart status logs clean deploy deploy-bridge deploy-mcp
+.PHONY: bridge mcp-server install bridge-unit mcp-unit embedder-unit transcriber-unit dashboard-unit whisper-unit workers start stop restart status logs clean deploy deploy-bridge deploy-mcp
 
-SCRIPTS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts
+REPO_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+SCRIPTS_DIR := $(REPO_ROOT)scripts
 
 ## Build and install the Go bridge binary
 bridge:
@@ -21,28 +22,62 @@ bridge-unit:
 mcp-unit:
 	@bash $(SCRIPTS_DIR)/setup-systemd.sh mcp-server
 
-## Start both services
+## Create user systemd unit for the embedder worker, reload daemon, and restart service
+embedder-unit:
+	@bash $(SCRIPTS_DIR)/setup-systemd.sh embedder
+
+## Create user systemd unit for the transcriber worker, reload daemon, and restart service
+transcriber-unit:
+	@bash $(SCRIPTS_DIR)/setup-systemd.sh transcriber
+
+## Create user systemd unit for the dashboard, reload daemon, and restart service
+dashboard-unit:
+	@bash $(SCRIPTS_DIR)/setup-systemd.sh dashboard
+
+## Create user systemd unit for the whisper.cpp server, reload daemon, and restart service
+whisper-unit:
+	@bash $(SCRIPTS_DIR)/setup-systemd.sh whisper
+
+## Sync the Python worker venvs (embedder, transcriber, dashboard)
+workers:
+	cd $(REPO_ROOT)embedder && uv sync
+	cd $(REPO_ROOT)transcriber && uv sync
+	cd $(REPO_ROOT)dashboard && uv sync
+
+## Start all services (dependency order)
 start:
 	systemctl --user start whatsapp-bridge.service
+	systemctl --user start whatsapp-whisper.service
+	systemctl --user start whatsapp-embedder.service
 	systemctl --user start whatsapp-mcp-server.service
+	systemctl --user start whatsapp-transcriber.service
+	systemctl --user start whatsapp-dashboard.service
 
-## Stop both services
+## Stop all services (reverse dependency order)
 stop:
+	systemctl --user stop whatsapp-dashboard.service
+	systemctl --user stop whatsapp-transcriber.service
+	systemctl --user stop whatsapp-embedder.service
+	systemctl --user stop whatsapp-whisper.service
 	systemctl --user stop whatsapp-mcp-server.service
 	systemctl --user stop whatsapp-bridge.service
 
-## Restart both services
+## Restart all services
 restart:
 	systemctl --user restart whatsapp-bridge.service
+	systemctl --user restart whatsapp-whisper.service
+	systemctl --user restart whatsapp-embedder.service
 	systemctl --user restart whatsapp-mcp-server.service
+	systemctl --user restart whatsapp-transcriber.service
+	systemctl --user restart whatsapp-dashboard.service
 
-## Show status of both services
+## Show status of all services
 status:
-	systemctl --user status whatsapp-bridge.service whatsapp-mcp-server.service
+	systemctl --user status whatsapp-bridge.service whatsapp-whisper.service whatsapp-mcp-server.service whatsapp-embedder.service whatsapp-transcriber.service whatsapp-dashboard.service
 
-## Tail logs for both services
+## Tail logs for all services
 logs:
-	journalctl --user -f -u whatsapp-bridge.service -u whatsapp-mcp-server.service
+	journalctl --user -f -u whatsapp-bridge.service -u whatsapp-whisper.service -u whatsapp-mcp-server.service -u whatsapp-embedder.service -u whatsapp-transcriber.service -u whatsapp-dashboard.service
 
 ## Rebuild and restart the bridge only (build, install binary, restart service)
 deploy-bridge: bridge

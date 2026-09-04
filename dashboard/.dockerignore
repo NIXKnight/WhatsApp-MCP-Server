@@ -1,0 +1,25 @@
+# Build context hygiene for the dashboard image.
+#
+# IMPORTANT — do NOT exclude any of these; the image needs them in context:
+#   tailwind.config.js, assets/, src/whatsapp_dashboard/templates/**,
+#   src/whatsapp_dashboard/static/fontawesome/** (vendored, committed).
+# The Tailwind output (static/app.css) is intentionally excluded below: the
+# assets stage regenerates it, so the build stays hermetic and never depends
+# on a stale host copy.
+
+# Host virtualenv — never copied by the Dockerfile; keep it out of context.
+.venv/
+
+# Python caches / bytecode.
+__pycache__/
+*.pyc
+*.pyo
+
+# Tailwind build artifacts (regenerated in the assets stage).
+src/whatsapp_dashboard/static/app.css
+tailwindcss
+tailwindcss-linux-*
+
+# VCS / editor noise.
+.git/
+.gitignore

@@ -1,8 +1,9 @@
 """FastMCP server definition for the WhatsApp MCP server.
 
-Wires together the lifespan (bridge client startup/shutdown) and all twelve
-tool modules.  The :data:`mcp` instance is the single authoritative FastMCP
-object; tools are registered against it in each ``register_*`` helper.
+Wires together the lifespan (bridge client startup/shutdown), the cross-cutting
+telemetry middleware, and all tool modules.  The :data:`mcp` instance is the
+single authoritative FastMCP object; tools are registered against it in each
+``register_*`` helper.
 
 Lifespan pattern
 ----------------
@@ -26,10 +27,12 @@ from typing import AsyncIterator
 from fastmcp import FastMCP
 
 from whatsapp_mcp.bridge_client import BridgeClient
+from whatsapp_mcp.middleware import TelemetryMiddleware
 from whatsapp_mcp.tools.contacts import register_contact_tools
 from whatsapp_mcp.tools.groups import register_group_tools
 from whatsapp_mcp.tools.media import register_media_tools
 from whatsapp_mcp.tools.messages import register_message_tools
+from whatsapp_mcp.tools.search import register_search_tools
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,13 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[dict]:  # noqa: ARG001
 mcp: FastMCP = FastMCP("WhatsApp", lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
+# Cross-cutting middleware
+# ---------------------------------------------------------------------------
+# TelemetryMiddleware records every tool call's name, duration, and outcome to
+# the bridge in one place via ``on_call_tool`` — no per-tool timing boilerplate.
+mcp.add_middleware(TelemetryMiddleware())
+
+# ---------------------------------------------------------------------------
 # Register all tool modules
 # ---------------------------------------------------------------------------
 
@@ -74,3 +84,4 @@ register_message_tools(mcp)
 register_contact_tools(mcp)
 register_group_tools(mcp)
 register_media_tools(mcp)
+register_search_tools(mcp)

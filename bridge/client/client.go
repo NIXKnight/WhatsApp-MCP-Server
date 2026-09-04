@@ -1,4 +1,9 @@
-package bridge
+// Package client implements L2 capture: it wraps a whatsmeow.Client with the
+// application's message store and connection state machine, and translates
+// whatsmeow events into store writes. It re-exports the connection-state
+// constants and Client.State so that callers (the HTTP API and main) depend on
+// this package rather than reaching into the connection package directly.
+package client
 
 import (
 	"context"
@@ -10,27 +15,46 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
+
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/connection"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
+
+// ConnectionState is re-exported from the connection package so callers can
+// depend solely on the client package.
+type ConnectionState = connection.ConnectionState
+
+// Connection-state constants re-exported from the connection package.
+const (
+	StateDisconnected            = connection.StateDisconnected
+	StateConnecting              = connection.StateConnecting
+	StateQRWaiting               = connection.StateQRWaiting
+	StateConnected               = connection.StateConnected
+	StatePermanentlyDisconnected = connection.StatePermanentlyDisconnected
+)
+
+// maxKeepaliveFailures is the number of consecutive keep-alive timeouts after
+// which the client forces a reconnect.
+const maxKeepaliveFailures = 3
 
 // Client wraps a whatsmeow.Client with the application's message store and
 // connection state machine.
 type Client struct {
 	WA      *whatsmeow.Client
-	Store   *Store
-	conn    *Connection
+	Store   *store.Store
+	conn    *connection.Connection
 	log     *slog.Logger
 	dataDir string
 
-	// keepAliveFailures counts consecutive KeepAliveTimeout events. It is
-	// accessed only from the whatsmeow event handler goroutine so no mutex is
-	// required.
-	keepAliveFailures int
+	// keepAlive tracks consecutive KeepAliveTimeout events. It is accessed only
+	// from the whatsmeow event handler goroutine, but is concurrency-safe.
+	keepAlive *connection.KeepaliveTracker
 }
 
 // NewClient initialises the whatsmeow device store, creates the whatsmeow
 // client, attaches event handlers, and prepares (but does not start) the
 // connection state machine.
-func NewClient(databaseURL string, dataDir string, store *Store, log *slog.Logger) (*Client, error) {
+func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Logger) (*Client, error) {
 	waLogger := newWALogger(log)
 	dbLog := newWALogger(log.With("component", "wastore"))
 
@@ -61,15 +85,16 @@ func NewClient(databaseURL string, dataDir string, store *Store, log *slog.Logge
 	wa.EnableAutoReconnect = false
 
 	c := &Client{
-		WA:      wa,
-		Store:   store,
-		log:     log,
-		dataDir: dataDir,
+		WA:        wa,
+		Store:     st,
+		log:       log,
+		dataDir:   dataDir,
+		keepAlive: connection.NewKeepaliveTracker(maxKeepaliveFailures),
 	}
 
 	// Wire event handlers before creating the connection manager so that
 	// Connected/Disconnected events from the initial connect are handled.
-	conn := newConnection(wa, log)
+	conn := connection.NewConnection(wa, log)
 	c.conn = conn
 
 	wa.AddEventHandler(c.handleEvent)

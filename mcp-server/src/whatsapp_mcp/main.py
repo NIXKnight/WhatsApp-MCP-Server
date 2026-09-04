@@ -132,7 +132,7 @@ def main() -> None:
     1. Configures logging to stderr.
     2. Patches ``print`` to default to stderr.
     3. Imports the :data:`~whatsapp_mcp.server.mcp` instance (which registers
-       all twelve tools).
+       all tools and the telemetry middleware).
     4. Calls ``mcp.run()`` which blocks on the MCP transport loop until the
        parent process closes the pipe (stdio) or the server is stopped.
 

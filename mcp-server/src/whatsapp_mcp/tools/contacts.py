@@ -1,4 +1,4 @@
-"""Contact-related MCP tools.
+"""Contact-related MCP tools (L4 tool/contract).
 
 Provides two tools:
 

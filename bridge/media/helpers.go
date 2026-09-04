@@ -61,6 +61,50 @@ func DetectTypeFromFilename(name string) string {
 	return extToMediaType(ext)
 }
 
+// CopyFile copies the file at src to dst, creating dst's parent directory if
+// needed. It returns the number of bytes written. The destination is created
+// with 0600 permissions to match the perms Download writes media with. Used to
+// serve a cached media copy into a caller-requested output directory without
+// re-fetching it from the network.
+//
+// Failures are split by side: anything wrong with the *destination* (creating
+// its directory, creating/writing/closing the target file) is returned as a
+// *LocalDestError so a caller serving an already-cached file can tell "the
+// bytes exist, but the requested output_dir is unwritable" apart from "the
+// cached source is gone". A failure to open src is returned as a plain error,
+// since that means the cache copy itself vanished (a genuine cache miss).
+func CopyFile(src, dst string) (int64, error) {
+	dstDir := filepath.Dir(dst)
+	if err := os.MkdirAll(dstDir, 0700); err != nil {
+		return 0, newLocalDestError("create dest dir", dstDir, err)
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		// Source is the cached copy; if it cannot be opened the cache entry is
+		// effectively gone. Not a destination problem.
+		return 0, fmt.Errorf("open source %q: %w", src, err)
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return 0, newLocalDestError("create dest file", dstDir, err)
+	}
+
+	n, err := io.Copy(out, in)
+	if err != nil {
+		out.Close()
+		os.Remove(dst)
+		return 0, newLocalDestError("write dest file", dstDir, err)
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return 0, newLocalDestError("close dest file", dstDir, err)
+	}
+	return n, nil
+}
+
 // ExpandTilde replaces a leading "~/" with the user's home directory path.
 // If the path does not start with "~/" it is returned unchanged.
 func ExpandTilde(path string) string {

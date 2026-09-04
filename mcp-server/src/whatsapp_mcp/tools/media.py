@@ -1,9 +1,10 @@
-"""Media-related MCP tools.
+"""Media-related MCP tools (L4 tool/contract).
 
-Provides two tools:
+Provides three tools:
 
 * :func:`send_media` — Send an image, video, audio, or document file.
 * :func:`download_media` — Download the media attachment from a received message.
+* :func:`analyze_media` — Sample video frames + transcribe a message's media.
 """
 
 from __future__ import annotations
@@ -194,4 +195,59 @@ def register_media_tools(mcp: FastMCP) -> None:
             "output_dir": os.getenv("WORKSPACE_DIR", "/workspace"),
         }
         result = await bridge.post("/api/download", json=payload)
+        return json.dumps(result)
+
+    # ------------------------------------------------------------------
+    # analyze_media
+    # ------------------------------------------------------------------
+
+    @mcp.tool
+    async def analyze_media(
+        ctx: Context,
+        chat_jid: str,
+        message_id: str,
+    ) -> str:
+        """Analyze a video/audio message: sample its frames and transcribe it.
+
+        The bridge samples representative frames from the video and writes them
+        to disk as image files, and transcribes the audio track to text.  This
+        tool returns only the resulting frame image paths and the transcript —
+        it does **not** read the frames itself.
+
+        To inspect the video's visual content, **Read** each path listed in
+        ``frame_paths`` (they are absolute paths to image files) and review the
+        images directly.  Combine what the frames show with ``transcription``
+        (the spoken/audio content) to judge the media, then produce a clear
+        safe / not-safe content verdict for the caller.
+
+        Analysis runs on the bridge and can take up to a few minutes for longer
+        clips; the call blocks until the bridge finishes.
+
+        Args:
+            ctx: FastMCP context.
+            chat_jid: JID of the chat the message belongs to, e.g.
+                ``120363039783372408@g.us`` for a group or
+                ``923001234567@s.whatsapp.net`` for a direct chat.
+            message_id: The ``id`` field of the WhatsApp message whose media is
+                analyzed.  Obtain it from :func:`check_new_messages`,
+                :func:`get_messages`, or :func:`get_unread_messages`.
+
+        Returns:
+            JSON string with the analysis result::
+
+                {
+                    "frame_paths": ["/abs/path/frame_000.jpg", ...],
+                    "transcription": "...",
+                    "duration": <seconds>,
+                    "frame_count": <number of frames sampled>
+                }
+
+            ``frame_paths`` holds absolute image paths to **Read**;
+            ``transcription`` is the audio transcript.  Raises
+            :class:`RuntimeError` when the message is not found, has no
+            analyzable media, or the bridge returns an error.
+        """
+        bridge: BridgeClient = ctx.lifespan_context["bridge"]
+
+        result = await bridge.analyze_media(chat_jid, message_id)
         return json.dumps(result)

@@ -1,4 +1,5 @@
-// Package api implements the REST HTTP layer for the WhatsApp bridge.
+// Package api implements the L2 gateway: the REST HTTP layer for the WhatsApp
+// bridge (send, query, and enrichment-support routes).
 package api
 
 import "time"
@@ -42,6 +43,11 @@ type MessageResponse struct {
 	QuotedMessageID   string    `json:"quoted_message_id,omitempty"`
 	QuotedParticipant string    `json:"quoted_participant,omitempty"`
 	Snippet           string    `json:"snippet,omitempty"`
+	// Transcription is the voice-note / audio transcription, when available.
+	// Empty for non-media messages and media whose transcription is pending.
+	Transcription string `json:"transcription,omitempty"`
+	// TranscribedAt is when the transcription was produced; nil when absent.
+	TranscribedAt *time.Time `json:"transcribed_at,omitempty"`
 }
 
 // MessagesResponse wraps a list of messages with pagination metadata.
@@ -189,6 +195,88 @@ type SendMediaResponse struct {
 	MessageID string `json:"message_id"`
 }
 
+// ---- Reaction / edit / revoke -------------------------------------------
+
+// ReactRequest is the body for POST /api/send/reaction.
+type ReactRequest struct {
+	// ChatJID is the chat containing the target message.
+	ChatJID string `json:"chat_jid"`
+	// MessageID is the ID of the message being reacted to.
+	MessageID string `json:"message_id"`
+	// Emoji is the reaction; an empty string removes a prior reaction.
+	Emoji string `json:"emoji"`
+	// Sender is the author of the target message. Empty means it is our own
+	// message.
+	Sender string `json:"sender,omitempty"`
+}
+
+// EditRequest is the body for POST /api/send/edit.
+type EditRequest struct {
+	// ChatJID is the chat containing the message to edit.
+	ChatJID string `json:"chat_jid"`
+	// MessageID is the ID of the message to edit (must be one we sent).
+	MessageID string `json:"message_id"`
+	// NewText is the replacement body.
+	NewText string `json:"new_text"`
+}
+
+// RevokeRequest is the body for POST /api/send/revoke.
+type RevokeRequest struct {
+	// ChatJID is the chat containing the message to revoke.
+	ChatJID string `json:"chat_jid"`
+	// MessageID is the ID of the message to revoke.
+	MessageID string `json:"message_id"`
+	// Sender is the author of the target message. Empty revokes our own
+	// message; set it when an admin revokes another member's message.
+	Sender string `json:"sender,omitempty"`
+}
+
+// ---- Trigger check ------------------------------------------------------
+
+// TriggerFilters controls optional filtering for the batch trigger check.
+type TriggerFilters struct {
+	// MentionJID, when set, keeps only messages referencing that JID.
+	MentionJID string `json:"mention_jid,omitempty"`
+	// SenderJIDs, when non-empty, keeps only messages from those senders.
+	SenderJIDs []string `json:"sender_jids,omitempty"`
+}
+
+// TriggerRequest is the body for POST /api/check/triggers.
+type TriggerRequest struct {
+	// JIDs is the list of chats to check (required, non-empty).
+	JIDs []string `json:"jids"`
+	// Filters narrows which messages are returned.
+	Filters TriggerFilters `json:"filters"`
+	// Limit caps the messages returned per chat (default 100).
+	Limit int `json:"limit,omitempty"`
+	// DryRun reports unseen messages without advancing watermarks.
+	DryRun bool `json:"dry_run,omitempty"`
+}
+
+// TriggerGroupResult holds the unseen messages for a single chat in the
+// trigger response.
+type TriggerGroupResult struct {
+	Count    int               `json:"count"`
+	Messages []MessageResponse `json:"messages"`
+}
+
+// TriggerResponse is returned by POST /api/check/triggers.
+type TriggerResponse struct {
+	Total  int                           `json:"total"`
+	Groups map[string]TriggerGroupResult `json:"groups"`
+}
+
+// ---- Telemetry ----------------------------------------------------------
+
+// ToolCallRequest is the body for POST /api/telemetry/tool. It records one MCP
+// tool invocation's latency and outcome.
+type ToolCallRequest struct {
+	ToolName   string `json:"tool_name"`
+	DurationMs int    `json:"duration_ms"`
+	Success    bool   `json:"success"`
+	ErrorMsg   string `json:"error_msg,omitempty"`
+}
+
 // DownloadRequest is the body for POST /api/download.
 type DownloadRequest struct {
 	MessageID string `json:"message_id"`
@@ -274,12 +362,13 @@ type SimilarMessagesResponse struct {
 // CompactMessageResponse is a reduced-field message projection
 // for token-efficient context windows. Used when ?compact=true.
 type CompactMessageResponse struct {
-	ID          string `json:"id"`
-	SenderName  string `json:"name"`
-	Content     string `json:"text"`
-	Timestamp   string `json:"ts"`
-	QuotedMsgID string `json:"quoted_id,omitempty"`
-	QuotedBy    string `json:"quoted_by,omitempty"`
+	ID            string `json:"id"`
+	SenderName    string `json:"name"`
+	Content       string `json:"text"`
+	Timestamp     string `json:"ts"`
+	QuotedMsgID   string `json:"quoted_id,omitempty"`
+	QuotedBy      string `json:"quoted_by,omitempty"`
+	Transcription string `json:"transcription,omitempty"`
 }
 
 // ---- Embeddings ---------------------------------------------------------
