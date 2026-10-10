@@ -34,6 +34,8 @@ const (
 
 // Config holds all runtime configuration for the bridge.
 type Config struct {
+	// Notifications controls the opt-in metadata-only incoming-message relay.
+	Notifications Notifications
 	// Addr is the TCP address to bind the HTTP server to (default: 127.0.0.1:8080).
 	Addr string
 	// DataDir is the directory for media file storage.
@@ -73,6 +75,10 @@ type Config struct {
 // any unset variables. It validates the data directory exists and is writable,
 // and warns if the bind address is not restricted to the loopback interface.
 func Load() (*Config, error) {
+	notifications, err := loadNotifications(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
 	addr := getEnv("BRIDGE_ADDR", "127.0.0.1:8080")
 	dataDir := getEnv("BRIDGE_DATA_DIR", "./data")
 	logLevelStr := getEnv("BRIDGE_LOG_LEVEL", "info")
@@ -109,6 +115,7 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
+		Notifications:            notifications,
 		Addr:                     addr,
 		DataDir:                  absDataDir,
 		DatabaseURL:              databaseURL,

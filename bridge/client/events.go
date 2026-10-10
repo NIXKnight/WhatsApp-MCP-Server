@@ -107,6 +107,7 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 
 // processMessage stores a single incoming (or outgoing) message.
 func (c *Client) processMessage(evt *events.Message) {
+	receivedAt := time.Now().UTC()
 	chatJID := evt.Info.Chat.String()
 	sender := evt.Info.Sender.String()
 	senderName := evt.Info.PushName
@@ -161,9 +162,19 @@ func (c *Client) processMessage(evt *events.Message) {
 		QuotedParticipant: quotedParticipant,
 	}
 
-	if err := c.Store.UpsertMessage(msg); err != nil {
-		c.log.Warn("failed to store message", "id", evt.Info.ID, "err", err)
-	} else {
+	// Origin policy alone cannot establish newness: insertion and event creation
+	// must commit together. History keeps the non-notifying legacy wrapper.
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 10*time.Second)
+	result, err := c.Store.SaveMessage(writeCtx, msg, c.notifications.candidate(evt, receivedAt))
+	cancelWrite()
+	if err != nil {
+		c.log.Warn("message persistence failed", "class", "store_failed")
+		return
+	}
+	if result == store.MessageSkipped {
+		return
+	}
+	{
 		direction := "←"
 		if evt.Info.IsFromMe {
 			direction = "→"

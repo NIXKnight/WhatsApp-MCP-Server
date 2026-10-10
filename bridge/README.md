@@ -57,6 +57,21 @@ The Dockerfile is a multi-stage build: a `golang:1.26-alpine` builder compiles t
 | `MEDIA_RETRY_INTERVAL` | `3m` | Poll cadence of the media-retry worker. Doubles as the cross-cycle backoff between attempts for a single row. Go duration syntax (e.g. `90s`, `5m`). |
 | `MEDIA_MAX_DOWNLOAD_ATTEMPTS` | `3` | Max re-download attempts for one media row before it is flagged `download_permanently_failed`. |
 | `MEDIA_RETRY_BATCH_SIZE` | `10` | Maximum retry-eligible rows processed per cycle. |
+| `BRIDGE_NOTIFY_ENABLED` | `false` | Opt-in incoming metadata relay; no automatic WhatsApp actions. |
+| `BRIDGE_NOTIFY_URL` | (required when enabled) | Private HTTPS or literal-loopback HTTP `/webhooks/<route>` endpoint. |
+| `BRIDGE_NOTIFY_SECRET` | (required when enabled) | At least 32 bytes of operator-provided HMAC key material; byte-counted, never generated or stored in the outbox. |
+| `BRIDGE_NOTIFY_CHAT_ALLOWLIST` | (required when enabled) | Exact comma-separated full chat JIDs; no wildcard or implicit entire inbox. |
+| `BRIDGE_NOTIFY_TIMEOUT` | `5s` | Request deadline. |
+| `BRIDGE_NOTIFY_POLL_INTERVAL` | `1s` | Enabled dispatcher poll cadence. |
+| `BRIDGE_NOTIFY_MIN_INTERVAL` | `2s` | Minimum global attempt spacing. |
+| `BRIDGE_NOTIFY_BATCH_SIZE` | `20` | Sequential claims per cycle. |
+| `BRIDGE_NOTIFY_MAX_ATTEMPTS` | `10` | Committed claims before dead-lettering. |
+| `BRIDGE_NOTIFY_MAX_AGE` | `24h` | Expiry from original receipt, frozen per event. |
+| `BRIDGE_NOTIFY_RETENTION` | `7d` | Retention after terminal transition. |
+
+See [Hermes notifications](../docs/hermes-notifications.md) for exact bounds,
+privacy limitations, disabled cleanup, required receiver permission verification,
+and separately approved backlog/migration operations. Deployment stays **PAUSED**.
 
 The embedder timeout (2s) and analyzer timeout (180s) are compiled-in constants, not environment variables.
 
@@ -145,7 +160,7 @@ DISCONNECTED -----> CONNECTING -----> CONNECTED
 
 PostgreSQL is the single source of truth. The bridge opens one `pgx` pool (`stdlib.OpenDB`, max 10 open / 5 idle connections) and serialises every write through a single writer goroutine. The whatsmeow device store uses the same database via `sqlstore.New(ctx, "pgx", databaseURL, ...)`, so credentials and key material live in PostgreSQL — there are no `.db` files and no SQLite anywhere.
 
-Schema is **bridge-owned**: only `bridge/migrations/` creates or alters tables, applied at startup with [golang-migrate](https://github.com/golang-migrate/migrate) (embedded via `iofs`). There are **9 migration pairs**: `000001` and `000003`–`000010` (no `000002`). Never edit a committed migration; add the next numbered pair.
+Schema is **bridge-owned**: only `bridge/migrations/` creates or alters tables, applied at startup with [golang-migrate](https://github.com/golang-migrate/migrate) (embedded via `iofs`). There are **10 migration pairs**: `000001` and `000003`–`000011` (no `000002`). Never edit a committed migration; add the next numbered pair.
 
 Key tables and the materialized view:
 
@@ -160,6 +175,7 @@ Key tables and the materialized view:
 | `telemetry_daily` | Daily rolling counters (sent, received, media, links). |
 | `telemetry_tool_calls` | Per-tool-call rows: `tool_name`, `duration_ms`, `success`, `error`. |
 | `watermarks` | Per-chat `last_seen` cursor backing the `check_triggers` batch endpoint. |
+| `notification_outbox` | Optional metadata-only event/retry state; committed atomically with a new live inbound message. No content, endpoint or authentication material. |
 | `unread_summary` | Materialized view (migration `000004`) summarising unread chats; refreshed by the store. |
 
 There is **no `group_participants` table**; group participants are fetched live from whatsmeow when `GET /api/groups/{jid}` is called.
@@ -179,6 +195,18 @@ The database is the only integration substrate — there is no message bus. Cros
 ### Media-retry worker (`bridge/mediaretry/`)
 
 A bounded background goroutine (gated by `MEDIA_RETRY_ENABLED`) re-downloads **requested-but-failed non-audio media**. Scope is requested-only: a row is eligible only after an on-demand download already failed (`download_attempts > 0` and not permanently failed); captured-but-never-requested media is left untouched. Re-downloading needs the live whatsmeow session, so the worker starts only after the connection is established. The poll interval (`MEDIA_RETRY_INTERVAL`) is itself the cross-cycle backoff — a transient 403/410 is usually a stale signed URL that a later download refreshes — so each eligible row is retried at most once per cycle (no tight in-loop retry). After `MEDIA_MAX_DOWNLOAD_ATTEMPTS` the row is flagged `download_permanently_failed`. It integrates purely through the database and issues no DDL.
+
+### Optional Hermes incoming relay (`bridge/notify/`)
+
+An independent single dispatcher leases committed outbox events, signs generic
+Hermes HMAC V2 POSTs, and records bounded retry/terminal state. It never sends
+from a whatsmeow callback or store transaction. Only first supported insertions
+from live incoming events in an explicit allowlist notify; imports, recovery
+origins, self events, edits and duplicate updates do not. Receiver acceptance
+is not agent completion or exactly-once execution. Disabled mode creates no
+new events or HTTP sender; local expiry/pruning runs in bounded minute batches.
+This is the database-handoff pattern plus an optional outbound webhook, not a
+new message bus. Configuration and operational gates are in the linked guide.
 
 ### Telemetry
 
@@ -242,7 +270,7 @@ bridge/
 │   └── links.go                URL/link extraction from message content
 ├── migrations/
 │   ├── embed.go                go:embed of the .sql migration files
-│   └── 000001 + 000003–000010  golang-migrate up/down pairs (PostgreSQL + pgvector schema)
+│   └── 000001 + 000003–000011  golang-migrate up/down pairs (PostgreSQL + pgvector schema)
 └── data/                       Runtime directory for downloaded media + cooldown marker
     └── .gitkeep
 ```
@@ -252,9 +280,14 @@ bridge/
 The bridge handles `SIGINT` and `SIGTERM` with an ordered shutdown:
 
 1. Stop accepting new HTTP requests and drain in-flight ones (15s deadline).
-2. Stop the media-retry worker (cancel its context and wait for it) so no in-flight download races the disconnect or store close.
-3. Disconnect from WhatsApp.
-4. Close the PostgreSQL store: the writer goroutine drains queued writes, then the `pgx` pool is closed.
+2. Cancel and wait for notification and media-retry workers before any store close.
+3. Disconnect from WhatsApp and remove/drain callback ingress.
+4. Close the PostgreSQL store: admission closes, the writer drains queued writes, then the `pgx` pool is closed.
+
+A single cleanup path also covers startup errors and pre-connection signals.
+Migration 011 is additive, but an old binary embedding only migrations through
+010 cannot start against version 011. Routine rollback disables notifications
+on a migration-aware binary; destructive down requires separate authorization.
 
 If a shutdown signal arrives before the initial WhatsApp connection is established, the bridge tears down and exits immediately without writing a cooldown marker.
 
@@ -315,3 +348,24 @@ Change `BRIDGE_ADDR` to an available port if needed.
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+## Local release artifact
+
+Build a host-native release from the repository root with:
+
+```bash
+scripts/build-bridge-release.sh
+```
+
+A normal release requires a clean worktree and is written beneath
+`bridge/dist/releases/<revision>/` with a SHA-256 file and timestamp-free
+provenance. During development, `--allow-dirty` builds the current bridge
+worktree twice, verifies that both binaries have the same SHA-256 digest, and
+writes a revision-plus-source-digest directory marked `NONDEPLOYABLE`. This is
+a same-source, same-toolchain check; it is not a claim of reproducibility
+across different Go toolchains or dependency caches.
+
+The host systemd unit must treat exit status 2 as a deliberate cooldown
+(`RestartPreventExitStatus=2`). The pairing QR is emitted on stdout; production
+supervision should discard stdout and pairing must be performed separately in
+an approved private foreground terminal, never captured in the journal.

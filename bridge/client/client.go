@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"go.mau.fi/whatsmeow"
@@ -45,6 +46,10 @@ type Client struct {
 	conn    *connection.Connection
 	log     *slog.Logger
 	dataDir string
+	// The handler registration is removed on terminal shutdown, draining ingress.
+	eventHandlerID uint32
+	stopOnce       sync.Once
+	notifications  notificationPolicy
 
 	// keepAlive tracks consecutive KeepAliveTimeout events. It is accessed only
 	// from the whatsmeow event handler goroutine, but is concurrency-safe.
@@ -54,7 +59,7 @@ type Client struct {
 // NewClient initialises the whatsmeow device store, creates the whatsmeow
 // client, attaches event handlers, and prepares (but does not start) the
 // connection state machine.
-func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Logger) (*Client, error) {
+func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Logger, options ...Option) (*Client, error) {
 	waLogger := newWALogger(log)
 	dbLog := newWALogger(log.With("component", "wastore"))
 
@@ -97,7 +102,10 @@ func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Lo
 	conn := connection.NewConnection(wa, log)
 	c.conn = conn
 
-	wa.AddEventHandler(c.handleEvent)
+	for _, option := range options {
+		option(c)
+	}
+	c.eventHandlerID = wa.AddEventHandler(c.handleEvent)
 
 	return c, nil
 }
@@ -113,8 +121,13 @@ func (c *Client) Connect(ctx context.Context) error {
 // disconnects from WhatsApp servers. Always call Stop() before Disconnect()
 // to prevent reconnect goroutines from racing the disconnect.
 func (c *Client) Disconnect() {
-	c.conn.Stop()
-	c.WA.Disconnect()
+	c.stopOnce.Do(func() {
+		c.conn.Stop()
+		c.WA.Disconnect()
+		// whatsmeow's removal takes the dispatcher write lock, waiting for
+		// active callbacks and excluding future ones. Never call from a callback.
+		c.WA.RemoveEventHandler(c.eventHandlerID)
+	})
 }
 
 // State returns the current connection state.

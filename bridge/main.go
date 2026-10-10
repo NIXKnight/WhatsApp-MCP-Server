@@ -31,6 +31,7 @@ import (
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/config"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/embed"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/mediaretry"
+	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/notify"
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
@@ -75,12 +76,14 @@ func clearCooldownMarker(dataDir string) {
 	_ = os.Remove(cooldownMarkerPath(dataDir))
 }
 
-func main() {
+func main() { os.Exit(run()) }
+
+func run() int {
 	// ---- Load configuration ------------------------------------------------
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("configuration error", "err", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// ---- Structured logger -------------------------------------------------
@@ -101,23 +104,31 @@ func main() {
 			"until", until.Format(time.RFC3339),
 			"remaining", time.Until(until).Round(time.Second).String(),
 		)
-		os.Exit(2)
+		return 2
 	}
 
 	// ---- Message store -----------------------------------------------------
 	st, err := store.NewStore(cfg.DatabaseURL, log.With("component", "store"))
 	if err != nil {
 		log.Error("failed to open message store", "err", err)
-		os.Exit(1)
+		return 1
+	}
+
+	resources := bridgeCleanup{closeStore: st.Close, log: log}
+	defer resources.run()
+	var options []client.Option
+	if cfg.Notifications.Enabled {
+		options = append(options, client.WithIncomingNotifications(cfg.Notifications.ChatAllowlist, cfg.Notifications.MaxAge))
 	}
 
 	// ---- WhatsApp client ---------------------------------------------------
-	waClient, err := client.NewClient(cfg.DatabaseURL, cfg.DataDir, st, log.With("component", "client"))
+	waClient, err := client.NewClient(cfg.DatabaseURL, cfg.DataDir, st, log.With("component", "client"), options...)
 	if err != nil {
 		log.Error("failed to create WhatsApp client", "err", err)
-		st.Close()
-		os.Exit(1)
+		return 1
 	}
+
+	resources.disconnect = waClient.Disconnect
 
 	// ---- HTTP API server ---------------------------------------------------
 	// Start the HTTP server before connecting to WhatsApp so that /api/status
@@ -128,6 +139,7 @@ func main() {
 	analyzer := analyzer.New(cfg.AnalyzerURL, cfg.AnalyzerTimeout)
 	h := api.NewHandler(waClient, st, embedder, analyzer, cfg.MediaMaxDownloadAttempts, log.With("component", "api"))
 	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"))
+	resources.stopHTTP = srv.Shutdown
 
 	srvErrCh := make(chan error, 1)
 	go func() {
@@ -137,10 +149,40 @@ func main() {
 	// ---- Signal handler for graceful shutdown ------------------------------
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	// ---- Connect to WhatsApp (non-blocking) --------------------------------
 	connectCtx, connectCancel := context.WithCancel(context.Background())
-	defer connectCancel()
+	resources.cancelConnect = connectCancel
+
+	// Notifications do not depend on WhatsApp connection state. Disabled mode
+	// constructs no sender and performs only bounded local maintenance.
+	var sender *notify.Sender
+	if cfg.Notifications.Enabled {
+		sender, err = notify.NewSender(cfg.Notifications)
+		if err != nil {
+			log.Error("notification initialization failed", "class", "configuration_invalid")
+			return 1
+		}
+	}
+	notifyCtx, notifyCancel := context.WithCancel(context.Background())
+	var notifyWG sync.WaitGroup
+	notifyWorker := notify.NewWorker(st, cfg.Notifications, sender, log.With("component", "notify"))
+	notifyWG.Add(1)
+	go func() { defer notifyWG.Done(); notifyWorker.Run(notifyCtx) }()
+	var mediaRetryCancel context.CancelFunc
+	var mediaRetryWG sync.WaitGroup
+	resources.stopWorkers = func() {
+		notifyCancel()
+		if mediaRetryCancel != nil {
+			mediaRetryCancel()
+		}
+		notifyWG.Wait()
+		mediaRetryWG.Wait()
+		if sender != nil {
+			sender.Close()
+		}
+	}
 
 	connectErrCh := make(chan error, 1)
 	go func() {
@@ -160,33 +202,16 @@ func main() {
 				log.Error("permanent disconnect detected, cooldown marker written",
 					"cooldown", cooldownDuration.String(),
 				)
-				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-				defer shutdownCancel()
-				_ = srv.Shutdown(shutdownCtx)
-				st.Close()
-				os.Exit(2) // exit code 2: tell supervisor not to restart yet
+				return 2 // exit code 2: tell supervisor not to restart yet
 			}
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer shutdownCancel()
-			_ = srv.Shutdown(shutdownCtx)
-			st.Close()
-			os.Exit(1)
+			return 1
 		}
 	case sig := <-sigCh:
 		log.Info("received signal before connection established, shutting down", "signal", sig)
-		connectCancel()
-		waClient.Disconnect()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer shutdownCancel()
-		_ = srv.Shutdown(shutdownCtx)
-		st.Close()
-		os.Exit(0)
+		return 0
 	case err := <-srvErrCh:
 		log.Error("HTTP server error before connection established", "err", err)
-		connectCancel()
-		waClient.Disconnect()
-		st.Close()
-		os.Exit(1)
+		return 1
 	}
 
 	// Successful connection: remove any stale cooldown marker.
@@ -198,8 +223,6 @@ func main() {
 	// started only after the session is up (downloading needs the live whatsmeow
 	// client) and is cancelled + awaited during graceful shutdown. When disabled
 	// the goroutine never starts.
-	var mediaRetryCancel context.CancelFunc
-	var mediaRetryWG sync.WaitGroup
 	if cfg.MediaRetryEnabled {
 		mrCtx, cancel := context.WithCancel(context.Background())
 		mediaRetryCancel = cancel
@@ -225,31 +248,41 @@ func main() {
 		log.Error("HTTP server error", "err", err)
 	}
 
-	// ---- Graceful shutdown sequence ----------------------------------------
-	// 1. Drain in-flight HTTP requests (15 s deadline).
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer shutdownCancel()
+	return 0
+}
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Warn("HTTP server shutdown did not complete cleanly", "err", err)
+// bridgeCleanup is populated as resources are acquired and deferred once.
+// Thus every return (including connection failure/cooldown exit 2) stops and
+// waits for the dispatcher before callback ingress or the store is closed.
+type bridgeCleanup struct {
+	stopHTTP      func(context.Context) error
+	cancelConnect context.CancelFunc
+	stopWorkers   func()
+	disconnect    func()
+	closeStore    func() error
+	log           *slog.Logger
+}
+
+func (r *bridgeCleanup) run() {
+	if r.cancelConnect != nil {
+		r.cancelConnect()
 	}
-	log.Info("HTTP server stopped")
-
-	// 2. Stop the media-retry worker before disconnecting/closing, so no
-	//    in-flight download races the WhatsApp disconnect or the store close.
-	if mediaRetryCancel != nil {
-		mediaRetryCancel()
-		mediaRetryWG.Wait()
-		log.Info("media-retry worker stopped")
+	if r.stopHTTP != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := r.stopHTTP(ctx); err != nil {
+			r.log.Warn("HTTP shutdown incomplete", "class", "shutdown_failed")
+		}
+		cancel()
 	}
-
-	// 3. Disconnect from WhatsApp.
-	waClient.Disconnect()
-	log.Info("WhatsApp client disconnected")
-
-	// 4. Close the message store.
-	if err := st.Close(); err != nil {
-		log.Warn("store close error", "err", err)
+	if r.stopWorkers != nil {
+		r.stopWorkers()
 	}
-	log.Info("shutdown complete")
+	if r.disconnect != nil {
+		r.disconnect()
+	}
+	if r.closeStore != nil {
+		if err := r.closeStore(); err != nil {
+			r.log.Warn("store close failed", "class", "store_failed")
+		}
+	}
 }
