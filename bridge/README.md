@@ -10,7 +10,7 @@ Security: the API has **no authentication** and must only be reachable on the lo
 
 ## Prerequisites
 
-- Go 1.25 or later.
+- Go 1.26 or later.
 - PostgreSQL 17 with the `pgvector` extension (the bridge runs its migrations automatically at startup).
 - A WhatsApp account with multi-device support enabled.
 
@@ -41,7 +41,7 @@ After the QR scan succeeds the bridge stays connected. Subsequent runs reconnect
 docker compose build bridge
 ```
 
-The Dockerfile is a multi-stage build: a `golang:1.25-alpine` builder compiles the binary with `CGO_ENABLED=0`, and the runtime stage is a minimal `alpine:3.21` image carrying only the static binary plus `ca-certificates` and `tzdata`.
+The Dockerfile is a multi-stage build: a `golang:1.26-alpine` builder compiles the binary with `CGO_ENABLED=0`, and the runtime stage is a minimal `alpine:3.21` image carrying only the static binary plus `ca-certificates` and `tzdata`.
 
 ## Environment Variables
 
@@ -300,7 +300,7 @@ The bridge runs golang-migrate `Up()` on every start. Ensure the role in `DATABA
 
 - These are permanent disconnects: the bridge writes a 10-minute cooldown marker and exits with code 2.
 - Wait out the cooldown (10 minutes) before restarting.
-- If `ClientOutdated` persists, update whatsmeow: `go get -u go.mau.fi/whatsmeow@latest`.
+- If `ClientOutdated` persists, update only to a reviewed whatsmeow pin (currently `go.mau.fi/whatsmeow@v0.0.0-20261007111105-c386243a72ba`); do not use `@latest`.
 
 ### Port Already in Use
 

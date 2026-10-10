@@ -121,7 +121,7 @@ Claude / MCP client  (L5)
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - Python 3.11+
 - [uv](https://astral.sh/uv) (Python package manager)
 - PostgreSQL 17 with the `pgvector` extension (the bridge runs migrations at startup)
