@@ -24,7 +24,7 @@ L2  Capture & Gateway
 
 L3  Persistence & Enrichment
     bridge/store/         PostgreSQL read/write via pgx pool
-    bridge/migrations/    9 golang-migrate pairs (001, 003-010)
+    bridge/migrations/    10 golang-migrate pairs (001, 003-011)
     bridge/mediaretry/    media re-download (retry) worker
     embedder/             poll worker + on-demand /embed server
     transcriber/          poll worker + on-demand /analyze server
@@ -261,6 +261,24 @@ All bridge settings are read from environment variables at startup.
 | `MEDIA_RETRY_INTERVAL` | `3m` | Poll cadence / per-row backoff. |
 | `MEDIA_MAX_DOWNLOAD_ATTEMPTS` | `3` | Attempts before a row is marked permanently failed. |
 | `MEDIA_RETRY_BATCH_SIZE` | `10` | Rows retried per cycle. |
+| `BRIDGE_NOTIFY_ENABLED` | `false` | Opt-in metadata-only Hermes relay; no auto-reply or action grant. |
+| `BRIDGE_NOTIFY_URL` | (required when enabled) | Private HTTPS or literal-loopback HTTP `/webhooks/<route>` endpoint. |
+| `BRIDGE_NOTIFY_SECRET` | (required when enabled) | At least 32 bytes of operator-managed HMAC key material; byte-counted, never generated, printed, or persisted in events. |
+| `BRIDGE_NOTIFY_CHAT_ALLOWLIST` | (required when enabled) | Exact comma-separated full chat JIDs; no wildcard/whole-inbox mode. |
+| `BRIDGE_NOTIFY_TIMEOUT` | `5s` | Per-request timeout. |
+| `BRIDGE_NOTIFY_POLL_INTERVAL` | `1s` | Enabled dispatcher poll cadence. |
+| `BRIDGE_NOTIFY_MIN_INTERVAL` | `2s` | Global minimum spacing between attempts. |
+| `BRIDGE_NOTIFY_BATCH_SIZE` | `20` | Maximum sequential claims per cycle. |
+| `BRIDGE_NOTIFY_MAX_ATTEMPTS` | `10` | Maximum committed claims per event. |
+| `BRIDGE_NOTIFY_MAX_AGE` | `24h` | Notification expiry from original receipt. |
+| `BRIDGE_NOTIFY_RETENTION` | `7d` | Terminal-state metadata retention. |
+
+[Hermes incoming notifications](docs/hermes-notifications.md) documents the
+metadata-only outbox, validation bounds, identifier privacy, **mandatory actual
+read-only receiver capability gate**, backlog retirement and rollback safety.
+Deployment remains **PAUSED**; enabling, migration execution and configuration
+changes require separate operator approval. Disabled mode loads no relay secret
+and performs only bounded minute-wise local cleanup with maintenance defaults.
 
 ---
 
@@ -347,7 +365,7 @@ POST   /api/send/revoke      (rate-limited)
 
 PostgreSQL 17 with the `pgvector` extension is the single source of truth. The bridge runs [golang-migrate](https://github.com/golang-migrate/migrate) migrations at startup automatically.
 
-Migrations: `bridge/migrations/000001`, `000003`–`000010` (9 pairs; no `000002`).
+Migrations: `bridge/migrations/000001`, `000003`–`000011` (10 pairs; no `000002`).
 
 Key tables:
 

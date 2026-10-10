@@ -6,6 +6,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ const EmbeddingDim = 384
 
 // WriteOp is a single write operation submitted to the store's single-writer goroutine.
 type WriteOp struct {
+	ctx  context.Context
 	fn   func(*sql.Tx) error
 	done chan error
 }
@@ -41,6 +43,7 @@ type Store struct {
 	writeCh      chan WriteOp
 	log          *slog.Logger
 	done         chan struct{}
+	admissionMu  sync.Mutex // prevents admission after shutdown begins
 	doneOnce     sync.Once
 	writerWG     sync.WaitGroup // tracks the writer goroutine
 	refreshMu    sync.Mutex
@@ -89,10 +92,10 @@ func NewStore(databaseURL string, log *slog.Logger) (*Store, error) {
 // Close signals the writer goroutine to drain and exit, waits for it to
 // finish, then closes the database handle.
 func (s *Store) Close() error {
-	// Signal shutdown exactly once.
-	s.doneOnce.Do(func() {
-		close(s.done)
-	})
+	// Close admission before the writer starts draining.
+	s.admissionMu.Lock()
+	s.doneOnce.Do(func() { close(s.done) })
+	s.admissionMu.Unlock()
 	// Cancel any pending debounced refresh.
 	s.refreshMu.Lock()
 	if s.refreshTimer != nil {
@@ -114,13 +117,13 @@ func (s *Store) writerLoop() {
 			if !ok {
 				return
 			}
-			op.done <- s.execWrite(op.fn)
+			op.done <- s.execWriteContext(op.ctx, op.fn)
 		case <-s.done:
 			// Drain remaining ops already queued before exiting.
 			for {
 				select {
 				case op := <-s.writeCh:
-					op.done <- s.execWrite(op.fn)
+					op.done <- s.execWriteContext(op.ctx, op.fn)
 				default:
 					return
 				}
@@ -129,38 +132,51 @@ func (s *Store) writerLoop() {
 	}
 }
 
-func (s *Store) execWrite(fn func(*sql.Tx) error) error {
-	tx, err := s.db.Begin()
+func (s *Store) execWriteContext(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	if err := fn(tx); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return err
 	}
 	return tx.Commit()
 }
 
-// submit enqueues a write operation and waits for the result.
-// Returns an error immediately if the store is already shut down.
+// submit preserves synchronous commit acknowledgement for existing callers.
 func (s *Store) submit(fn func(*sql.Tx) error) error {
-	op := WriteOp{fn: fn, done: make(chan error, 1)}
+	return s.submitContext(context.Background(), fn)
+}
+
+// submitContext bounds queue waiting and SQL execution. On cancellation an
+// admitted operation may have committed; callers must not read closure-owned
+// results on error. The buffered completion channel lets the writer finish.
+func (s *Store) submitContext(ctx context.Context, fn func(*sql.Tx) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	op := WriteOp{ctx: ctx, fn: fn, done: make(chan error, 1)}
+	s.admissionMu.Lock()
 	select {
-	case s.writeCh <- op:
 	case <-s.done:
+		s.admissionMu.Unlock()
 		return fmt.Errorf("store is closed")
 	default:
+	}
+	select {
+	case s.writeCh <- op:
+		s.admissionMu.Unlock()
+	default:
+		s.admissionMu.Unlock()
 		s.log.Warn("write channel saturated, dropping write operation")
 		return fmt.Errorf("write channel saturated")
 	}
-	// Wait for result, but also handle the case where the store shuts down
-	// while we are waiting (writer drains then exits).
 	select {
 	case err := <-op.done:
 		return err
-	case <-s.done:
-		// The writer is draining; our op may still complete. Wait a bit.
-		return <-op.done
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

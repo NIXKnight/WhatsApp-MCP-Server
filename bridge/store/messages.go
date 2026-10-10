@@ -1,7 +1,10 @@
 package store
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -66,7 +69,7 @@ const msgSelectCols = `m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.t
 	`m.file_length, m.push_name, m.quoted_message_id, m.quoted_participant`
 
 // msgMediaCols are the two transcription columns appended after the snippet
-// column. COALESCE collapses both "no media row" and "pending" to '' so the
+// column. COALESCE collapses both "no media row" and "pending" to ” so the
 // scan target is a plain string; transcribed_at stays nullable.
 const msgMediaCols = `COALESCE(mm.transcription, '') AS transcription, mm.transcribed_at`
 
@@ -76,42 +79,104 @@ const msgMediaCols = `COALESCE(mm.transcription, '') AS transcription, mm.transc
 const msgFromJoin = ` FROM messages m
 	 LEFT JOIN messages_media mm ON mm.message_id = m.id AND mm.chat_jid = m.chat_jid`
 
-// UpsertMessage inserts or replaces a message row. Messages with no content
-// and no media type are silently ignored.
-func (s *Store) UpsertMessage(m *MessageRow) error {
-	if m.Content == "" && m.MediaType == "" {
-		return nil
-	}
-	return s.submit(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
-			`INSERT INTO messages
+// MessageWriteResult identifies the committed persistence outcome.
+type MessageWriteResult string
+
+const (
+	// MessageInserted means a new supported message row committed.
+	MessageInserted MessageWriteResult = "inserted"
+	// MessageUpdated means an existing row was updated without notification.
+	MessageUpdated MessageWriteResult = "updated"
+	// MessageSkipped means unsupported content was ignored without SQL.
+	MessageSkipped MessageWriteResult = "skipped"
+)
+
+// NotificationRequest requests a metadata-only event for a live insertion.
+// The caller must first apply live-origin and chat-allowlist policy.
+type NotificationRequest struct {
+	ReceivedAt time.Time
+	MaxAge     time.Duration
+}
+
+const insertMessageSQL = `INSERT INTO messages
 			 (id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
 			  media_type, filename, url, media_key, file_sha256, file_enc_sha256,
 			  file_length, push_name, quoted_message_id, quoted_participant)
 			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-			 ON CONFLICT(id, chat_jid) DO UPDATE SET
-			     sender             = excluded.sender,
-			     sender_name        = excluded.sender_name,
-			     content            = excluded.content,
-			     timestamp          = excluded.timestamp,
-			     is_from_me         = excluded.is_from_me,
-			     media_type         = excluded.media_type,
-			     filename           = excluded.filename,
-			     url                = excluded.url,
-			     media_key          = excluded.media_key,
-			     file_sha256        = excluded.file_sha256,
-			     file_enc_sha256    = excluded.file_enc_sha256,
-			     file_length        = excluded.file_length,
-			     push_name          = excluded.push_name,
-			     quoted_message_id  = excluded.quoted_message_id,
-			     quoted_participant = excluded.quoted_participant`,
-			m.ID, m.ChatJID, m.Sender, m.SenderName, m.Content,
+			 ON CONFLICT(id, chat_jid) DO NOTHING RETURNING id`
+const updateMessageSQL = `UPDATE messages SET sender = $3, sender_name = $4, content = $5, timestamp = $6, is_from_me = $7, media_type = $8, filename = $9, url = $10, media_key = $11, file_sha256 = $12, file_enc_sha256 = $13, file_length = $14, push_name = $15, quoted_message_id = $16, quoted_participant = $17 WHERE id = $1 AND chat_jid = $2`
+
+// UpsertMessage preserves the legacy non-notifying history/import path.
+func (s *Store) UpsertMessage(m *MessageRow) error {
+	_, err := s.SaveMessage(context.Background(), m, nil)
+	return err
+}
+
+// SaveMessage atomically saves a message and, for an eligible insertion only,
+// its notification. Results are usable only on successful commit. Cancellation
+// or a commit failure may have an unknown outcome; the outbox is authoritative.
+func (s *Store) SaveMessage(ctx context.Context, msg *MessageRow, request *NotificationRequest) (MessageWriteResult, error) {
+	if msg == nil {
+		return "", errors.New("notification_message_invalid")
+	}
+	if msg.Content == "" && msg.MediaType == "" {
+		return MessageSkipped, nil
+	}
+	// Own mutable input buffers even if cancellation returns before execution.
+	m := *msg
+	m.MediaKey, m.FileSHA256, m.FileEncSHA256 = bytes.Clone(msg.MediaKey), bytes.Clone(msg.FileSHA256), bytes.Clone(msg.FileEncSHA256)
+	var candidate NotificationRequest
+	eligible := request != nil && !m.IsFromMe
+	if eligible {
+		candidate = *request
+		if m.ID == "" || m.ChatJID == "" || m.Timestamp.IsZero() || candidate.ReceivedAt.IsZero() || candidate.MaxAge <= 0 || candidate.MaxAge > 7*24*time.Hour {
+			return "", errors.New("notification_metadata_invalid")
+		}
+	}
+	var result MessageWriteResult
+	err := s.submitContext(ctx, func(tx *sql.Tx) error {
+		args := []any{m.ID, m.ChatJID, m.Sender, m.SenderName, m.Content,
 			m.Timestamp, m.IsFromMe, m.MediaType, m.Filename, m.URL,
 			m.MediaKey, m.FileSHA256, m.FileEncSHA256, m.FileLength,
-			m.PushName, m.QuotedMessageID, m.QuotedParticipant,
-		)
-		return err
+			m.PushName, m.QuotedMessageID, m.QuotedParticipant}
+		var id string
+		err := tx.QueryRowContext(ctx, insertMessageSQL, args...).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			updated, err := tx.ExecContext(ctx, updateMessageSQL, args...)
+			if err != nil {
+				return err
+			}
+			count, err := updated.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if count != 1 {
+				return errors.New("message_update_missing")
+			}
+			result = MessageUpdated
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if eligible {
+			eventID, err := newNotificationID()
+			if err != nil {
+				return err
+			}
+			receivedAt := candidate.ReceivedAt.UTC().Truncate(time.Microsecond)
+			if _, err := tx.ExecContext(ctx, insertNotificationSQL,
+				eventID, m.ChatJID, m.ID, m.Timestamp.UTC().Truncate(time.Microsecond), receivedAt, receivedAt.Add(candidate.MaxAge)); err != nil {
+				return err
+			}
+		}
+		result = MessageInserted
+		return nil
 	})
+	if err != nil {
+		return "", notificationStoreError(ctx)
+	}
+	return result, nil
 }
 
 // ListMessages returns messages matching the given filter.

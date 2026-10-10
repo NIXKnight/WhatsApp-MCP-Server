@@ -57,7 +57,7 @@ def register_contact_tools(mcp: FastMCP) -> None:
     # get_contact
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations={"readOnlyHint": True})
     async def get_contact(ctx: Context, jid: str) -> str:
         """Return metadata for a single WhatsApp contact by their JID.
 

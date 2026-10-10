@@ -19,5 +19,7 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+# Host-native bridge release artifacts (explicit even though dist/ also matches).
+/bridge/dist/
 bridge/whatsapp-bridge
 .playwright*

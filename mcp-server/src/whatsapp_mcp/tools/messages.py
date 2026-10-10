@@ -140,7 +140,7 @@ def register_message_tools(mcp: FastMCP) -> None:
     # get_messages
     # ------------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(annotations={"readOnlyHint": True})
     async def get_messages(
         ctx: Context,
         jid: str,
