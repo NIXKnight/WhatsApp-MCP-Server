@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -22,8 +23,13 @@ func TestNotificationsDisabledDoesNotReadSecret(t *testing.T) {
 }
 
 func notificationEnv() map[string]string {
-	return map[string]string{"BRIDGE_NOTIFY_ENABLED": "true", "BRIDGE_NOTIFY_URL": "http://127.0.0.1:8644/webhooks/test",
-		"BRIDGE_NOTIFY_SECRET": testOnlyNotificationSecret, "BRIDGE_NOTIFY_CHAT_ALLOWLIST": "100@g.us, 200@lid,100@g.us"}
+	return map[string]string{
+		"BRIDGE_NOTIFY_ENABLED":         "true",
+		"BRIDGE_NOTIFY_URL":             "http://127.0.0.1:8644/webhooks/test",
+		"BRIDGE_NOTIFY_SECRET":          testOnlyNotificationSecret,
+		"BRIDGE_NOTIFY_GROUP_ALLOWLIST": "100@g.us,200@g.us,100@g.us",
+		"BRIDGE_NOTIFY_OPERATOR_JIDS":   "300@lid,400@s.whatsapp.net,300@lid",
+	}
 }
 
 func TestNotificationsConfig(t *testing.T) {
@@ -33,8 +39,10 @@ func TestNotificationsConfig(t *testing.T) {
 	}{
 		{"defaults", "", "", true}, {"boolean", "BRIDGE_NOTIFY_ENABLED", "invalid-test-value", false},
 		{"secret missing", "BRIDGE_NOTIFY_SECRET", "", false}, {"bypass rejected", "BRIDGE_NOTIFY_SECRET", "INSECURE_NO_AUTH", false},
-		{"allowlist missing", "BRIDGE_NOTIFY_CHAT_ALLOWLIST", "", false}, {"wildcard", "BRIDGE_NOTIFY_CHAT_ALLOWLIST", "*", false},
-		{"bare id", "BRIDGE_NOTIFY_CHAT_ALLOWLIST", "100", false}, {"unsupported namespace", "BRIDGE_NOTIFY_CHAT_ALLOWLIST", "100@broadcast", false},
+		{"groups missing", "BRIDGE_NOTIFY_GROUP_ALLOWLIST", "", false}, {"group wildcard", "BRIDGE_NOTIFY_GROUP_ALLOWLIST", "*", false},
+		{"group private jid", "BRIDGE_NOTIFY_GROUP_ALLOWLIST", "300@lid", false}, {"group bare id", "BRIDGE_NOTIFY_GROUP_ALLOWLIST", "100", false},
+		{"operators missing", "BRIDGE_NOTIFY_OPERATOR_JIDS", "", false}, {"operator wildcard", "BRIDGE_NOTIFY_OPERATOR_JIDS", "*", false},
+		{"operator group jid", "BRIDGE_NOTIFY_OPERATOR_JIDS", "100@g.us", false}, {"operator unsupported namespace", "BRIDGE_NOTIFY_OPERATOR_JIDS", "300@hosted", false},
 		{"bad duration", "BRIDGE_NOTIFY_TIMEOUT", "invalid-test-value", false}, {"negative", "BRIDGE_NOTIFY_TIMEOUT", "-1s", false},
 		{"timeout bound", "BRIDGE_NOTIFY_TIMEOUT", "31s", false}, {"batch bound", "BRIDGE_NOTIFY_BATCH_SIZE", "101", false},
 		{"attempt bound", "BRIDGE_NOTIFY_MAX_ATTEMPTS", "0", false}, {"valid override", "BRIDGE_NOTIFY_MAX_ATTEMPTS", "3", true},
@@ -51,8 +59,11 @@ func TestNotificationsConfig(t *testing.T) {
 			if err != nil && (strings.Contains(err.Error(), testOnlyNotificationSecret) || strings.Contains(err.Error(), "invalid-test-value")) {
 				t.Fatal("configuration value leaked")
 			}
-			if tt.valid && len(cfg.ChatAllowlist) != 2 {
-				t.Fatal("allowlist was not deduplicated")
+			if tt.valid {
+				want := []string{"100@g.us", "200@g.us", "300@lid", "400@s.whatsapp.net"}
+				if !reflect.DeepEqual(cfg.ChatAllowlist, want) {
+					t.Fatal("ordered admission identities were not deduplicated")
+				}
 			}
 		})
 	}

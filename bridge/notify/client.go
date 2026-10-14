@@ -28,8 +28,10 @@ import (
 var errDestination = errors.New("notification_destination_policy")
 var opaqueID = regexp.MustCompile(`^[0-9a-f]{32}$`)
 var chatID = regexp.MustCompile(`^\d+@(s\.whatsapp\.net|g\.us|lid)$`)
+var privateChatID = regexp.MustCompile(`^\d+@(s\.whatsapp\.net|lid)$`)
+var participantID = regexp.MustCompile(`^\d+@(s\.whatsapp\.net|lid|bot|hosted|hosted\.lid)$`)
 
-// Payload is the entire wire contract. Never marshal the message or outbox row.
+// Payload is the exact schema-v1 seven-field wire contract.
 type Payload struct {
 	SchemaVersion  int       `json:"schema_version"`
 	EventType      string    `json:"event_type"`
@@ -40,11 +42,58 @@ type Payload struct {
 	ReceivedAt     time.Time `json:"received_at"`
 }
 
+// PayloadV2 is the sequenced controller intake contract. ChatJID remains the
+// actual message-storage identity; CanonicalChatJID is routing metadata only.
+type PayloadV2 struct {
+	SchemaVersion    int       `json:"schema_version"`
+	EventType        string    `json:"event_type"`
+	EventID          string    `json:"event_id"`
+	ChatJID          string    `json:"chat_jid"`
+	CanonicalChatJID string    `json:"canonical_chat_jid"`
+	MessageID        string    `json:"message_id"`
+	EventTimestamp   time.Time `json:"event_timestamp"`
+	ReceivedAt       time.Time `json:"received_at"`
+	ChatSequence     int64     `json:"chat_sequence"`
+	SenderJID        string    `json:"sender_jid"`
+	SenderAltJID     string    `json:"sender_alt_jid,omitempty"`
+	ChatKind         string    `json:"chat_kind"`
+	IsFromMe         bool      `json:"is_from_me"`
+}
+
 func payloadBytes(n store.Notification) ([]byte, error) {
-	if !opaqueID.MatchString(n.EventID) || n.SchemaVersion != 1 || n.EventType != "whatsapp.message.received" || !chatID.MatchString(n.ChatJID) || n.MessageID == "" || len(n.MessageID) > 512 || n.EventTimestamp.IsZero() || n.ReceivedAt.IsZero() {
+	if !opaqueID.MatchString(n.EventID) || n.EventType != "whatsapp.message.received" ||
+		!chatID.MatchString(n.ChatJID) || n.MessageID == "" || len(n.MessageID) > 512 ||
+		n.EventTimestamp.IsZero() || n.ReceivedAt.IsZero() {
 		return nil, errors.New("notification_metadata_invalid")
 	}
-	return json.Marshal(Payload{n.SchemaVersion, n.EventType, n.EventID, n.ChatJID, n.MessageID, n.EventTimestamp.UTC(), n.ReceivedAt.UTC()})
+	switch n.SchemaVersion {
+	case 1:
+		if n.CanonicalChatJID != "" || n.ChatSequence != 0 || n.SenderJID != "" ||
+			n.SenderAltJID != "" || n.ChatKind != "" || n.IsFromMe {
+			return nil, errors.New("notification_metadata_invalid")
+		}
+		return json.Marshal(Payload{
+			SchemaVersion: n.SchemaVersion, EventType: n.EventType, EventID: n.EventID,
+			ChatJID: n.ChatJID, MessageID: n.MessageID,
+			EventTimestamp: n.EventTimestamp.UTC(), ReceivedAt: n.ReceivedAt.UTC(),
+		})
+	case 2:
+		validRoute := n.ChatKind == "group" && strings.HasSuffix(n.ChatJID, "@g.us") && n.CanonicalChatJID == n.ChatJID
+		validRoute = validRoute || (n.ChatKind == "operator_private" && privateChatID.MatchString(n.ChatJID) && privateChatID.MatchString(n.CanonicalChatJID))
+		if !validRoute || n.ChatSequence < 1 || !participantID.MatchString(n.SenderJID) ||
+			(n.SenderAltJID != "" && !participantID.MatchString(n.SenderAltJID)) {
+			return nil, errors.New("notification_metadata_invalid")
+		}
+		return json.Marshal(PayloadV2{
+			SchemaVersion: n.SchemaVersion, EventType: n.EventType, EventID: n.EventID,
+			ChatJID: n.ChatJID, CanonicalChatJID: n.CanonicalChatJID, MessageID: n.MessageID,
+			EventTimestamp: n.EventTimestamp.UTC(), ReceivedAt: n.ReceivedAt.UTC(),
+			ChatSequence: n.ChatSequence, SenderJID: n.SenderJID,
+			SenderAltJID: n.SenderAltJID, ChatKind: n.ChatKind, IsFromMe: n.IsFromMe,
+		})
+	default:
+		return nil, errors.New("notification_metadata_invalid")
+	}
 }
 
 type privateDialer struct {

@@ -91,11 +91,16 @@ const (
 	MessageSkipped MessageWriteResult = "skipped"
 )
 
-// NotificationRequest requests a metadata-only event for a live insertion.
-// The caller must first apply live-origin and chat-allowlist policy.
+// NotificationRequest requests a schema-v2 metadata-only event for a live
+// insertion. The caller must first apply live-origin and admission policy.
 type NotificationRequest struct {
-	ReceivedAt time.Time
-	MaxAge     time.Duration
+	ReceivedAt       time.Time
+	MaxAge           time.Duration
+	CanonicalChatJID string
+	SenderJID        string
+	SenderAltJID     string
+	ChatKind         string
+	IsFromMe         bool
 }
 
 const insertMessageSQL = `INSERT INTO messages
@@ -112,9 +117,10 @@ func (s *Store) UpsertMessage(m *MessageRow) error {
 	return err
 }
 
-// SaveMessage atomically saves a message and, for an eligible insertion only,
-// its notification. Results are usable only on successful commit. Cancellation
-// or a commit failure may have an unknown outcome; the outbox is authoritative.
+// SaveMessage atomically saves a message and, for an eligible first insertion
+// only, allocates its canonical-chat sequence and creates its v2 notification.
+// Results are usable only on successful commit. Cancellation or a commit failure
+// may have an unknown outcome; the outbox is authoritative.
 func (s *Store) SaveMessage(ctx context.Context, msg *MessageRow, request *NotificationRequest) (MessageWriteResult, error) {
 	if msg == nil {
 		return "", errors.New("notification_message_invalid")
@@ -126,10 +132,10 @@ func (s *Store) SaveMessage(ctx context.Context, msg *MessageRow, request *Notif
 	m := *msg
 	m.MediaKey, m.FileSHA256, m.FileEncSHA256 = bytes.Clone(msg.MediaKey), bytes.Clone(msg.FileSHA256), bytes.Clone(msg.FileEncSHA256)
 	var candidate NotificationRequest
-	eligible := request != nil && !m.IsFromMe
+	eligible := request != nil
 	if eligible {
 		candidate = *request
-		if m.ID == "" || m.ChatJID == "" || m.Timestamp.IsZero() || candidate.ReceivedAt.IsZero() || candidate.MaxAge <= 0 || candidate.MaxAge > 7*24*time.Hour {
+		if !validV2NotificationRequest(m, candidate) {
 			return "", errors.New("notification_metadata_invalid")
 		}
 	}
@@ -164,9 +170,20 @@ func (s *Store) SaveMessage(ctx context.Context, msg *MessageRow, request *Notif
 			if err != nil {
 				return err
 			}
+			var sequence int64
+			if err := tx.QueryRowContext(ctx, allocateNotificationSequenceSQL, candidate.CanonicalChatJID).Scan(&sequence); err != nil {
+				return err
+			}
 			receivedAt := candidate.ReceivedAt.UTC().Truncate(time.Microsecond)
+			var senderAlt any
+			if candidate.SenderAltJID != "" {
+				senderAlt = candidate.SenderAltJID
+			}
 			if _, err := tx.ExecContext(ctx, insertNotificationSQL,
-				eventID, m.ChatJID, m.ID, m.Timestamp.UTC().Truncate(time.Microsecond), receivedAt, receivedAt.Add(candidate.MaxAge)); err != nil {
+				eventID, m.ChatJID, candidate.CanonicalChatJID, m.ID,
+				m.Timestamp.UTC().Truncate(time.Microsecond), receivedAt,
+				receivedAt.Add(candidate.MaxAge), sequence, candidate.SenderJID,
+				senderAlt, candidate.ChatKind, candidate.IsFromMe); err != nil {
 				return err
 			}
 		}
