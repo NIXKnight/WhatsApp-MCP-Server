@@ -45,8 +45,13 @@ func testSender(t *testing.T, server *httptest.Server) *Sender {
 	return s
 }
 
-func TestSigningAndStableWhitelist(t *testing.T) {
+func TestSigningAndStableV2Whitelist(t *testing.T) {
 	n := testNotification()
+	n.SchemaVersion = 2
+	n.CanonicalChatJID = n.ChatJID
+	n.ChatSequence = 41
+	n.SenderJID = "500@s.whatsapp.net"
+	n.ChatKind = "group"
 	type capture struct {
 		body                     []byte
 		timestamp, signature, id string
@@ -80,16 +85,104 @@ func TestSigningAndStableWhitelist(t *testing.T) {
 			t.Fatal("V2 signature mismatch")
 		}
 		var body map[string]json.RawMessage
-		if json.Unmarshal(c.body, &body) != nil || len(body) != 7 {
-			t.Fatal("payload shape invalid")
+		if json.Unmarshal(c.body, &body) != nil || len(body) != 12 {
+			t.Fatal("v2 payload shape invalid")
 		}
-		for _, key := range []string{"schema_version", "event_type", "event_id", "chat_jid", "message_id", "event_timestamp", "received_at"} {
+		for _, key := range []string{
+			"schema_version", "event_type", "event_id", "chat_jid", "canonical_chat_jid",
+			"message_id", "event_timestamp", "received_at", "chat_sequence", "sender_jid",
+			"chat_kind", "is_from_me",
+		} {
 			if _, ok := body[key]; !ok {
-				t.Fatal("metadata field missing")
+				t.Fatal("v2 metadata field missing")
 			}
 		}
 		if strings.Contains(string(c.body), testOnlySecret) || strings.Contains(string(c.body), n.LeaseToken) {
 			t.Fatal("auth/bookkeeping leaked into payload")
+		}
+	}
+}
+
+func TestV2PayloadWhitelistAndRoutingMetadata(t *testing.T) {
+	n := testNotification()
+	n.SchemaVersion = 2
+	n.CanonicalChatJID = n.ChatJID
+	n.ChatSequence = 41
+	n.SenderJID = "500@s.whatsapp.net"
+	n.SenderAltJID = "600@lid"
+	n.ChatKind = "group"
+	n.IsFromMe = false
+
+	body, err := payloadBytes(n)
+	if err != nil {
+		t.Fatal("valid v2 payload rejected")
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || len(fields) != 13 {
+		t.Fatal("v2 payload shape invalid")
+	}
+	for _, key := range []string{
+		"schema_version", "event_type", "event_id", "chat_jid", "canonical_chat_jid",
+		"message_id", "event_timestamp", "received_at", "chat_sequence", "sender_jid",
+		"sender_alt_jid", "chat_kind", "is_from_me",
+	} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("v2 metadata field missing: %s", key)
+		}
+	}
+	if string(fields["is_from_me"]) != "false" || strings.Contains(string(body), "message_origin") {
+		t.Fatal("explicit own-message boolean contract drifted")
+	}
+
+	n.SenderAltJID = ""
+	body, err = payloadBytes(n)
+	fields = nil
+	if err != nil || json.Unmarshal(body, &fields) != nil {
+		t.Fatal("optional sender alternate rejected")
+	}
+	if _, ok := fields["sender_alt_jid"]; ok || len(fields) != 12 {
+		t.Fatal("empty sender alternate was serialized")
+	}
+
+	n.ChatJID = "400@s.whatsapp.net"
+	n.CanonicalChatJID = "300@lid"
+	n.ChatKind = "operator_private"
+	n.IsFromMe = true
+	body, err = payloadBytes(n)
+	if err != nil || !strings.Contains(string(body), `"chat_jid":"400@s.whatsapp.net"`) ||
+		!strings.Contains(string(body), `"canonical_chat_jid":"300@lid"`) {
+		t.Fatal("actual and canonical private identities were not preserved")
+	}
+}
+
+func TestV1PayloadNeverFabricatesV2Metadata(t *testing.T) {
+	n := testNotification()
+	body, err := payloadBytes(n)
+	if err != nil {
+		t.Fatal("valid v1 payload rejected")
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || len(fields) != 7 {
+		t.Fatal("v1 payload is not the exact seven-field body")
+	}
+	for _, key := range []string{"canonical_chat_jid", "chat_sequence", "sender_jid", "sender_alt_jid", "chat_kind", "is_from_me"} {
+		if _, ok := fields[key]; ok {
+			t.Fatalf("v2 field leaked into v1 payload: %s", key)
+		}
+	}
+
+	for _, mutate := range []func(*store.Notification){
+		func(n *store.Notification) { n.CanonicalChatJID = n.ChatJID },
+		func(n *store.Notification) { n.ChatSequence = 1 },
+		func(n *store.Notification) { n.SenderJID = "500@s.whatsapp.net" },
+		func(n *store.Notification) { n.SenderAltJID = "600@lid" },
+		func(n *store.Notification) { n.ChatKind = "group" },
+		func(n *store.Notification) { n.IsFromMe = true },
+	} {
+		candidate := n
+		mutate(&candidate)
+		if _, err := payloadBytes(candidate); err == nil || err.Error() != "notification_metadata_invalid" {
+			t.Fatal("schema-v1 payload silently ignored v2 metadata")
 		}
 	}
 }
@@ -331,6 +424,25 @@ func TestPayloadRejectsMalformedMetadata(t *testing.T) {
 	n.ChatJID = "TEST_BAD_CHAT"
 	if _, err := payloadBytes(n); err == nil {
 		t.Fatal("incompatible chat accepted")
+	}
+	v2 := testNotification()
+	v2.SchemaVersion = 2
+	v2.CanonicalChatJID = v2.ChatJID
+	v2.ChatSequence = 1
+	v2.SenderJID = "500@s.whatsapp.net"
+	v2.ChatKind = "group"
+	for _, mutate := range []func(*store.Notification){
+		func(n *store.Notification) { n.ChatSequence = 0 },
+		func(n *store.Notification) { n.CanonicalChatJID = "200@g.us" },
+		func(n *store.Notification) { n.SenderJID = "500@broadcast" },
+		func(n *store.Notification) { n.SenderAltJID = "500:7@s.whatsapp.net" },
+		func(n *store.Notification) { n.ChatKind = "private" },
+	} {
+		candidate := v2
+		mutate(&candidate)
+		if _, err := payloadBytes(candidate); err == nil || err.Error() != "notification_metadata_invalid" {
+			t.Fatal("malformed v2 metadata admitted")
+		}
 	}
 }
 
