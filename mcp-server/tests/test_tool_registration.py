@@ -1,17 +1,13 @@
-"""Tests that the full tool set is registered on the production server.
-
-These assert against the real ``whatsapp_mcp.server.mcp`` object (not the test
-clone) so that any drift between ``server.py`` wiring and the expected tool
-inventory is caught.  ``mcp.list_tools()`` enumerates registered tools
-server-side without needing a client session or the lifespan/health-check.
-"""
+"""Assert the exact production FastMCP tool inventory."""
 
 from __future__ import annotations
 
+
 EXPECTED_TOOLS = {
-    # messages (10)
+    # messages (11)
     "send_message",
     "check_new_messages",
+    "get_message",
     "get_messages",
     "get_unread_chats",
     "get_unread_messages",
@@ -25,9 +21,10 @@ EXPECTED_TOOLS = {
     "get_group",
     "send_group_message",
     "send_auto_message",
-    # media (2)
+    # media (3)
     "send_media",
     "download_media",
+    "analyze_media",
     # contacts (2)
     "list_contacts",
     "get_contact",
@@ -37,26 +34,21 @@ EXPECTED_TOOLS = {
 
 
 async def test_full_tool_set_registered():
-    """The production server registers exactly 19 tools (14 existing + 5 new)."""
+    """Production registers exactly the approved 21-tool inventory."""
     from whatsapp_mcp.server import mcp
 
     tools = await mcp.list_tools()
-    names = {t.name for t in tools}
+    names = {tool.name for tool in tools}
 
-    assert len(tools) == 19, f"expected 19 tools, got {len(tools)}: {sorted(names)}"
+    assert len(tools) == 21, f"expected 21 tools, got {len(tools)}: {sorted(names)}"
     assert names == EXPECTED_TOOLS
 
 
-async def test_new_tools_present():
-    """The five new tools are individually present."""
+async def test_slice_two_inventory_additions_present():
+    """The exact read and existing media analyzer remain explicit."""
     from whatsapp_mcp.server import mcp
 
-    names = {t.name for t in await mcp.list_tools()}
-    for new_tool in (
-        "semantic_search",
-        "send_reaction",
-        "edit_message",
-        "revoke_message",
-        "check_triggers",
-    ):
-        assert new_tool in names, f"missing new tool: {new_tool}"
+    names = {tool.name for tool in await mcp.list_tools()}
+
+    assert "get_message" in names
+    assert "analyze_media" in names
