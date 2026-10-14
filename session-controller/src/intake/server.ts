@@ -3,6 +3,9 @@ import type { AddressInfo } from 'node:net';
 import { checked, AcceptanceSchema, ControllerError, systemClock, type Clock, type DiagnosticPort, type IntakeStore, type ReadinessPort, type IntakeLifecycle } from '../domain.js';
 import type { ControllerConfig } from '../config.js';
 import { createSignatureVerifier } from './signature.js';
+import { connectRedis } from '../redis/client.js';
+import { createRepository, type RedisRepository } from '../redis/repository.js';
+import type { CompletionIndexPort } from '../domain.js';
 import { parsePayload } from './payload.js';
 
 function singleHeader(req: IncomingMessage, name: string): string | undefined {
@@ -120,4 +123,20 @@ export function createWebhookServer(config: ControllerConfig, store: IntakeStore
       return closing;
     }
   };
+}
+
+/** No listen, environment read, Pi import or in-memory production fallback.
+ * Caller owns stopIntake -> stopScheduling -> indefinite drain -> server.close
+ * -> repository.close. CompletionIndexPort must return fsynced strict evidence
+ * from all configured mapped Pi histories, never replay-derived fingerprints.
+ */
+export async function createRedisWebhookServer(config: ControllerConfig, completions: CompletionIndexPort, diagnostics: DiagnosticPort, clock: Clock = systemClock): Promise<{ server: WebhookServer; repository: RedisRepository }> {
+  const connections = await connectRedis(config.redis);
+  try {
+    const repository = await createRepository(connections, config.admission, completions, clock);
+    return { server: createWebhookServer(config, repository, connections, diagnostics, clock), repository };
+  } catch {
+    await connections.close();
+    throw new ControllerError('store_unavailable');
+  }
 }
