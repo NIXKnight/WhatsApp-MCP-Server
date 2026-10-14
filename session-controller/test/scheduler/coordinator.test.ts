@@ -224,6 +224,79 @@ describe('bounded coordinator and recovery hints', () => {
 
     await f.coordinator.drain();
   });
+  it('loop failure stops application heartbeat', async () => {
+    const f = coordinatorFixture(1), heartbeatTick = gate(), failLoop = gate();
+    let heartbeatWaiting = false, claimWaiting = false, renewals = 0, losses = 0;
+    f.worker.wait = { wait: async (ms, signal) => {
+      if (ms === 100) {
+        heartbeatWaiting = true;
+        await Promise.race([heartbeatTick.promise, new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }))]);
+      } else await timerWait.wait(ms, signal);
+    } };
+    f.worker.diagnostics = { emit: event => { if (event.class === 'lease_lost') losses++; } };
+    f.repository.renewApp = async () => { renewals++; return fence; };
+    f.repository.claimNext = async () => {
+      claimWaiting = true;
+      await failLoop.promise;
+      throw new Error('synthetic_loop_failure');
+    };
+
+    await f.coordinator.start();
+    await until(() => heartbeatWaiting && claimWaiting);
+    failLoop.resolve();
+    await until(() => losses === 1);
+    heartbeatTick.resolve();
+    await new Promise<void>(r => setImmediate(r));
+    expect(renewals).toBe(0); expect(losses).toBe(1);
+
+    await f.coordinator.drain();
+  });
+  it('normal drain renews until active work settles then releases leadership', async () => {
+    const f = coordinatorFixture(1), heartbeatTick = gate(), ordering: string[] = [];
+    let appHeartbeatSignal: AbortSignal | undefined, renewals = 0, releases = 0, drained = false;
+    f.worker.wait = { wait: async (ms, signal) => {
+      if (ms === 100 && !appHeartbeatSignal) {
+        appHeartbeatSignal = signal;
+        await Promise.race([heartbeatTick.promise, new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }))]);
+        return;
+      }
+      if (signal.aborted) return;
+      await new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }));
+    } };
+    const renewApp = f.repository.renewApp;
+    f.repository.renewApp = async (...args) => {
+      renewals++; ordering.push('renewApp');
+      return renewApp(...args);
+    };
+    const releaseApp = f.repository.releaseApp;
+    f.repository.releaseApp = async (...args) => {
+      releases++; ordering.push('releaseApp');
+      return releaseApp(...args);
+    };
+    const open = f.worker.host.open;
+    f.worker.host.open = async (...args) => {
+      const session = await open(...args), dispose = session.dispose;
+      session.dispose = async () => { await dispose(); ordering.push('workerSettled'); };
+      return session;
+    };
+
+    await f.coordinator.start();
+    await until(() => appHeartbeatSignal !== undefined && f.holds.size === 1);
+    f.coordinator.stopScheduling();
+    const draining = f.coordinator.drain().then(() => { drained = true; });
+    await new Promise<void>(r => setImmediate(r));
+    expect(drained).toBe(false);
+
+    heartbeatTick.resolve();
+    await until(() => renewals === 1);
+    expect(releases).toBe(0); expect(drained).toBe(false);
+
+    f.holds.values().next().value?.resolve();
+    await draining;
+    expect(appHeartbeatSignal?.aborted).toBe(true);
+    expect(renewals).toBe(1); expect(releases).toBe(1);
+    expect(ordering).toEqual(['renewApp', 'workerSettled', 'releaseApp']);
+  });
   it('app renewal failure prevents new scheduling', async () => {
     const f = coordinatorFixture(1), firstTick = gate(), secondTick = gate();
     let heartbeatWaits = 0, renewalCalls = 0, claimCalls = 0, losses = 0;
