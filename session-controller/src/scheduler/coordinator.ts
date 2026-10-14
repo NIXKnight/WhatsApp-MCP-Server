@@ -33,9 +33,13 @@ export function createCoordinator(repository: CoordinatorRepository, options: Co
   const active = new Map<string, Promise<void>>();
   const recovery = createRecovery(repository);
   const stop = new AbortController(), heartbeatStop = new AbortController();
-  let app: Fence | undefined, live = false, started = false, stopped = false, position = 0;
+  let app: Fence | undefined, live = false, started = false, stopped = false, lost = false, position = 0;
   let startTask: Promise<void> | undefined, loop: Promise<void> = Promise.resolve(), heartbeat: Promise<void> = Promise.resolve();
-  const lose = () => { live = false; stopped = true; stop.abort(); emit({ class: 'lease_lost' }); };
+  const lose = () => {
+    if (lost) return;
+    lost = true; live = false; stopped = true;
+    stop.abort(); heartbeatStop.abort(); emit({ class: 'lease_lost' });
+  };
   const coordinator: Coordinator = {
     start() {
       if (startTask) return startTask;

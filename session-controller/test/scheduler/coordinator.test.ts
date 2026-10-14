@@ -134,7 +134,7 @@ describe('bounded coordinator and recovery hints', () => {
     const f = fixture(), holds = new Map<string, ReturnType<typeof gate>>(), claimed = new Set<string>();
     const attempts = new Map<string, number>(), starts = new Map<string, number>(), completed = new Set<string>();
     let scheduling = 0, max = 0, appRenewFailed = false;
-    const repository = {
+    const repository: CoordinatorRepository = {
       ...f.repository, chats: [chat, other], acquireApp: async () => fence,
       renewApp: async () => appRenewFailed ? undefined : fence, releaseApp: async () => true,
       recoverPending: async () => ({ status: 'ok' as const, next: '0-0', claimed: 0, deleted: 0 }),
@@ -144,7 +144,7 @@ describe('bounded coordinator and recovery hints', () => {
         // Adversarial port offers work again even while this chat is active.
         claimed.add(c); scheduling++; max = Math.max(max, scheduling); return { status: 'claimed' as const, work: work(c) };
       }
-    } satisfies CoordinatorRepository;
+    };
     f.options.host.open = async w => {
       const h = gate(); holds.set(w.event.canonical_chat_jid, h);
       starts.set(w.event.canonical_chat_jid, (starts.get(w.event.canonical_chat_jid) ?? 0) + 1);
@@ -203,16 +203,51 @@ describe('bounded coordinator and recovery hints', () => {
     f.coordinator.stopScheduling(); const draining = f.coordinator.drain(); for (const h of f.holds.values()) h.resolve(); await draining;
     expect(f.maximum()).toBe(1); expect(f.claimed.size).toBe(1);
   });
-  it('app renewal failure prevents new scheduling', async () => {
-    const f = coordinatorFixture(1), tick = gate(); let renewed = false;
+  it('claim loss stops application heartbeat', async () => {
+    const f = coordinatorFixture(1), heartbeatTick = gate();
+    let heartbeatWaiting = false, renewals = 0, losses = 0;
     f.worker.wait = { wait: async (ms, signal) => {
-      if (ms === 100) await Promise.race([tick.promise, new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }))]);
-      else await timerWait.wait(ms, signal);
+      if (ms === 100) {
+        heartbeatWaiting = true;
+        await Promise.race([heartbeatTick.promise, new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }))]);
+      } else await timerWait.wait(ms, signal);
     } };
-    const original = f.repository.renewApp; f.repository.renewApp = async (...args) => { renewed = true; return original(...args); };
-    // The original factory captures the same worker object at construction.
-    await f.coordinator.start(); await until(() => f.holds.size === 1); f.failRenew(); tick.resolve(); await until(() => renewed);
-    for (const h of f.holds.values()) h.resolve(); await f.coordinator.drain(); expect(f.claimed.size).toBe(1);
+    f.worker.diagnostics = { emit: event => { if (event.class === 'lease_lost') losses++; } };
+    f.repository.renewApp = async () => { renewals++; return fence; };
+    f.repository.claimNext = async () => ({ status: 'lost' as const });
+
+    await f.coordinator.start();
+    await until(() => heartbeatWaiting && losses === 1);
+    heartbeatTick.resolve();
+    await new Promise<void>(r => setImmediate(r));
+    expect(renewals).toBe(0); expect(losses).toBe(1);
+
+    await f.coordinator.drain();
+  });
+  it('app renewal failure prevents new scheduling', async () => {
+    const f = coordinatorFixture(1), firstTick = gate(), secondTick = gate();
+    let heartbeatWaits = 0, renewalCalls = 0, claimCalls = 0, losses = 0;
+    f.worker.wait = { wait: async (ms, signal) => {
+      if (ms === 100) {
+        const tick = heartbeatWaits++ === 0 ? firstTick : secondTick;
+        await Promise.race([tick.promise, new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }))]);
+      } else await timerWait.wait(ms, signal);
+    } };
+    f.worker.diagnostics = { emit: event => { if (event.class === 'lease_lost') losses++; } };
+    f.repository.claimNext = async () => { claimCalls++; return { status: 'empty' as const }; };
+    const original = f.repository.renewApp;
+    f.repository.renewApp = async (...args) => { renewalCalls++; return original(...args); };
+
+    await f.coordinator.start(); await until(() => heartbeatWaits === 1 && claimCalls > 0);
+    f.failRenew(); firstTick.resolve(); await until(() => losses === 1);
+    const claimsAtLoss = claimCalls;
+    secondTick.resolve();
+    await new Promise<void>(r => setImmediate(r));
+    await new Promise<void>(r => setImmediate(r));
+    expect(renewalCalls).toBe(1); expect(losses).toBe(1);
+    expect(heartbeatWaits).toBe(1); expect(claimCalls).toBe(claimsAtLoss);
+
+    await f.coordinator.drain();
   });
   it('stop before start is terminal and idempotent', async () => {
     const f = coordinatorFixture(); f.coordinator.stopScheduling(); f.coordinator.stopScheduling();
