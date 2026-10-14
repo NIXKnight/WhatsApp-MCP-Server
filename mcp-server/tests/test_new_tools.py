@@ -16,6 +16,11 @@ async def test_get_message_routes_validates_envelope_and_records_telemetry(
     client,
     fake_bridge,
 ):
+    timestamp = "2026-01-01T00:00:00.123456789Z"
+    transcribed_at = "2026-01-01T00:00:01.987654321+05:30"
+    fake_bridge.message_response["message"]["timestamp"] = timestamp
+    fake_bridge.message_response["message"]["transcribed_at"] = transcribed_at
+
     result = await client.call_tool(
         "get_message",
         {"message_id": "M1", "chat_jid": TEST_CHAT_JID},
@@ -31,7 +36,8 @@ async def test_get_message_routes_validates_envelope_and_records_telemetry(
     assert payload["id"] == "M1"
     assert payload["snippet"] == "hello"
     assert payload["transcription"] == "fixture transcript"
-    assert payload["transcribed_at"] == "2026-01-01T00:00:01Z"
+    assert payload["timestamp"] == timestamp
+    assert payload["transcribed_at"] == transcribed_at
     assert fake_bridge.telemetry[-1]["tool_name"] == "get_message"
     assert fake_bridge.telemetry[-1]["success"] is True
 
@@ -91,6 +97,39 @@ async def test_get_message_preserves_go_omitempty_shape(client, fake_bridge):
                 "sender_name": "Alice",
                 "content": "hello",
                 "timestamp": "2026-01-01 00:00:00+00:00",
+                "is_from_me": False,
+            }
+        },
+        {
+            "message": {
+                "id": "M1",
+                "chat_jid": TEST_CHAT_JID,
+                "sender": "9230@s.whatsapp.net",
+                "sender_name": "Alice",
+                "content": "hello",
+                "timestamp": "2026-02-30T00:00:00Z",
+                "is_from_me": False,
+            }
+        },
+        {
+            "message": {
+                "id": "M1",
+                "chat_jid": TEST_CHAT_JID,
+                "sender": "9230@s.whatsapp.net",
+                "sender_name": "Alice",
+                "content": "hello",
+                "timestamp": "2026-01-01T00:00:00.1234567890Z",
+                "is_from_me": False,
+            }
+        },
+        {
+            "message": {
+                "id": "M1",
+                "chat_jid": TEST_CHAT_JID,
+                "sender": "9230@s.whatsapp.net",
+                "sender_name": "Alice",
+                "content": "hello",
+                "timestamp": "2026-01-01T00:00:00+24:00",
                 "is_from_me": False,
             }
         },
@@ -189,6 +228,27 @@ async def test_check_new_messages_uses_jid_and_preserves_empty_text(
     assert fake_bridge.telemetry[-1]["success"] is True
 
 
+async def test_check_new_messages_preserves_nanosecond_timestamps(
+    client,
+    fake_bridge,
+):
+    message = copy.deepcopy(fake_bridge.messages_response["messages"][0])
+    message["timestamp"] = "2026-01-01T00:00:00.123456789Z"
+    fake_bridge.check_response = {
+        "messages": [message],
+        "count": 1,
+        "since": "2026-01-01T00:00:00.000000001Z",
+        "timestamp": "2026-01-01T00:00:02.999999999+00:00",
+    }
+
+    result = await client.call_tool("check_new_messages", {"since": 0})
+
+    payload = json.loads(result.data)
+    assert payload["messages"][0]["timestamp"] == message["timestamp"]
+    assert payload["since"] == fake_bridge.check_response["since"]
+    assert payload["timestamp"] == fake_bridge.check_response["timestamp"]
+
+
 async def test_check_new_messages_rejects_strict_malformed_envelope(
     client,
     fake_bridge,
@@ -207,6 +267,9 @@ async def test_check_new_messages_rejects_strict_malformed_envelope(
 
 
 async def test_get_messages_validates_and_returns_envelope(client, fake_bridge):
+    timestamp = "2026-01-01T00:00:00.123456789-04:30"
+    fake_bridge.messages_response["messages"][0]["timestamp"] = timestamp
+
     result = await client.call_tool(
         "get_messages",
         {"jid": TEST_CHAT_JID, "limit": 9},
@@ -215,6 +278,7 @@ async def test_get_messages_validates_and_returns_envelope(client, fake_bridge):
     payload = json.loads(result.data)
     assert set(payload) == {"messages", "total", "limit", "offset"}
     assert payload["messages"][0]["transcription"] == "fixture transcript"
+    assert payload["messages"][0]["timestamp"] == timestamp
     assert fake_bridge.calls[-1] == (
         "get",
         {

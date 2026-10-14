@@ -31,8 +31,8 @@ _RFC3339 = re.compile(
 )
 
 
-def _parse_bridge_datetime(value: Any) -> datetime:
-    """Parse only the RFC3339 string shape emitted by Go JSON timestamps."""
+def _parse_bridge_datetime(value: Any) -> str:
+    """Validate a Go RFC3339Nano timestamp without changing its text."""
     if not isinstance(value, str) or _RFC3339.fullmatch(value) is None:
         raise ValueError("bridge timestamp must be an RFC3339 string")
     try:
@@ -41,10 +41,10 @@ def _parse_bridge_datetime(value: Any) -> datetime:
         raise ValueError("invalid bridge timestamp") from exc
     if parsed.tzinfo is None:
         raise ValueError("bridge timestamp must include a timezone")
-    return parsed
+    return value
 
 
-BridgeDatetime = Annotated[datetime, BeforeValidator(_parse_bridge_datetime)]
+BridgeDatetime = Annotated[str, BeforeValidator(_parse_bridge_datetime)]
 
 
 class StrictBridgeModel(BaseModel):
