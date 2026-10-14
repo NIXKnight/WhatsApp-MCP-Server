@@ -40,9 +40,24 @@ _POOL_TIMEOUT = 5.0
 # per-call by :meth:`BridgeClient.analyze_media`.
 _ANALYZE_READ_TIMEOUT = 200.0
 
+_BRIDGE_UNAVAILABLE_MESSAGE = "Bridge unavailable."
+_BRIDGE_TIMEOUT_MESSAGE = "Bridge request timed out."
+_BRIDGE_INVALID_RESPONSE_MESSAGE = "Bridge returned an invalid JSON response."
+
 
 class BridgeUnavailableError(RuntimeError):
     """Raised when the Go WhatsApp bridge cannot be reached."""
+
+
+def _http_status_message(status: int) -> str:
+    """Return a fixed message for an HTTP status class, never response data."""
+    if 300 <= status < 400:
+        return "Bridge request failed with an HTTP redirect."
+    if 400 <= status < 500:
+        return "Bridge request failed with an HTTP client error."
+    if 500 <= status < 600:
+        return "Bridge request failed with an HTTP server error."
+    return "Bridge request failed with an unexpected HTTP status."
 
 
 def _bridge_error_code(response: httpx.Response) -> str:
@@ -123,22 +138,19 @@ class BridgeClient:
                 resp.raise_for_status()
                 logger.info("Bridge health check passed on attempt %d.", attempt)
                 return
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+            except (httpx.RequestError, httpx.HTTPStatusError) as exc:
                 last_exc = exc
                 logger.warning(
-                    "Bridge health check attempt %d/%d failed: %s",
+                    "Bridge health check attempt %d/%d failed.",
                     attempt,
                     _HEALTH_ATTEMPTS,
-                    exc,
                 )
                 if attempt < _HEALTH_ATTEMPTS:
                     await asyncio.sleep(_HEALTH_RETRY_DELAY_S)
 
         raise BridgeUnavailableError(
-            f"Go WhatsApp bridge unreachable at {self._base_url} after "
-            f"{_HEALTH_ATTEMPTS} attempts. Start the bridge first. "
-            f"Last error: {last_exc}"
-        )
+            f"Go WhatsApp bridge is unavailable after {_HEALTH_ATTEMPTS} attempts."
+        ) from last_exc
 
     async def close(self) -> None:
         """Close the underlying httpx connection pool."""
@@ -208,18 +220,14 @@ class BridgeClient:
         clean_params = {k: v for k, v in params.items() if v is not None}
         try:
             return await self._get_raw(path, clean_params)
-        except httpx.ConnectError as exc:
-            raise RuntimeError(
-                f"Bridge unavailable at {self._base_url}: {exc}"
-            ) from exc
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 503:
-                raise RuntimeError("WhatsApp not connected.") from exc
-            raise RuntimeError(
-                f"Bridge HTTP {exc.response.status_code}: {exc.response.text}"
-            ) from exc
+            raise self._translate_http_error(exc, path) from exc
         except httpx.TimeoutException as exc:
-            raise RuntimeError(f"Bridge request timed out: {exc}") from exc
+            raise RuntimeError(_BRIDGE_TIMEOUT_MESSAGE) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(_BRIDGE_UNAVAILABLE_MESSAGE) from exc
+        except ValueError as exc:
+            raise RuntimeError(_BRIDGE_INVALID_RESPONSE_MESSAGE) from exc
 
     def _translate_http_error(
         self, exc: httpx.HTTPStatusError, path: str
@@ -236,13 +244,13 @@ class BridgeClient:
         * ``MEDIA_PERMANENTLY_UNAVAILABLE`` (410) — the media can never be
           re-downloaded.
 
-        A 503 carrying no recognized code falls back to a generic "HTTP 503"
-        message rather than the misleading "WhatsApp not connected." assertion,
-        so a stuck download is never reported as a session disconnect.
+        An unrecognized code falls back to a fixed HTTP status-class message
+        rather than echoing the response or asserting a session disconnect.
 
         Args:
             exc: The raised status error whose ``response`` carries the body.
-            path: Request path, included in the generic fallback message.
+            path: Request path, accepted for call-site compatibility but never
+                included in the returned message.
 
         Returns:
             A :class:`RuntimeError` (not raised) for the caller to ``raise``.
@@ -261,14 +269,7 @@ class BridgeClient:
             )
         if status == 503 and code == "NOT_CONNECTED":
             return RuntimeError("WhatsApp not connected.")
-        if status == 503:
-            # Unknown 503 — do NOT assert a disconnect.  Surface the raw body so
-            # the cause is visible instead of guessed.
-            return RuntimeError(f"Bridge returned HTTP 503: {exc.response.text}")
-
-        return RuntimeError(
-            f"Bridge returned HTTP {status} for POST {path}: {exc.response.text}"
-        )
+        return RuntimeError(_http_status_message(status))
 
     async def _post_raw(
         self,
@@ -300,8 +301,8 @@ class BridgeClient:
                 ``code`` field: ``NOT_CONNECTED`` (503) -> "WhatsApp not
                 connected."; ``DOWNLOAD_RETRY_PENDING`` (503) -> a transient
                 media-pending message; ``MEDIA_PERMANENTLY_UNAVAILABLE`` (410)
-                -> a permanent-media message.  A 503 with no recognized code
-                yields a generic "HTTP 503" message, not a false disconnect.
+                -> a permanent-media message. Unrecognized codes yield only a
+                fixed HTTP status-class message.
         """
         try:
             if timeout is not None:
@@ -310,15 +311,14 @@ class BridgeClient:
                 resp = await self._client.post(path, json=json)
             resp.raise_for_status()
             return resp.json()
-        except httpx.ConnectError as exc:
-            raise RuntimeError(
-                f"Bridge unavailable — could not connect to {self._base_url}{path}. "
-                "Ensure the Go bridge is running."
-            ) from exc
         except httpx.HTTPStatusError as exc:
             raise self._translate_http_error(exc, path) from exc
         except httpx.TimeoutException as exc:
-            raise RuntimeError(f"Bridge request timed out: {exc}") from exc
+            raise RuntimeError(_BRIDGE_TIMEOUT_MESSAGE) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(_BRIDGE_UNAVAILABLE_MESSAGE) from exc
+        except ValueError as exc:
+            raise RuntimeError(_BRIDGE_INVALID_RESPONSE_MESSAGE) from exc
 
     async def post(self, path: str, json: dict[str, Any] | None = None) -> Any:
         """Perform a throttled POST against the bridge.  Never retried.
@@ -364,15 +364,14 @@ class BridgeClient:
             resp = await self._client.post(path, data=data, files=files)
             resp.raise_for_status()
             return resp.json()
-        except httpx.ConnectError as exc:
-            raise RuntimeError(
-                f"Bridge unavailable — could not connect to {self._base_url}{path}. "
-                "Ensure the Go bridge is running."
-            ) from exc
         except httpx.HTTPStatusError as exc:
             raise self._translate_http_error(exc, path) from exc
         except httpx.TimeoutException as exc:
-            raise RuntimeError(f"Bridge request timed out: {exc}") from exc
+            raise RuntimeError(_BRIDGE_TIMEOUT_MESSAGE) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(_BRIDGE_UNAVAILABLE_MESSAGE) from exc
+        except ValueError as exc:
+            raise RuntimeError(_BRIDGE_INVALID_RESPONSE_MESSAGE) from exc
 
     # ------------------------------------------------------------------
     # Typed endpoint wrappers
@@ -610,5 +609,5 @@ class BridgeClient:
                     "error_msg": error_msg,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — telemetry must never propagate.
-            logger.debug("Telemetry record_tool_call failed (ignored): %s", exc)
+        except Exception:  # noqa: BLE001 — telemetry must never propagate.
+            logger.debug("Telemetry record_tool_call failed (ignored).")

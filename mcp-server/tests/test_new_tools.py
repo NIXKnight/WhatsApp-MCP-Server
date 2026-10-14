@@ -180,6 +180,7 @@ async def test_get_message_rejects_malformed_envelope_without_echo(
     malformed,
 ):
     fake_bridge.message_response = malformed
+    telemetry_before = len(fake_bridge.telemetry)
 
     with pytest.raises(ToolError) as exc_info:
         await client.call_tool(
@@ -190,6 +191,7 @@ async def test_get_message_rejects_malformed_envelope_without_echo(
     error = str(exc_info.value)
     assert "MessageResponseEnvelope" in error
     assert "TEST_RAW_RESPONSE_MARKER" not in error
+    assert len(fake_bridge.telemetry) == telemetry_before + 1
     assert fake_bridge.telemetry[-1]["tool_name"] == "get_message"
     assert fake_bridge.telemetry[-1]["success"] is False
     assert "TEST_RAW_RESPONSE_MARKER" not in fake_bridge.telemetry[-1]["error_msg"]
