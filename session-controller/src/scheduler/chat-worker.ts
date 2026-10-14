@@ -30,7 +30,7 @@ export interface WorkerOptions {
   leaseMs: number; renewMs: number;
   appCurrent(): boolean;
   instructions(work: ClaimedWork): string;
-  host: PiHostPort; turns: TurnPorts; wait: WaitPort;
+  host: PiHostPort & { attach?(session: PiSessionPort, context: TurnContext): Promise<void> }; turns: TurnPorts; wait: WaitPort;
   diagnostics: DiagnosticPort; clock?: Clock;
 }
 /** One invocation owns one chat slot; the coordinator never overlaps it. */
@@ -86,6 +86,7 @@ export async function runChatWorker(repository: WorkerRepository, initial: Claim
     if (session.binding.canonicalChatId !== work.event.canonical_chat_jid ||
         (state.session && !isDeepStrictEqual(state.session, session.binding)) ||
         !await repository.bindSession(work, session.binding)) throw new ControllerError('session_failed');
+    await context.current(); await options.host.attach?.(session, context);
     await context.current(); await options.turns.attach(session, context);
     if (own !== 'confirmed') {
       reason = 'preparation_failed';
