@@ -1,23 +1,66 @@
 """Pydantic models mirroring Go bridge REST API response shapes.
 
-These models document the exact JSON returned by the Go bridge.  Field names
-and types are derived directly from ``api/types.go`` in the Go bridge source.
-All optional bridge fields use ``default=None`` or an appropriate default so
-that partial responses (e.g. omitempty fields absent from the JSON) do not
-raise validation errors.
-
-None of these models are used by the tool implementations at runtime — tools
-call ``json.dumps(result)`` directly on the raw bridge response.  The models
-serve as authoritative documentation and can be used for type-safe
-deserialization in future tool iterations.
+Selected message and text-send contracts are validated at runtime by the MCP
+tools. Those models reject coercion and unknown fields so bridge/API drift
+fails closed before data is returned to callers. Other models remain response
+shape documentation for tools that have not yet adopted runtime validation.
 """
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
+
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+_RFC3339 = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _parse_bridge_datetime(value: Any) -> datetime:
+    """Parse only the RFC3339 string shape emitted by Go JSON timestamps."""
+    if not isinstance(value, str) or _RFC3339.fullmatch(value) is None:
+        raise ValueError("bridge timestamp must be an RFC3339 string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("invalid bridge timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("bridge timestamp must include a timezone")
+    return parsed
+
+
+BridgeDatetime = Annotated[datetime, BeforeValidator(_parse_bridge_datetime)]
+
+
+class StrictBridgeModel(BaseModel):
+    """Base for runtime contracts with strict types and no unknown fields."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+
+def validate_bridge_response(model: type[ModelT], data: Any) -> ModelT:
+    """Validate one bridge payload without exposing response data in errors."""
+    try:
+        return model.model_validate(data)
+    except ValidationError:
+        raise RuntimeError(
+            f"Invalid bridge response contract: {model.__name__}."
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -56,50 +99,88 @@ class BridgeStatus(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class Message(BaseModel):
+class MessageResponse(StrictBridgeModel):
     """A single stored WhatsApp message.
 
-    Go type: ``MessageResponse``.
+    Go type: ``MessageResponse``. Fields tagged ``omitempty`` in Go remain
+    optional here; every field emitted unconditionally by Go is required.
     """
 
-    id: str
-    chat_jid: str
-    sender: str = ""
-    sender_name: str = ""
-    content: str = ""
-    timestamp: datetime | None = None
-    is_from_me: bool = False
-    media_type: str = ""
-    filename: str = ""
-    url: str = ""
-    file_length: int = 0
-    push_name: str = ""
-    quoted_message_id: str = ""
-    quoted_participant: str = ""
+    id: str = Field(min_length=1)
+    chat_jid: str = Field(min_length=1)
+    sender: str
+    sender_name: str
+    content: str
+    timestamp: BridgeDatetime
+    is_from_me: bool
+    media_type: str = Field(default="", min_length=1)
+    filename: str = Field(default="", min_length=1)
+    url: str = Field(default="", min_length=1)
+    file_length: int = Field(default=0, gt=0)
+    push_name: str = Field(default="", min_length=1)
+    quoted_message_id: str = Field(default="", min_length=1)
+    quoted_participant: str = Field(default="", min_length=1)
+    snippet: str = Field(default="", min_length=1)
+    transcription: str = Field(default="", min_length=1)
+    transcribed_at: BridgeDatetime | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_zero_omitempty(cls, value: Any) -> Any:
+        """Reject values Go would omit instead of serializing explicitly."""
+        if not isinstance(value, Mapping):
+            return value
+        empty_string_fields = {
+            "media_type",
+            "filename",
+            "url",
+            "push_name",
+            "quoted_message_id",
+            "quoted_participant",
+            "snippet",
+            "transcription",
+        }
+        if any(
+            value.get(field) == ""
+            for field in empty_string_fields
+            if field in value
+        ):
+            raise ValueError("explicit empty omitempty field")
+        if value.get("file_length", 1) == 0 and "file_length" in value:
+            raise ValueError("explicit zero omitempty field")
+        if "transcribed_at" in value and value["transcribed_at"] is None:
+            raise ValueError("explicit null omitempty field")
+        return value
 
 
-class MessagesResponse(BaseModel):
+class MessageResponseEnvelope(StrictBridgeModel):
+    """Exact response from ``GET /api/messages/{id}``."""
+
+    message: MessageResponse
+
+
+class MessagesResponse(StrictBridgeModel):
     """Paginated list of messages.
 
     Go type: ``MessagesResponse``.
     """
 
-    messages: list[Message] = Field(default_factory=list)
-    total: int = 0
-    limit: int = 0
-    offset: int = 0
+    messages: list[MessageResponse]
+    total: int = Field(ge=0)
+    limit: int = Field(ge=0)
+    offset: int = Field(ge=0)
 
 
-class CheckResponse(BaseModel):
+class CheckResponse(StrictBridgeModel):
     """Response from ``GET /api/check``.
 
     Go type: ``CheckResponse``.
     """
 
-    messages: list[Message] = Field(default_factory=list)
-    count: int = 0
-    since: datetime | None = None
-    timestamp: datetime | None = None
+    messages: list[MessageResponse]
+    count: int = Field(ge=0)
+    since: BridgeDatetime
+    timestamp: BridgeDatetime
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +221,7 @@ class UnreadChatEntry(BaseModel):
     """
 
     chat: Chat
-    messages: list[Message] = Field(default_factory=list)
+    messages: list[MessageResponse] = Field(default_factory=list)
 
 
 class UnreadResponse(BaseModel):
@@ -243,14 +324,14 @@ class Group(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class SendResponse(BaseModel):
-    """Response from ``POST /api/send``.
+class SendResponse(StrictBridgeModel):
+    """Validated response from ``POST /api/send``.
 
     Go type: ``SendResponse``.
     """
 
-    success: bool = False
-    message_id: str = ""
+    success: Literal[True]
+    message_id: str = Field(min_length=1)
 
 
 class SendMediaResponse(BaseModel):

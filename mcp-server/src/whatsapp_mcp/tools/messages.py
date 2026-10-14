@@ -1,9 +1,10 @@
 """Message-related MCP tools (L4 tool/contract).
 
-Provides ten tools:
+Provides eleven tools:
 
 * :func:`send_message` — Send a plain-text message to an individual contact.
-* :func:`check_new_messages` — Poll for new messages since a given Unix timestamp.
+* :func:`check_new_messages` — Poll from a supplied Unix-millisecond watermark.
+* :func:`get_message` — Retrieve one exact message from a specific chat.
 * :func:`get_messages` — Retrieve recent messages from a specific chat.
 * :func:`get_unread_chats` — List all chats that have unread messages.
 * :func:`get_unread_messages` — Flat list of all unread messages across all chats.
@@ -21,6 +22,14 @@ import logging
 from typing import TYPE_CHECKING
 
 from fastmcp import Context, FastMCP
+
+from whatsapp_mcp.models import (
+    CheckResponse,
+    MessageResponseEnvelope,
+    MessagesResponse,
+    SendResponse,
+    validate_bridge_response,
+)
 
 if TYPE_CHECKING:
     from whatsapp_mcp.bridge_client import BridgeClient
@@ -75,8 +84,9 @@ def register_message_tools(mcp: FastMCP) -> None:
                 render them as display names.
 
         Returns:
-            JSON string with ``{"id": "...", "timestamp": "..."}`` on
-            success, or raises :class:`RuntimeError` on bridge error.
+            JSON string with ``{"success": true, "message_id": "SENT1"}`` on
+            success. Raises :class:`RuntimeError` on a bridge error or invalid
+            bridge response contract.
         """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
 
@@ -89,7 +99,8 @@ def register_message_tools(mcp: FastMCP) -> None:
             payload["mentions"] = mentions
 
         result = await bridge.post("/api/send", json=payload)
-        return json.dumps(result)
+        response = validate_bridge_response(SendResponse, result)
+        return json.dumps(response.model_dump(mode="json", exclude_unset=True))
 
     # ------------------------------------------------------------------
     # check_new_messages
@@ -104,12 +115,9 @@ def register_message_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Poll for new messages since an explicit Unix millisecond timestamp.
 
-        The caller is responsible for persisting the watermark and advancing it
-        on each successful call.  Use the ``timestamp`` field from the response
-        as the next ``since`` value, or the current wall-clock time in
-        milliseconds when no messages are returned.
-
-        Pass ``since=0`` on the very first call to receive recent history.
+        The caller owns the watermark. Pass ``since=0`` on the first call.
+        The optional chat filter is sent under the bridge's exact ``jid`` query
+        key, while the MCP argument remains ``chat_jid`` for compatibility.
 
         Args:
             ctx: FastMCP context.
@@ -120,21 +128,55 @@ def register_message_tools(mcp: FastMCP) -> None:
             chat_jid: Optional JID to filter results to a single chat.
 
         Returns:
-            JSON string with ``{"count": N, "messages": [...], "since": "...",
-            "timestamp": "..."}`` where each message has ``id``,
-            ``chat_jid``, ``sender``, ``sender_name``, ``content``,
-            ``timestamp``, ``is_from_me``, ``push_name``.
-            When nothing is new: ``"No new messages."``.
+            A validated JSON ``CheckResponse`` envelope, or exactly
+            ``No new messages.`` when that valid envelope has no messages.
         """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
-
-        result = await bridge.get("/api/check", since=since, limit=limit, chat_jid=chat_jid)
-
-        messages = result.get("messages") if isinstance(result, dict) else []
-        if not messages:
+        result = await bridge.get(
+            "/api/check",
+            since=since,
+            limit=limit,
+            jid=chat_jid,
+        )
+        response = validate_bridge_response(CheckResponse, result)
+        if not response.messages:
             return "No new messages."
 
-        return json.dumps(result)
+        return json.dumps(response.model_dump(mode="json", exclude_unset=True))
+
+    # ------------------------------------------------------------------
+    # get_message
+    # ------------------------------------------------------------------
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def get_message(
+        ctx: Context,
+        message_id: str,
+        chat_jid: str,
+    ) -> str:
+        """Retrieve one exact WhatsApp message from its actual chat.
+
+        Message IDs are scoped by chat, so both values are required. Use this
+        tool when an event supplies an exact ``message_id`` and ``chat_jid``.
+
+        Args:
+            ctx: FastMCP context.
+            message_id: Exact stored WhatsApp message ID.
+            chat_jid: Exact JID of the chat containing the message.
+
+        Returns:
+            The nested ``MessageResponse`` object as JSON after strict
+            ``MessageResponseEnvelope`` validation.
+        """
+        bridge: BridgeClient = ctx.lifespan_context["bridge"]
+        result = await bridge.get_message(
+            message_id=message_id,
+            chat_jid=chat_jid,
+        )
+        response = validate_bridge_response(MessageResponseEnvelope, result)
+        return json.dumps(
+            response.message.model_dump(mode="json", exclude_unset=True)
+        )
 
     # ------------------------------------------------------------------
     # get_messages
@@ -148,8 +190,8 @@ def register_message_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Retrieve the most recent messages from a WhatsApp chat.
 
-        Returns messages in reverse-chronological order (newest first).
-        Works for both individual chats and group chats.
+        Messages are returned newest first. Individual and group JIDs are
+        supported.
 
         Args:
             ctx: FastMCP context.
@@ -160,14 +202,17 @@ def register_message_tools(mcp: FastMCP) -> None:
                 Capped by the bridge at 500.
 
         Returns:
-            JSON string containing a list of message objects, each with fields:
-            ``id``, ``chat_jid``, ``sender``, ``sender_name``, ``content``,
-            ``timestamp``, ``is_from_me``, ``media_type``, ``push_name``,
-            ``quoted_message_id``, ``quoted_participant``.
+            A validated JSON ``MessagesResponse`` envelope containing complete
+            ``MessageResponse`` objects plus pagination metadata.
         """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
-        result = await bridge.get("/api/messages", chat_jid=jid, limit=limit)
-        return json.dumps(result)
+        result = await bridge.get(
+            "/api/messages",
+            chat_jid=jid,
+            limit=limit,
+        )
+        response = validate_bridge_response(MessagesResponse, result)
+        return json.dumps(response.model_dump(mode="json", exclude_unset=True))
 
     # ------------------------------------------------------------------
     # get_unread_chats
@@ -256,8 +301,8 @@ def register_message_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Return a compact recent-turn window for a group chat.
 
-        Strips own messages and empty content. Returns only fields needed
-        for context assembly in chronological order (oldest first).
+        Own messages and blank content are removed. The remaining bridge
+        newest-first messages are emitted oldest first.
 
         Args:
             ctx: FastMCP context.
@@ -265,23 +310,35 @@ def register_message_tools(mcp: FastMCP) -> None:
             limit: Maximum messages (default 20).
 
         Returns:
-            JSON list: [{"name", "sender", "text", "ts"}] in chronological order.
+            JSON objects containing only ``name``, ``sender``, ``text``, and
+            ``ts`` in chronological order.
         """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
-        result = await bridge.get("/api/messages", chat_jid=jid, limit=limit)
-        messages = result if isinstance(result, list) else []
+        result = await bridge.get(
+            "/api/messages",
+            chat_jid=jid,
+            limit=limit,
+        )
+        response = validate_bridge_response(MessagesResponse, result)
 
         chronological = []
-        for m in reversed(messages):
-            text = (m.get("content") or "").strip()
+        for message in reversed(response.messages):
+            if message.is_from_me:
+                continue
+            text = message.content.strip()
             if not text:
                 continue
-            chronological.append({
-                "name": m.get("sender_name") or m.get("push_name") or m.get("sender", ""),
-                "sender": m.get("sender", ""),
-                "text": text,
-                "ts": m["timestamp"],
-            })
+            dumped = message.model_dump(mode="json", exclude_unset=True)
+            chronological.append(
+                {
+                    "name": (
+                        message.sender_name or message.push_name or message.sender
+                    ),
+                    "sender": message.sender,
+                    "text": text,
+                    "ts": dumped["timestamp"],
+                }
+            )
 
         return json.dumps(chronological)
 

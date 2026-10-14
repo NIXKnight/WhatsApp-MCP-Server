@@ -14,6 +14,7 @@ import os
 import random
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from tenacity import (
@@ -376,6 +377,26 @@ class BridgeClient:
     # ------------------------------------------------------------------
     # Typed endpoint wrappers
     # ------------------------------------------------------------------
+
+    async def get_message(self, message_id: str, chat_jid: str) -> Any:
+        """Fetch one exact-message envelope from the bridge.
+
+        The message ID is encoded as one path segment so reserved characters
+        cannot alter the endpoint path. The actual chat JID is always sent
+        because bridge storage keys messages by ``(id, chat_jid)``.
+
+        Args:
+            message_id: Exact stored WhatsApp message ID.
+            chat_jid: Exact chat JID containing the message.
+
+        Returns:
+            Parsed JSON for the bridge's ``MessageResponseEnvelope`` contract.
+        """
+        encoded_id = quote(message_id, safe="")
+        return await self.get(
+            f"/api/messages/{encoded_id}",
+            chat_jid=chat_jid,
+        )
 
     async def search(
         self,

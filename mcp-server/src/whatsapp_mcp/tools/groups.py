@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 from fastmcp import Context, FastMCP
 
+from whatsapp_mcp.models import SendResponse, validate_bridge_response
+
 if TYPE_CHECKING:
     from whatsapp_mcp.bridge_client import BridgeClient
 
@@ -129,9 +131,9 @@ def register_group_tools(mcp: FastMCP) -> None:
                 render them as display names.
 
         Returns:
-            JSON string with ``{"id": "...", "timestamp": "..."}`` on
-            success.  Raises :class:`RuntimeError` on validation failure or
-            bridge error.
+            JSON string with ``{"success": true, "message_id": "SENT1"}`` on
+            success. Raises :class:`RuntimeError` on validation failure, bridge
+            error, or an invalid bridge response contract.
         """
         if not jid.endswith("@g.us"):
             raise RuntimeError(
@@ -150,7 +152,8 @@ def register_group_tools(mcp: FastMCP) -> None:
             payload["mentions"] = mentions
 
         result = await bridge.post("/api/send", json=payload)
-        return json.dumps(result)
+        response = validate_bridge_response(SendResponse, result)
+        return json.dumps(response.model_dump(mode="json", exclude_unset=True))
 
     # ------------------------------------------------------------------
     # send_auto_message
@@ -179,7 +182,9 @@ def register_group_tools(mcp: FastMCP) -> None:
             mentions: Optional list of JIDs to tag in the message.
 
         Returns:
-            JSON string with {"id": "...", "timestamp": "..."} on success.
+            JSON string with ``{"success": true, "message_id": "SENT1"}`` on
+            success. Raises :class:`RuntimeError` on a bridge error or invalid
+            bridge response contract.
         """
         bridge: BridgeClient = ctx.lifespan_context["bridge"]
 
@@ -192,4 +197,5 @@ def register_group_tools(mcp: FastMCP) -> None:
             payload["mentions"] = mentions
 
         result = await bridge.post("/api/send", json=payload)
-        return json.dumps(result)
+        response = validate_bridge_response(SendResponse, result)
+        return json.dumps(response.model_dump(mode="json", exclude_unset=True))
