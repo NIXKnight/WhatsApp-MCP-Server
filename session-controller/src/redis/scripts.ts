@@ -116,7 +116,9 @@ elseif op=='recover-pel' then
   if sameApp and tonumber(redis.call('HGET',lease,'until') or '0')>now() then return {'busy'} end
   if redis.call('HGET',state,'pause') then return {'paused'} end
   local r=redis.call('XAUTOCLAIM',stream,ARGV[7],ARGV[4],0,ARGV[5],'COUNT',ARGV[6],'JUSTID')
-  -- Since Redis 7.0: cursor, claimed IDs, deleted IDs. Never authorize a turn here.
+  -- Redis 7.2: cursor, claimed IDs, deleted IDs. JUSTID preserves delivery
+  -- counts, and no returned ID grants execution authority.
+  if #r~=3 or type(r[2])~='table' or type(r[3])~='table' then return redis.error_reply('store_unavailable') end
   if #r[3]>0 then redis.call('HSET',state,'pause','sequence_gap') end
   barrier();return {'ok',r[1],tostring(#r[2]),tostring(#r[3])}
 elseif op=='check-work' then

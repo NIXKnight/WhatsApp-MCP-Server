@@ -15,6 +15,10 @@ import { strings, type RedisConnections } from './client.js';
 import { configuredChats, keys, scriptKeys, GROUP } from './keys.js';
 import { SCRIPT } from './scripts.js';
 const duration = Type.Integer({ minimum: 1, maximum: 3600000 });
+const recoveryCount = Type.Integer({ minimum: 1, maximum: 128 });
+const recoveryDeletedCount = Type.Integer({ minimum: 0, maximum: 1280 });
+const absoluteMilliseconds = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
+const positiveAbsoluteMilliseconds = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
 const entryId = Type.String({ minLength: 1, maxLength: 128 });
 const JournalEnvelopeSchema = Type.Object({ version: Type.Literal(1), eventFingerprint: EventFingerprintSchema,
   session: SessionBindingSchema, state: MutationStateSchema }, { additionalProperties: false });
@@ -264,22 +268,22 @@ export async function createRepository(connections: RedisConnections, policy: Ad
     },
     async recoverPending(chat, app, consumer, start, count) {
       checked(FenceSchema, app, 'lease_lost'); checked(StreamIdSchema, start, 'store_unavailable');
-      checked(Type.Integer({ minimum: 1, maximum: 128 }), count, 'config_invalid');
+      checked(recoveryCount, count, 'config_invalid');
       const r = await write(chat, ['recover-pel', app.owner, app.epoch, owner(consumer), start, String(count), GROUP]);
       if (r[0] === 'lost' || r[0] === 'busy' || r[0] === 'paused') return { status: r[0] };
       if (r[0] !== 'ok') throw new ControllerError('store_unavailable');
       const next = checked(StreamIdSchema, r[1], 'store_unavailable');
       const claimed = checked(Type.Integer({ minimum: 0, maximum: 128 }), Number(r[2]), 'store_unavailable');
-      const deleted = checked(Type.Integer({ minimum: 0, maximum: 1280 }), Number(r[3]), 'store_unavailable');
+      const deleted = checked(recoveryDeletedCount, Number(r[3]), 'store_unavailable');
       return { status: 'ok', next, claimed, deleted };
     },
     async checkWork(work) {
       const r = await write(work.event.canonical_chat_jid, ['check-work', ...argsFor(work)]);
       if (r[0] !== 'ok') return false;
-      const appUntil = checked(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }), Number(r[1]), 'store_unavailable');
-      const chatUntil = checked(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }), Number(r[2]), 'store_unavailable');
+      const appUntil = checked(positiveAbsoluteMilliseconds, Number(r[1]), 'store_unavailable');
+      const chatUntil = checked(positiveAbsoluteMilliseconds, Number(r[2]), 'store_unavailable');
       // A delayed durability barrier must not turn an expired reply into authority.
-      const time = checked(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }), clock.now(), 'store_unavailable');
+      const time = checked(absoluteMilliseconds, clock.now(), 'store_unavailable');
       return time < appUntil && time < chatUntil;
     },
     async turnState(work) {
