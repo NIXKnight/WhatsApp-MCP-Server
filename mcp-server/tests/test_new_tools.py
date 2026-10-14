@@ -42,6 +42,45 @@ async def test_get_message_routes_validates_envelope_and_records_telemetry(
     assert fake_bridge.telemetry[-1]["success"] is True
 
 
+@pytest.mark.parametrize("timezone", ["+23:59", "-23:59", "Z"])
+async def test_get_message_preserves_valid_rfc3339_boundary_offsets(
+    client,
+    fake_bridge,
+    timezone,
+):
+    timestamp = f"2026-01-01T00:00:00.123456789{timezone}"
+    fake_bridge.message_response["message"]["timestamp"] = timestamp
+
+    result = await client.call_tool(
+        "get_message",
+        {"message_id": "M1", "chat_jid": TEST_CHAT_JID},
+    )
+
+    assert json.loads(result.data)["timestamp"] == timestamp
+
+
+@pytest.mark.parametrize("timezone", ["+00:60", "-12:60", "+24:00"])
+async def test_get_message_rejects_invalid_rfc3339_offsets_without_echo(
+    client,
+    fake_bridge,
+    timezone,
+):
+    timestamp = f"2026-01-01T00:00:00.123456789{timezone}"
+    fake_bridge.message_response["message"]["timestamp"] = timestamp
+
+    with pytest.raises(ToolError) as exc_info:
+        await client.call_tool(
+            "get_message",
+            {"message_id": "M1", "chat_jid": TEST_CHAT_JID},
+        )
+
+    error = str(exc_info.value)
+    assert "MessageResponseEnvelope" in error
+    assert timestamp not in error
+    assert fake_bridge.telemetry[-1]["success"] is False
+    assert timestamp not in fake_bridge.telemetry[-1]["error_msg"]
+
+
 async def test_get_message_preserves_go_omitempty_shape(client, fake_bridge):
     fake_bridge.message_response = {
         "message": {
@@ -119,17 +158,6 @@ async def test_get_message_preserves_go_omitempty_shape(client, fake_bridge):
                 "sender_name": "Alice",
                 "content": "hello",
                 "timestamp": "2026-01-01T00:00:00.1234567890Z",
-                "is_from_me": False,
-            }
-        },
-        {
-            "message": {
-                "id": "M1",
-                "chat_jid": TEST_CHAT_JID,
-                "sender": "9230@s.whatsapp.net",
-                "sender_name": "Alice",
-                "content": "hello",
-                "timestamp": "2026-01-01T00:00:00+24:00",
                 "is_from_me": False,
             }
         },

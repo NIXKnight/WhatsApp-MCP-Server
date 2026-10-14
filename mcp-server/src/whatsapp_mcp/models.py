@@ -35,6 +35,11 @@ def _parse_bridge_datetime(value: Any) -> str:
     """Validate a Go RFC3339Nano timestamp without changing its text."""
     if not isinstance(value, str) or _RFC3339.fullmatch(value) is None:
         raise ValueError("bridge timestamp must be an RFC3339 string")
+    if value[-1] != "Z":
+        offset_hour = int(value[-5:-3])
+        offset_minute = int(value[-2:])
+        if offset_hour > 23 or offset_minute > 59:
+            raise ValueError("invalid bridge timestamp")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
