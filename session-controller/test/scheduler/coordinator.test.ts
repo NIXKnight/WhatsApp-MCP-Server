@@ -188,14 +188,58 @@ describe('bounded coordinator and recovery hints', () => {
     expect(f.completed.size).toBe(2);
   });
   it('throwing diagnostics cannot reject app-loss or release-failure drain', async () => {
-    for (const loss of [true, false]) {
-      const f = coordinatorFixture(1);
-      f.worker.diagnostics = { emit: () => { throw new Error('synthetic_sink'); } };
-      f.repository.releaseApp = async () => { throw new Error('synthetic_release'); };
-      await f.coordinator.start(); await until(() => f.holds.size === 1);
-      if (loss) { f.failRenew(); await new Promise(r => setTimeout(r, 120)); }
-      f.coordinator.stopScheduling(); for (const h of f.holds.values()) h.resolve();
+    {
+      const f = coordinatorFixture(1), heartbeatWaiting = gate(), heartbeatTick = gate();
+      let appHeartbeatSignal: AbortSignal | undefined, heartbeatWaits = 0, renewals = 0, claims = 0, losses = 0, releases = 0;
+      f.worker.wait = { wait: async (ms, signal) => {
+        if (ms === 100 && !appHeartbeatSignal) {
+          appHeartbeatSignal = signal; heartbeatWaits++; heartbeatWaiting.resolve();
+          await Promise.race([heartbeatTick.promise, new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }))]);
+          return;
+        }
+        if (ms === 100 && signal === appHeartbeatSignal) heartbeatWaits++;
+        if (signal.aborted) return;
+        await new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }));
+      } };
+      f.worker.diagnostics = { emit: event => { if (event.class === 'lease_lost') losses++; throw new Error('synthetic_sink'); } };
+      const renewApp = f.repository.renewApp;
+      f.repository.renewApp = async (...args) => { renewals++; return renewApp(...args); };
+      const claimNext = f.repository.claimNext;
+      f.repository.claimNext = async (...args) => { claims++; return claimNext(...args); };
+      f.repository.releaseApp = async () => { releases++; throw new Error('synthetic_release'); };
+
+      await f.coordinator.start();
+      await heartbeatWaiting.promise;
+      await until(() => f.holds.size === 1 && claims === 1);
+      f.failRenew(); heartbeatTick.resolve();
+      await until(() => renewals === 1 && losses === 1);
+      expect(heartbeatWaits).toBe(1); expect(renewals).toBe(1); expect(losses).toBe(1); expect(claims).toBe(1);
+
+      f.holds.values().next().value?.resolve();
       await expect(f.coordinator.drain()).resolves.toBeUndefined();
+      await new Promise<void>(r => setImmediate(r));
+      expect(heartbeatWaits).toBe(1); expect(renewals).toBe(1); expect(claims).toBe(1); expect(releases).toBe(0);
+    }
+
+    {
+      const f = coordinatorFixture(1);
+      let releases = 0, releaseDiagnostics = 0, drained = false;
+      f.worker.wait = { wait: async (_ms, signal) => {
+        if (signal.aborted) return;
+        await new Promise<void>(r => signal.addEventListener('abort', () => r(), { once: true }));
+      } };
+      f.worker.diagnostics = { emit: event => { if (event.class === 'store_unavailable') releaseDiagnostics++; throw new Error('synthetic_sink'); } };
+      f.repository.releaseApp = async () => { releases++; throw new Error('synthetic_release'); };
+
+      await f.coordinator.start(); await until(() => f.holds.size === 1);
+      f.coordinator.stopScheduling();
+      const draining = f.coordinator.drain().then(() => { drained = true; });
+      await new Promise<void>(r => setImmediate(r));
+      expect(drained).toBe(false); expect(releases).toBe(0);
+
+      f.holds.values().next().value?.resolve();
+      await expect(draining).resolves.toBeUndefined();
+      expect(drained).toBe(true); expect(releases).toBe(1); expect(releaseDiagnostics).toBe(1);
     }
   });
   it('concurrency one bounds cross-chat work', async () => {
