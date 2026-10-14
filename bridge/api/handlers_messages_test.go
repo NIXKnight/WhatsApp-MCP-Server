@@ -209,18 +209,22 @@ func openMessageTestDatabase(t *testing.T) (*store.Store, *sql.DB) {
 		t.Fatal("TEST_DATABASE_URL database name must contain test")
 	}
 
-	messageStore, err := store.NewStore(databaseURL, testAPILogger())
-	if err != nil {
-		t.Fatal("failed to initialize disposable message store")
-	}
 	database := stdlib.OpenDB(*config)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := database.PingContext(ctx); err != nil {
-		_ = messageStore.Close()
 		_ = database.Close()
 		t.Fatal("failed to connect to disposable test database")
+	}
+	if _, err := database.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
+		_ = database.Close()
+		t.Fatal("failed to initialize disposable test database")
+	}
+
+	messageStore, err := store.NewStore(databaseURL, testAPILogger())
+	if err != nil {
+		_ = database.Close()
+		t.Fatal("failed to initialize disposable message store")
 	}
 
 	// LIFO test cleanup closes the store before the independent fixture handle.
@@ -379,6 +383,11 @@ func TestGetMessagePostgres(t *testing.T) {
 		var got MessageResponseEnvelope
 		if err := json.Unmarshal(body, &got); err != nil {
 			t.Fatal("failed to decode exact-message response")
+		}
+		got.Message.Timestamp = got.Message.Timestamp.UTC()
+		if got.Message.TranscribedAt != nil {
+			transcribedAt := got.Message.TranscribedAt.UTC()
+			got.Message.TranscribedAt = &transcribedAt
 		}
 		if !reflect.DeepEqual(got.Message, want) {
 			t.Fatal("exact-message response did not use the established projection")
