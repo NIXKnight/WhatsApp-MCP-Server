@@ -38,6 +38,7 @@ func NewServer(addr string, h *Handler, log *slog.Logger) *Server {
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/status", h.Status)
 		r.Get("/messages", h.ListMessages)
+		r.Get("/messages/{id}", h.GetMessage)
 		r.Get("/messages/{id}/context", h.MessageContext)
 		r.Get("/messages/{id}/similar", h.SimilarMessages)
 		r.Put("/messages/{id}/embedding", h.UpsertEmbedding)

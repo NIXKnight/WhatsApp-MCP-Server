@@ -3,8 +3,10 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -84,6 +86,54 @@ func (h *Handler) ListMessages(w http.ResponseWriter, r *http.Request) {
 		Total:    len(msgs),
 		Limit:    limit,
 		Offset:   offset,
+	})
+}
+
+// ---- GET /api/messages/{id} ---------------------------------------------
+
+// GetMessage returns one message identified by its message ID and actual chat JID.
+func (h *Handler) GetMessage(w http.ResponseWriter, r *http.Request) {
+	messageID := chi.URLParam(r, "id")
+	// chi routes against RawPath when it is present, so the captured parameter
+	// is still escaped in that case. When RawPath is empty, net/url has already
+	// decoded the canonical path and a second PathUnescape would corrupt IDs
+	// containing a literal percent escape such as "%2F".
+	if r.URL.RawPath != "" {
+		decoded, err := url.PathUnescape(messageID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid message ID", "INVALID_MESSAGE_ID")
+			return
+		}
+		messageID = decoded
+	}
+	if messageID == "" {
+		writeError(w, http.StatusBadRequest, "invalid message ID", "INVALID_MESSAGE_ID")
+		return
+	}
+
+	chatJID := r.URL.Query().Get("chat_jid")
+	if chatJID == "" {
+		writeError(w, http.StatusBadRequest, "chat_jid query parameter required", "MISSING_PARAM")
+		return
+	}
+	if !jidRe.MatchString(chatJID) {
+		writeError(w, http.StatusBadRequest, "invalid chat_jid format", "INVALID_JID")
+		return
+	}
+
+	message, err := h.store.GetMessageByID(messageID, chatJID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "message not found", "NOT_FOUND")
+			return
+		}
+		h.log.Error("get message", "error_class", "DB_ERROR")
+		writeError(w, http.StatusInternalServerError, "failed to get message", "DB_ERROR")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, MessageResponseEnvelope{
+		Message: toMessageResponse(*message),
 	})
 }
 
