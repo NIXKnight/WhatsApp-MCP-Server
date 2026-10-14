@@ -6,22 +6,33 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"regexp"
 	"time"
 )
 
-// Notification is an immutable event plus mutable delivery bookkeeping. No
-// configuration, content, sender information or media material belongs here.
+var storedGroupJID = regexp.MustCompile(`^\d+@g\.us$`)
+var storedPrivateJID = regexp.MustCompile(`^\d+@(s\.whatsapp\.net|lid)$`)
+var storedParticipantJID = regexp.MustCompile(`^\d+@(s\.whatsapp\.net|lid|bot|hosted|hosted\.lid)$`)
+
+// Notification is an immutable event plus mutable delivery bookkeeping. It
+// contains routing metadata, but never message content or media material.
 type Notification struct {
-	EventID        string
-	SchemaVersion  int
-	EventType      string
-	ChatJID        string
-	MessageID      string
-	EventTimestamp time.Time
-	ReceivedAt     time.Time
-	ExpiresAt      time.Time
-	Attempts       int
-	LeaseToken     string
+	EventID          string
+	SchemaVersion    int
+	EventType        string
+	ChatJID          string
+	CanonicalChatJID string
+	MessageID        string
+	EventTimestamp   time.Time
+	ReceivedAt       time.Time
+	ExpiresAt        time.Time
+	ChatSequence     int64
+	SenderJID        string
+	SenderAltJID     string
+	ChatKind         string
+	IsFromMe         bool
+	Attempts         int
+	LeaseToken       string
 }
 
 // NotificationOutcome records receiver acceptance, not agent completion.
@@ -33,9 +44,17 @@ type NotificationOutcome struct {
 	NextAttemptAt time.Time
 }
 
+const allocateNotificationSequenceSQL = `INSERT INTO notification_chat_sequences
+ (canonical_chat_jid, last_sequence) VALUES ($1, 1)
+ ON CONFLICT (canonical_chat_jid) DO UPDATE
+ SET last_sequence = notification_chat_sequences.last_sequence + 1
+ RETURNING last_sequence`
+
 const insertNotificationSQL = `INSERT INTO notification_outbox
- (event_id, chat_jid, message_id, event_timestamp, received_at, expires_at, next_attempt_at)
- VALUES ($1,$2,$3,$4,$5,$6,$5)`
+ (event_id, schema_version, event_type, chat_jid, canonical_chat_jid, message_id,
+  event_timestamp, received_at, expires_at, next_attempt_at, chat_sequence,
+  sender_jid, sender_alt_jid, chat_kind, is_from_me)
+ VALUES ($1,2,'whatsapp.message.received',$2,$3,$4,$5,$6,$7,$6,$8,$9,$10,$11,$12)`
 
 const claimNotificationSQL = `WITH statement_clock AS MATERIALIZED (
  SELECT clock_timestamp() AS now
@@ -49,8 +68,10 @@ const claimNotificationSQL = `WITH statement_clock AS MATERIALIZED (
  UPDATE notification_outbox n SET state = 'leased', lease_token = $3,
  lease_until = c.now + ($4::bigint * interval '1 millisecond'), attempts = n.attempts + 1
  FROM candidate candidate, statement_clock c WHERE n.event_id = candidate.event_id
- RETURNING n.event_id, n.schema_version, n.event_type, n.chat_jid, n.message_id,
- n.event_timestamp, n.received_at, n.expires_at, n.attempts, n.lease_token`
+ RETURNING n.event_id, n.schema_version, n.event_type, n.chat_jid,
+ n.canonical_chat_jid, n.message_id, n.event_timestamp, n.received_at, n.expires_at,
+ n.chat_sequence, n.sender_jid, n.sender_alt_jid, n.chat_kind, n.is_from_me,
+ n.attempts, n.lease_token`
 
 const finishNotificationSQL = `UPDATE notification_outbox
  SET state = $3, last_error_class = $4, last_http_status = $5,
@@ -85,6 +106,23 @@ const pruneNotificationsSQL = `DELETE FROM notification_outbox WHERE event_id IN
  ORDER BY terminal_at, event_id FOR UPDATE SKIP LOCKED LIMIT $2
 )`
 
+func validV2NotificationRequest(message MessageRow, request NotificationRequest) bool {
+	if message.ID == "" || message.ChatJID == "" || message.Timestamp.IsZero() ||
+		request.ReceivedAt.IsZero() || request.MaxAge <= 0 || request.MaxAge > 7*24*time.Hour ||
+		request.IsFromMe != message.IsFromMe || !storedParticipantJID.MatchString(request.SenderJID) ||
+		(request.SenderAltJID != "" && !storedParticipantJID.MatchString(request.SenderAltJID)) {
+		return false
+	}
+	switch request.ChatKind {
+	case "group":
+		return storedGroupJID.MatchString(message.ChatJID) && request.CanonicalChatJID == message.ChatJID
+	case "operator_private":
+		return storedPrivateJID.MatchString(message.ChatJID) && storedPrivateJID.MatchString(request.CanonicalChatJID)
+	default:
+		return false
+	}
+}
+
 func newNotificationID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -98,6 +136,33 @@ func notificationStoreError(ctx context.Context) error {
 		return err
 	}
 	return errors.New("notification_store_failed")
+}
+
+func populateClaimedNotification(n *Notification, canonical sql.NullString, sequence sql.NullInt64, sender, senderAlt, kind sql.NullString, fromMe sql.NullBool) error {
+	switch n.SchemaVersion {
+	case 1:
+		if canonical.Valid || sequence.Valid || sender.Valid || senderAlt.Valid || kind.Valid || fromMe.Valid {
+			return errors.New("notification_metadata_invalid")
+		}
+		// Schema v1 has no canonical identity or v2 routing metadata. Keep every
+		// v2 field at its zero value; the legacy serializer emits seven fields.
+	case 2:
+		if !canonical.Valid || canonical.String == "" || !sequence.Valid || sequence.Int64 < 1 ||
+			!sender.Valid || sender.String == "" || !kind.Valid || kind.String == "" || !fromMe.Valid {
+			return errors.New("notification_metadata_invalid")
+		}
+		n.CanonicalChatJID = canonical.String
+		n.ChatSequence = sequence.Int64
+		n.SenderJID = sender.String
+		if senderAlt.Valid {
+			n.SenderAltJID = senderAlt.String
+		}
+		n.ChatKind = kind.String
+		n.IsFromMe = fromMe.Bool
+	default:
+		return errors.New("notification_metadata_invalid")
+	}
+	return nil
 }
 
 // ClaimNotification commits one exclusive, bounded lease before returning work.
@@ -120,13 +185,20 @@ func (s *Store) ClaimNotification(ctx context.Context, _ time.Time, allowed []st
 	var result *Notification
 	err = s.submitContext(ctx, func(tx *sql.Tx) error {
 		var n Notification
+		var canonical, sender, senderAlt, kind sql.NullString
+		var sequence sql.NullInt64
+		var fromMe sql.NullBool
 		err := tx.QueryRowContext(ctx, claimNotificationSQL, maxAttempts, allowed, token, leaseMilliseconds).Scan(
-			&n.EventID, &n.SchemaVersion, &n.EventType, &n.ChatJID, &n.MessageID,
-			&n.EventTimestamp, &n.ReceivedAt, &n.ExpiresAt, &n.Attempts, &n.LeaseToken)
+			&n.EventID, &n.SchemaVersion, &n.EventType, &n.ChatJID, &canonical,
+			&n.MessageID, &n.EventTimestamp, &n.ReceivedAt, &n.ExpiresAt, &sequence,
+			&sender, &senderAlt, &kind, &fromMe, &n.Attempts, &n.LeaseToken)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		if err != nil {
+			return err
+		}
+		if err := populateClaimedNotification(&n, canonical, sequence, sender, senderAlt, kind, fromMe); err != nil {
 			return err
 		}
 		result = &n
