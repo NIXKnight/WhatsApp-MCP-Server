@@ -50,6 +50,11 @@ type MessageResponse struct {
 	TranscribedAt *time.Time `json:"transcribed_at,omitempty"`
 }
 
+// MessageResponseEnvelope wraps one exact message.
+type MessageResponseEnvelope struct {
+	Message MessageResponse `json:"message"`
+}
+
 // MessagesResponse wraps a list of messages with pagination metadata.
 type MessagesResponse struct {
 	Messages []MessageResponse `json:"messages"`
