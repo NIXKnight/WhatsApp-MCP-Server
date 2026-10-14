@@ -10,7 +10,8 @@ import (
 	"time"
 )
 
-var notificationJID = regexp.MustCompile(`^\d+@(s\.whatsapp\.net|g\.us|lid)$`)
+var notificationGroupJID = regexp.MustCompile(`^\d+@g\.us$`)
+var notificationOperatorJID = regexp.MustCompile(`^\d+@(s\.whatsapp\.net|lid)$`)
 
 // NotificationSecretMinBytes is the enforced HMAC key length in bytes.
 const NotificationSecretMinBytes = 32
@@ -18,9 +19,11 @@ const NotificationSecretMinBytes = 32
 // Notifications configures the optional metadata-only incoming-message relay.
 // Secret is read only from the operator's environment and must never be logged.
 type Notifications struct {
-	Enabled       bool
-	URL           string
-	Secret        string
+	Enabled bool
+	URL     string
+	Secret  string
+	// ChatAllowlist is the ordered union of configured group JIDs followed by
+	// operator JIDs. Delivery policy continues to check the actual chat JID.
 	ChatAllowlist []string
 	Timeout       time.Duration
 	PollInterval  time.Duration
@@ -83,6 +86,22 @@ func AllowedNotificationAddress(ip netip.Addr, loopbackOnly bool) (netip.Addr, b
 	return netip.Addr{}, false
 }
 
+func parseNotificationJIDs(raw, key string, pattern *regexp.Regexp) ([]string, error) {
+	seen := make(map[string]bool)
+	var result []string
+	for _, value := range strings.Split(raw, ",") {
+		jid := strings.TrimSpace(value)
+		if !pattern.MatchString(jid) {
+			return nil, errors.New(key + "_invalid")
+		}
+		if !seen[jid] {
+			result = append(result, jid)
+			seen[jid] = true
+		}
+	}
+	return result, nil
+}
+
 func loadNotifications(getenv func(string) string) (Notifications, error) {
 	n := Notifications{Timeout: 5 * time.Second, PollInterval: time.Second, MinInterval: 2 * time.Second,
 		BatchSize: 20, MaxAttempts: 10, MaxAge: 24 * time.Hour, Retention: 7 * 24 * time.Hour}
@@ -93,7 +112,8 @@ func loadNotifications(getenv func(string) string) (Notifications, error) {
 		}
 		n.Enabled = b
 	}
-	// Disabled mode deliberately does not look up the secret or destination.
+	// Disabled mode deliberately does not look up the secret, destination, or
+	// admission identities.
 	if !n.Enabled {
 		return n, nil
 	}
@@ -108,17 +128,16 @@ func loadNotifications(getenv func(string) string) (Notifications, error) {
 	if len(n.Secret) < NotificationSecretMinBytes {
 		return Notifications{}, errors.New("BRIDGE_NOTIFY_SECRET_too_short")
 	}
-	seen := make(map[string]bool)
-	for _, jid := range strings.Split(getenv("BRIDGE_NOTIFY_CHAT_ALLOWLIST"), ",") {
-		jid = strings.TrimSpace(jid)
-		if !notificationJID.MatchString(jid) {
-			return Notifications{}, errors.New("BRIDGE_NOTIFY_CHAT_ALLOWLIST_invalid")
-		}
-		if !seen[jid] {
-			n.ChatAllowlist = append(n.ChatAllowlist, jid)
-			seen[jid] = true
-		}
+	groups, err := parseNotificationJIDs(getenv("BRIDGE_NOTIFY_GROUP_ALLOWLIST"), "BRIDGE_NOTIFY_GROUP_ALLOWLIST", notificationGroupJID)
+	if err != nil {
+		return Notifications{}, err
 	}
+	operators, err := parseNotificationJIDs(getenv("BRIDGE_NOTIFY_OPERATOR_JIDS"), "BRIDGE_NOTIFY_OPERATOR_JIDS", notificationOperatorJID)
+	if err != nil {
+		return Notifications{}, err
+	}
+	n.ChatAllowlist = append(n.ChatAllowlist, groups...)
+	n.ChatAllowlist = append(n.ChatAllowlist, operators...)
 	for _, f := range []struct {
 		key      string
 		dst      *time.Duration
