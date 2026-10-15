@@ -49,7 +49,8 @@ async function fixture() {
       states.set(id, { ...a, status: 'uncertain', reason: 'mutation_uncertain' }); return true; }),
     list: vi.fn(async () => [...states.values()])
   };
-  const journal = createToolJournal({ nativeJournal, ownMutation: async () => own }, { clock: { now: () => 2000000000000 }, id: () => (++serial).toString(16).padStart(32, '0') });
+  const ownMutation = vi.fn(async (): Promise<typeof own> => own);
+  const journal = createToolJournal({ nativeJournal, ownMutation }, { clock: { now: () => 2000000000000 }, id: () => (++serial).toString(16).padStart(32, '0') });
   const info: ToolInfo = { name: call().toolName, description: '', parameters: { type: 'object' }, exposure: 'direct', namespace: { name: `mcp__${WHATSAPP_SERVER}` },
     sourceInfo: { path: '<inline:mcp>', source: 'inline', scope: 'temporary', origin: 'top-level' } };
   const pi = { on: (type: string, handler: any) => { handlers[type] = handler; return () => {}; }, getAllTools: () => [info] } as unknown as ExtensionAPI;
@@ -57,7 +58,7 @@ async function fixture() {
   const ctx = { sessionManager: { getSessionId: () => binding.sessionId }, abort: vi.fn() } as unknown as ExtensionContext;
   const record = vi.fn(async (r: JournalRecord) => { effects.push(r.state.status + ':fsync'); records.push(structuredClone(r)); });
   journal.bind({ session: binding, record }); await handlers['session_start']!({ type: 'session_start' }, ctx); await journal.attach(binding, context);
-  return { journal, ctx, nativeJournal, states, records, effects, record, info, handlers,
+  return { journal, ctx, nativeJournal, ownMutation, states, records, effects, record, info, handlers,
     setOwn: (v: typeof own) => { own = v; }, invokeCall: (e = call()) => handlers['tool_call']!(e, ctx), invokeResult: (e = result()) => handlers['tool_result']!(e, ctx) };
 }
 describe('native-shaped durable mutation hooks', () => {
@@ -141,6 +142,32 @@ describe('native-shaped durable mutation hooks', () => {
     f.setOwn('confirmed'); expect(await f.journal.classifyOwn(chat, other, 'SYNTHETIC_SENT', fallback)).toBe('confirmed');
     f.setOwn('uncertain'); expect(await f.journal.classifyOwn(chat, other, 'SYNTHETIC_SENT', fallback)).toBe('uncertain');
     f.setOwn('none'); expect(await f.journal.classifyOwn(chat, other, 'SYNTHETIC_MANUAL', fallback)).toBe('manual');
+  });
+  it('bridges confirmed journal cleanup only after durable completion proof is visible', async () => {
+    const proven = await fixture();
+    proven.ownMutation.mockResolvedValueOnce('confirmed').mockResolvedValueOnce('none');
+    const durable = vi.fn(async (): Promise<'confirmed' | 'manual' | 'uncertain'> => 'manual')
+      .mockResolvedValueOnce('manual').mockResolvedValueOnce('confirmed');
+    expect(await proven.journal.classifyOwn(chat, other, 'SYNTHETIC_HANDOFF', durable)).toBe('confirmed');
+    expect(durable).toHaveBeenCalledTimes(2);
+
+    const missing = await fixture();
+    missing.ownMutation.mockResolvedValueOnce('confirmed').mockResolvedValueOnce('none');
+    const absent = vi.fn(async (): Promise<'confirmed' | 'manual' | 'uncertain'> => 'manual');
+    expect(await missing.journal.classifyOwn(chat, other, 'SYNTHETIC_HANDOFF', absent)).toBe('uncertain');
+    expect(absent).toHaveBeenCalledTimes(2);
+
+    const unresolved = await fixture();
+    unresolved.ownMutation.mockResolvedValueOnce('none').mockResolvedValueOnce('confirmed');
+    const uncertain = vi.fn(async (): Promise<'confirmed' | 'manual' | 'uncertain'> => 'uncertain');
+    expect(await unresolved.journal.classifyOwn(chat, other, 'SYNTHETIC_UNCERTAIN', uncertain)).toBe('uncertain');
+    expect(unresolved.ownMutation).toHaveBeenCalledTimes(1);
+
+    const late = await fixture();
+    late.ownMutation.mockResolvedValueOnce('none').mockResolvedValueOnce('uncertain');
+    const indexedConfirmed = vi.fn(async (): Promise<'confirmed' | 'manual' | 'uncertain'> => 'confirmed');
+    expect(await late.journal.classifyOwn(chat, other, 'SYNTHETIC_LATE_UNCERTAIN', indexedConfirmed)).toBe('uncertain');
+    expect(late.ownMutation).toHaveBeenCalledTimes(2);
   });
 });
 describe('locked seven tools and native response envelope', () => {
@@ -321,7 +348,7 @@ const ownedBinary = process.env['SLICE7_OWNED_REDIS_BINARY'];
       expect(await repo.nativeJournal.begin(w, unresolved)).toBe(true);
       expect(await repo.ownMutation(other, 'SYNTHETIC_SENT')).toBe('uncertain');
       await admin.hSet(keys(chat).lease, 'until', '1');
-      expect(await repo.nativeJournal.confirm(w, a.attemptId, 'SYNTHETIC_SENT')).toBe(false);
+      expect(await repo.nativeJournal.confirm(w, unresolved.attemptId, 'SYNTHETIC_STALE_RESULT')).toBe(false);
       expect((await repo.claimNext(chat, app, 'b'.repeat(32), 300000, 1000)).status).toBe('paused');
       expect((await repo.nativeJournal.list(chat)).find(r => r.attemptId === unresolved.attemptId)?.status).toBe('uncertain');
       expect((await repo.readChat(chat)).pause).toBe('mutation_uncertain');
@@ -409,6 +436,7 @@ describe('session host journal attachment', () => {
       await expect(journalFailureSession.dispose()).rejects.toMatchObject({ code: 'session_failed' });
       await expect(host.attach(journalFailureSession, context)).rejects.toMatchObject({ code: 'session_failed' });
       expect(journalDispose).toHaveBeenCalledTimes(1); journalDispose.mockRestore();
+      await expect(host.open(work, session.binding)).rejects.toMatchObject({ code: 'mutation_uncertain' });
       await f.journal.dispose(journalFailureSession.binding);
       const afterJournalFailure = await host.open(work, session.binding); await afterJournalFailure.dispose();
 

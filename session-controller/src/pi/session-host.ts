@@ -86,15 +86,17 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
           if (disposed || closed) throw new ControllerError('session_failed');
           if (context) await context.current(); else await initialCurrent();
         };
-        journalBinding = binding;
-        options.journal?.bind({ session: binding, async record(value) {
-          try {
-            await current(); manager.appendCustomEntry(MUTATION_TYPE, value);
-            await current(); await syncSession(binding!);
-            await current(); await syncDirectory(dirname(binding!.sessionFile));
-            await current();
-          } catch { options.index.invalidate(binding!); throw new ControllerError('mutation_uncertain'); }
-        } });
+        if (options.journal) {
+          options.journal.bind({ session: binding, async record(value) {
+            try {
+              await current(); manager.appendCustomEntry(MUTATION_TYPE, value);
+              await current(); await syncSession(binding!);
+              await current(); await syncDirectory(dirname(binding!.sessionFile));
+              await current();
+            } catch { options.index.invalidate(binding!); throw new ControllerError('mutation_uncertain'); }
+          } });
+          journalBinding = binding;
+        }
         raw = await options.sdk.connect(manager, current);
         const runtime = raw;
         await current(); runtime.setAutoCompactionEnabled(false);

@@ -216,7 +216,13 @@ export function createToolJournal(ports: Pick<RedisRepository, 'nativeJournal' |
     },
     async classifyOwn(_chat, actual, messageId, fallback) {
       const first = await repository.ownMutation(actual, messageId); if (first === 'uncertain') return first;
-      const result = await fallback(); const last = await repository.ownMutation(actual, messageId); return last === 'none' ? result : last;
+      const indexed = await fallback(); if (indexed === 'uncertain') return indexed;
+      const last = await repository.ownMutation(actual, messageId); if (last === 'uncertain') return last;
+      if (last === 'confirmed' || indexed === 'confirmed') return 'confirmed';
+      if (first === 'confirmed') {
+        const settled = await fallback(); return settled === 'confirmed' ? 'confirmed' : 'uncertain';
+      }
+      return indexed;
     },
     async dispose(binding) { const l = get(binding); await l.tail; if (l.running) throw fail(); live.delete(binding.sessionId); }
   };
