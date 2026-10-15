@@ -5,12 +5,18 @@ import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {
   checked, ControllerError, SessionBindingSchema, CompletionMarkerSchema, fingerprintEvent,
-  type ClaimedWork, type PiHostPort, type PiSessionPort, type CompletionProof, type CheckpointV1
+  type ClaimedWork, type PiHostPort, type PiSessionPort, type CompletionProof, type CheckpointRecord, type CheckpointV1
 } from '../domain.js';
 import type { TurnContext } from '../scheduler/chat-worker.js';
 import { BINDING_TYPE, COMPLETION_TYPE, assertSessionPath, durableDirectory, syncSession, syncDirectory, type CompletionIndex } from './completion-index.js';
-import { WHATSAPP_SERVER, type SdkPort, type SdkSession } from './mcp-loader.js';
+import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import { WHATSAPP_SERVER, type SdkManager, type SdkPort, type SdkSession } from './mcp-loader.js';
 import { MUTATION_TYPE, type JournalAttachment } from './tool-journal-extension.js';
+import { checkpointIdentity, confirmedHistory, renderCheckpointSummary, validateCheckpoint, type ConfirmedToolOutcome } from '../compaction/checkpoint.js';
+interface HostedSessionPort extends PiSessionPort {
+  history(lastCompletedSequence: number, currentCheckpoint?: CheckpointV1): Promise<readonly ConfirmedToolOutcome[]>;
+  reconcileCheckpoint(record: CheckpointRecord): Promise<{ entryId: string; checkpoint: CheckpointV1 }>;
+}
 export interface SessionHost extends PiHostPort { attach(session: PiSessionPort, context: TurnContext): Promise<void> }
 export interface SessionHostOptions {
   cwd: string; root: string; sdk: SdkPort; index: CompletionIndex;
@@ -23,7 +29,11 @@ export interface SessionHostOptions {
   /** Native composition MUST pass this and loadNativeSdk(...,[journal.extension]).
    * Optional only for non-executing fake SDK proofs of Slice 6. */
   journal?: JournalAttachment;
-  compact?: (raw: SdkSession, context: TurnContext, instructions: string, checkpoint: CheckpointV1) => Promise<{ entryId: string; checkpoint: CheckpointV1 }>;
+  checkpointMaxBytes?: number;
+  compact?: (raw: SdkSession, context: TurnContext, instructions: string, checkpoint: CheckpointV1) => Promise<{ entryId: string; checkpointId: string; checkpoint: CheckpointV1; compacted?(): Promise<void>; restored?(): Promise<void> }>;
+}
+function storedCheckpointDetails(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 export function createSessionHost(options: SessionHostOptions): SessionHost {
   let closed = false, closingHost = false, closeTask: Promise<void> | undefined;
@@ -78,6 +88,9 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
         await initialCurrent();
         const manager = options.sdk.open(binding.sessionFile, dir);
         if (manager.getSessionId() !== binding.sessionId || manager.getSessionFile() !== binding.sessionFile) throw new ControllerError('session_failed');
+        // The installed public Pi 1.1 SessionManager implements getBranch(); keep
+        // that runtime fact local rather than widening the locked SDK adapter.
+        const branchManager = manager as SdkManager & { getBranch(): readonly unknown[] };
         let context: TurnContext | undefined, disposed = false, disposing = false, busy = false, turnSettled = false;
         let operation: Promise<void> = Promise.resolve(), finished: (() => void) | undefined, disposeTask: Promise<void> | undefined;
         const begin = () => { busy = true; operation = new Promise<void>(resolve => { finished = resolve; }); };
@@ -106,7 +119,7 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
         // Fake Slice 6 sessions have no tools and remain valid proof ports.
         if (!options.journal && runtime.getAllTools().some(t => t.name.startsWith(`mcp__${WHATSAPP_SERVER}__`))) throw new ControllerError('session_failed');
         const requireAttached = async () => { if (!context || disposing) throw new ControllerError('session_failed'); await current(); if (disposing) throw new ControllerError('session_failed'); };
-        const port: PiSessionPort = {
+        const port: HostedSessionPort = {
           binding,
           async prompt(event, instructions) {
             await requireAttached();
@@ -128,6 +141,44 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
             } finally { unsubscribe(); end(); }
           },
           usage() { if (disposed || busy || !runtime.isIdle) return undefined; return runtime.getContextUsage(); },
+          async history(lastCompletedSequence, currentCheckpoint) {
+            await requireAttached(); await current();
+            if (typeof branchManager.getBranch !== 'function') throw new ControllerError('checkpoint_invalid');
+            const entries = branchManager.getBranch() as readonly SessionEntry[];
+            await current();
+            return confirmedHistory(entries, binding!, lastCompletedSequence, currentCheckpoint);
+          },
+          async reconcileCheckpoint(record) {
+            await requireAttached();
+            if (busy || !runtime.isIdle || record.checkpoint.canonicalChatId !== port.binding.canonicalChatId) throw new ControllerError('restore_failed');
+            await current(); await syncSession(port.binding);
+            await current(); await syncDirectory(dirname(port.binding.sessionFile));
+            await current(); const reopened = options.sdk.open(port.binding.sessionFile, dirname(port.binding.sessionFile));
+            if (reopened.getSessionId() !== port.binding.sessionId || reopened.getSessionFile() !== port.binding.sessionFile) throw new ControllerError('restore_failed');
+            // Reconciliation is branch-local. getEntries() includes abandoned
+            // siblings and must never authorize prepared/restored evidence.
+            const reopenedBranch = reopened as SdkManager & { getBranch(): readonly unknown[] };
+            if (typeof reopenedBranch.getBranch !== 'function') throw new ControllerError('restore_failed');
+            const entries = reopenedBranch.getBranch() as readonly Record<string, unknown>[];
+            const claims = entries.filter(e => e['type'] === 'compaction' && storedCheckpointDetails(e['details']) && e['details']['checkpointId'] === record.checkpointId);
+            if (claims.length !== 1) throw new ControllerError('restore_failed');
+            const entry = claims[0]!, id = entry['id'], details = entry['details'];
+            if (entry['fromHook'] !== true || typeof id !== 'string' || id.length < 1 || id.length > 128 ||
+                !storedCheckpointDetails(details) || details['version'] !== 1 || details['checkpointId'] !== record.checkpointId) throw new ControllerError('restore_failed');
+            if (record.phase === 'compacted' || record.phase === 'restored') {
+              if (record.compactionEntryId !== id) throw new ControllerError('restore_failed');
+            }
+            const maximumBytes = options.checkpointMaxBytes ?? 262144;
+            const originalIdentity = checkpointIdentity(record.checkpoint);
+            let restored: CheckpointV1, expectedSummary: string;
+            try {
+              restored = validateCheckpoint(details['checkpoint'], originalIdentity, maximumBytes);
+              expectedSummary = renderCheckpointSummary(restored, record.checkpointId, originalIdentity, maximumBytes);
+            } catch { throw new ControllerError('restore_failed'); }
+            if (!isDeepStrictEqual(restored, record.checkpoint) || entry['summary'] !== expectedSummary) throw new ControllerError('restore_failed');
+            await options.index.exclusive(() => options.index.evidence(port.binding)); await current();
+            return { entryId: id, checkpoint: restored };
+          },
           async compact(instructions, checkpoint) {
             await requireAttached();
             if (busy || !runtime.isIdle || !options.compact || !context) throw new ControllerError('compaction_failed');
@@ -138,9 +189,35 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
               // Never hold evidence lock during SDK compaction/hooks: intake's
               // writer→index ordering would otherwise deadlock journal gates.
               await current(); await syncSession(port.binding);
+              await current(); await syncDirectory(dirname(port.binding.sessionFile));
+              const controlled = result.compacted !== undefined && result.restored !== undefined;
+              if (runtime.getAllTools().some(t => t.name.startsWith(`mcp__${WHATSAPP_SERVER}__`)) && !controlled) throw new ControllerError('compaction_failed');
+              if (controlled) {
+                await current(); await result.compacted!();
+                await current();
+                try {
+                  const reopened = options.sdk.open(port.binding.sessionFile, dirname(port.binding.sessionFile));
+                  if (reopened.getSessionId() !== port.binding.sessionId || reopened.getSessionFile() !== port.binding.sessionFile) throw new ControllerError('compaction_failed');
+                  const reopenedBranch = reopened as SdkManager & { getBranch(): readonly unknown[] };
+                  if (typeof reopenedBranch.getBranch !== 'function') throw new ControllerError('compaction_failed');
+                  const entries = reopenedBranch.getBranch() as readonly Record<string, unknown>[];
+                  const claims = entries.filter(e => e['type'] === 'compaction' && storedCheckpointDetails(e['details']) && e['details']['checkpointId'] === result.checkpointId);
+                  if (claims.length !== 1) throw new ControllerError('compaction_failed');
+                  const entry = claims[0]!, details = entry['details'];
+                  if (entry['id'] !== result.entryId || entry['fromHook'] !== true || !storedCheckpointDetails(details) ||
+                      details['version'] !== 1 || details['checkpointId'] !== result.checkpointId) throw new ControllerError('compaction_failed');
+                  const maximumBytes = options.checkpointMaxBytes ?? 262144;
+                  const originalIdentity = checkpointIdentity(checkpoint);
+                  const restored = validateCheckpoint(details['checkpoint'], originalIdentity, maximumBytes);
+                  const expectedSummary = renderCheckpointSummary(restored, result.checkpointId, originalIdentity, maximumBytes);
+                  if (!isDeepStrictEqual(restored, result.checkpoint) || entry['summary'] !== expectedSummary) throw new ControllerError('compaction_failed');
+                } catch { throw new ControllerError('compaction_failed'); }
+                await current(); await result.restored!();
+                await current();
+              }
               await options.index.exclusive(() => options.index.evidence(port.binding));
-              return result;
-            } catch { options.index.invalidate(port.binding); throw new ControllerError('compaction_failed'); }
+              return { entryId: result.entryId, checkpoint: result.checkpoint };
+            } catch (error) { options.index.invalidate(port.binding); if (error instanceof ControllerError) throw error; throw new ControllerError('compaction_failed'); }
             finally { end(); }
           },
           async appendCompletion(input): Promise<CompletionProof> {

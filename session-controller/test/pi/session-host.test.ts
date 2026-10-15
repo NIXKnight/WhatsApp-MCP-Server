@@ -9,6 +9,7 @@ import {
   type ClaimedWork, type CompletionMarker, type SessionBinding, type CheckpointV1
 } from '../../src/domain.js';
 import { createCompletionIndex, readEvidence, COMPLETION_TYPE, type MappingPort } from '../../src/pi/completion-index.js';
+import { checkpointIdentity, renderCheckpointSummary } from '../../src/compaction/checkpoint.js';
 import { createSessionHost } from '../../src/pi/session-host.js';
 import { renderPolicy, loadPromptPolicy } from '../../src/pi/prompt-policy.js';
 import type { SdkPort, SdkManager, SdkSession } from '../../src/pi/mcp-loader.js';
@@ -95,8 +96,10 @@ async function fixture() {
       await context.current(); effects.push('compact-start'); await compactGate.promise; await context.current();
       const b = rows.find(r => r.chat === context.work().event.canonical_chat_jid)!.binding!;
       const lines = JSON.parse((await readFile(b.sessionFile, 'utf8')).trimEnd().split('\n').at(-1)!) as { id: string };
-      appendFileSync(b.sessionFile, JSON.stringify({ type: 'compaction', id: 'SYNTHETIC_COMPACT', parentId: lines.id, timestamp: '2033-05-18T03:33:23Z', summary: 'SYNTHETIC_SUMMARY', firstKeptEntryId: 'SYNTHETIC_COMPACT', tokensBefore: 12 }) + '\n');
-      return { entryId: 'SYNTHETIC_COMPACT', checkpoint };
+      const checkpointId = 'c'.repeat(32);
+      const summary = renderCheckpointSummary(checkpoint, checkpointId, checkpointIdentity(checkpoint), 65536);
+      appendFileSync(b.sessionFile, JSON.stringify({ type: 'compaction', id: 'SYNTHETIC_COMPACT', parentId: lines.id, timestamp: '2033-05-18T03:33:23Z', summary, firstKeptEntryId: 'SYNTHETIC_COMPACT', tokensBefore: 12, fromHook: true, details: { version: 1, checkpointId, checkpoint } }) + '\n');
+      return { entryId: 'SYNTHETIC_COMPACT', checkpointId, checkpoint };
     }
   });
   const attach = async (w: ClaimedWork, session: Awaited<ReturnType<typeof host.open>>) => {
@@ -204,7 +207,7 @@ describe('isolated Pi boundary and durable noncontext evidence (no native runtim
       held.release(); const proof = await append;
       expect(prior.every(p => p === undefined || p.marker.eventFingerprint === proof.marker.eventFingerprint)).toBe(true);
       expect(await f.index.findEvent(group, w.event.event_id)).toEqual(proof);
-      const checkpoint = { version: 1 } as CheckpointV1; // injected compact port does not claim Slice 8 validation
+      const checkpoint = { version: 1, canonicalChatId: group, lastCompletedSequence: 0, policyVersion: 'p1', templateVersion: 't1', createdAt: '2033-05-18T03:33:22Z', goals: [], decisions: [], constraints: [], verifiedFacts: [], pendingWork: [], approvalBoundaries: [], nextSteps: [], confirmedToolOutcomes: [] } satisfies CheckpointV1;
       const compact = session.compact('SYNTHETIC_COMPACT', checkpoint);
       await new Promise(r => setImmediate(r));
       expect(await f.index.findEvent(group, w.event.event_id)).toEqual(proof);
