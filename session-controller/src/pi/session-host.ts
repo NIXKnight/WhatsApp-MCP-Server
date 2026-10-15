@@ -9,7 +9,8 @@ import {
 } from '../domain.js';
 import type { TurnContext } from '../scheduler/chat-worker.js';
 import { BINDING_TYPE, COMPLETION_TYPE, assertSessionPath, durableDirectory, syncSession, syncDirectory, type CompletionIndex } from './completion-index.js';
-import type { SdkPort, SdkSession } from './mcp-loader.js';
+import { WHATSAPP_SERVER, type SdkPort, type SdkSession } from './mcp-loader.js';
+import { MUTATION_TYPE, type JournalAttachment } from './tool-journal-extension.js';
 export interface SessionHost extends PiHostPort { attach(session: PiSessionPort, context: TurnContext): Promise<void> }
 export interface SessionHostOptions {
   cwd: string; root: string; sdk: SdkPort; index: CompletionIndex;
@@ -19,6 +20,9 @@ export interface SessionHostOptions {
   bind(work: ClaimedWork, binding: PiSessionPort['binding']): Promise<boolean>;
   /** Slice 8 performs checkpoint prepare/compact/restore through this injected
    * port, with context.current before each effect; no future module import. */
+  /** Native composition MUST pass this and loadNativeSdk(...,[journal.extension]).
+   * Optional only for non-executing fake SDK proofs of Slice 6. */
+  journal?: JournalAttachment;
   compact?: (raw: SdkSession, context: TurnContext, instructions: string, checkpoint: CheckpointV1) => Promise<{ entryId: string; checkpoint: CheckpointV1 }>;
 }
 export function createSessionHost(options: SessionHostOptions): SessionHost {
@@ -28,7 +32,9 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
   const opening = new Set<string>();
   const host: SessionHost = {
     findEvent: (chat, id) => options.index.findEvent(chat, id),
-    classifyOwn: (chat, actual, id) => options.index.classifyOwn(chat, actual, id),
+    classifyOwn: (chat, actual, id) => options.journal
+      ? options.journal.classifyOwn(chat, actual, id, () => options.index.classifyOwn(chat, actual, id))
+      : options.index.classifyOwn(chat, actual, id),
     async attach(session, context) {
       const attach = attaching.get(session); if (!attach) throw new ControllerError('session_failed');
       await attach(context);
@@ -37,7 +43,7 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
       const chat = work.event.canonical_chat_jid;
       if (closed || closingHost || active.has(chat) || opening.has(chat)) throw new ControllerError('session_failed');
       opening.add(chat);
-      let raw: SdkSession | undefined;
+      let raw: SdkSession | undefined; let journalBinding: PiSessionPort['binding'] | undefined;
       try {
         const initialCurrent = () => options.current(work);
         await initialCurrent();
@@ -73,18 +79,32 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
         const manager = options.sdk.open(binding.sessionFile, dir);
         if (manager.getSessionId() !== binding.sessionId || manager.getSessionFile() !== binding.sessionFile) throw new ControllerError('session_failed');
         let context: TurnContext | undefined, disposed = false, disposing = false, busy = false, turnSettled = false;
-        let operation: Promise<void> = Promise.resolve(), finished: (() => void) | undefined;
+        let operation: Promise<void> = Promise.resolve(), finished: (() => void) | undefined, disposeTask: Promise<void> | undefined;
         const begin = () => { busy = true; operation = new Promise<void>(resolve => { finished = resolve; }); };
         const end = () => { busy = false; finished?.(); finished = undefined; };
         const current = async () => {
           if (disposed || closed) throw new ControllerError('session_failed');
           if (context) await context.current(); else await initialCurrent();
         };
+        if (options.journal) {
+          options.journal.bind({ session: binding, async record(value) {
+            try {
+              await current(); manager.appendCustomEntry(MUTATION_TYPE, value);
+              await current(); await syncSession(binding!);
+              await current(); await syncDirectory(dirname(binding!.sessionFile));
+              await current();
+            } catch { options.index.invalidate(binding!); throw new ControllerError('mutation_uncertain'); }
+          } });
+          journalBinding = binding;
+        }
         raw = await options.sdk.connect(manager, current);
         const runtime = raw;
         await current(); runtime.setAutoCompactionEnabled(false);
         await current(); await runtime.bindExtensions({}); // starts stdio MCP, untouched stdout framing
         await current(); await options.sdk.ready(runtime, current);
+        // Native MCP inventory may never run without an installed journal.
+        // Fake Slice 6 sessions have no tools and remain valid proof ports.
+        if (!options.journal && runtime.getAllTools().some(t => t.name.startsWith(`mcp__${WHATSAPP_SERVER}__`))) throw new ControllerError('session_failed');
         const requireAttached = async () => { if (!context || disposing) throw new ControllerError('session_failed'); await current(); if (disposing) throw new ControllerError('session_failed'); };
         const port: PiSessionPort = {
           binding,
@@ -95,8 +115,11 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
             const unsubscribe = runtime.subscribe(e => { if (e.type === 'agent_settled') { settled = true; aborted = e.aborted; } });
             try {
               await current();
-              await runtime.prompt(instructions, { expandPromptTemplates: false });
-              await runtime.waitForIdle();
+              const invoke = async () => {
+                await runtime.prompt(instructions, { expandPromptTemplates: false });
+                await runtime.waitForIdle();
+              };
+              if (options.journal) await options.journal.run(port.binding, invoke); else await invoke();
               if (!settled || aborted || !runtime.isIdle) throw new ControllerError('session_failed');
               await current(); turnSettled = true;
             } catch (error) {
@@ -127,7 +150,7 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
             const event = work.event;
             if (marker.eventId !== event.event_id || marker.canonicalChatId !== chat || marker.chatSequence !== event.chat_sequence || marker.eventFingerprint !== fingerprintEvent(event)) throw new ControllerError('session_failed');
             if (marker.completion === 'turn' && !turnSettled) throw new ControllerError('session_failed');
-            if (marker.completion === 'context_only' && (!event.is_from_me || await options.index.classifyOwn(chat, event.chat_jid, event.message_id) !== 'confirmed')) throw new ControllerError('session_failed');
+            if (marker.completion === 'context_only' && (!event.is_from_me || await host.classifyOwn(chat, event.chat_jid, event.message_id) !== 'confirmed')) throw new ControllerError('session_failed');
             begin(); let reserved = false;
             try {
               // Never await Redis while holding the file-only interval. Reserve
@@ -156,12 +179,25 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
             finally { end(); }
           },
           async dispose() {
-            if (disposed) return;
-            // Indefinite drain. Never abort/reuse a cached active session handle.
-            disposing = true; await operation; await runtime.waitForIdle();
-            if (disposed) return;
-            disposed = true; runtime.dispose();
-            attaching.delete(port); if (active.get(chat) === port) active.delete(chat);
+            if (disposeTask) return disposeTask;
+            // Indefinite drain. Cleanup attempts are independent, fixed-error,
+            // and always detach this handle so a failed cleanup cannot wedge chat.
+            disposing = true;
+            disposeTask = (async () => {
+              let failed = false;
+              try {
+                try { await operation; } catch { failed = true; }
+                try { await runtime.waitForIdle(); } catch { failed = true; }
+                disposed = true;
+                try { runtime.dispose(); } catch { failed = true; }
+                try { await options.journal?.dispose(port.binding); } catch { failed = true; }
+                if (failed) throw new ControllerError('session_failed');
+              } finally {
+                disposed = true;
+                attaching.delete(port); if (active.get(chat) === port) active.delete(chat);
+              }
+            })();
+            return disposeTask;
           }
         };
         attaching.set(port, async next => {
@@ -170,11 +206,13 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
           if (context && context !== next) throw new ControllerError('session_failed');
           if (next.work().event.event_id !== work.event.event_id || fingerprintEvent(next.work().event) !== fingerprintEvent(work.event)) throw new ControllerError('session_failed');
           context = next;
+          await options.journal?.attach(port.binding, next);
         });
         active.set(chat, port); return port;
       } catch (error) {
         try { raw?.dispose(); }
         catch { /* Failed-open cleanup cannot replace the primary fixed error class. */ }
+        if (journalBinding && options.journal) { try { await options.journal.dispose(journalBinding); } catch { /* fixed outer error */ } }
         if (error instanceof ControllerError) throw error;
         throw new ControllerError('session_failed');
       } finally { opening.delete(chat); }

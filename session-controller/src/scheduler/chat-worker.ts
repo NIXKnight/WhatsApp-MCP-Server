@@ -5,7 +5,7 @@ import {
   type PauseReason, type Clock, type WaitPort, type DiagnosticPort
 } from '../domain.js';
 import type { RedisRepository } from '../redis/repository.js';
-export type WorkerRepository = Pick<RedisRepository, 'renew' | 'checkWork' | 'readChat' | 'bindSession' | 'turnState' | 'beginTurn' | 'pause' | 'complete'>;
+export type WorkerRepository = Pick<RedisRepository, 'renew' | 'checkWork' | 'readChat' | 'bindSession' | 'turnState' | 'beginTurn' | 'pause' | 'complete'> & Partial<Pick<RedisRepository, 'ownMutation'>>;
 export interface TurnContext {
   /** Ownership gate, not a tool/destination authorization interceptor.
    * Slice 6/7 adapters must call immediately before every prompt, journal,
@@ -19,12 +19,29 @@ export interface TurnPorts {
    * including marker fsync and extension follow-ups, before any prompt.
    * This is ownership fencing only, never capability/destination policy. */
   attach(session: PiSessionPort, context: TurnContext): Promise<void>;
-  /** Slice 8 supplies usage/compaction handling through this port. */
-  prepare(session: PiSessionPort, context: TurnContext): Promise<void>;
+  /** Slice 8 may compact before this event. Null usage immediately afterward
+   * is expected and is carried into afterPrompt rather than blocking prompt. */
+  prepare(session: PiSessionPort, context: TurnContext): Promise<{ usagePendingAfterCompaction: boolean } | void>;
   /** Slice 7 installs journal hooks through this port. It must settle all
    * hooks before returning and must not replay uncertain calls. */
   run(session: PiSessionPort, context: TurnContext, prompt: () => Promise<void>): Promise<void>;
+  /** Runs after the real event prompt settles under the journal/fences. */
+  afterPrompt?(session: PiSessionPort, context: TurnContext, preparation: { usagePendingAfterCompaction: boolean }): Promise<void>;
   confirmed(context: TurnContext): Promise<CompletionMarker['confirmedSends']>;
+}
+/** Native composition: host performs the durable journal run inside prompt;
+ * these scheduler ports expose confirmed metadata and injected Slice 8 prepare.
+ * loadNativeSdk extras and SessionHostOptions.journal must share this instance. */
+export function createJournalTurns(journal: Pick<import('../pi/tool-journal-extension.js').JournalAttachment, 'confirmed'>,
+  prepare: TurnPorts['prepare'],
+  afterPrompt: NonNullable<TurnPorts['afterPrompt']> = async () => {}): TurnPorts {
+  return {
+    async attach(_session, context) { await context.current(); },
+    prepare,
+    async run(_session, context, prompt) { await context.current(); await prompt(); await context.current(); },
+    afterPrompt,
+    confirmed: context => journal.confirmed(context)
+  };
 }
 export interface WorkerOptions {
   leaseMs: number; renewMs: number;
@@ -73,10 +90,14 @@ export async function runChatWorker(repository: WorkerRepository, initial: Claim
       if (!await repository.complete(work, p)) throw new ControllerError('lease_lost');
       return; // Durable marker already exists: no host.open or repeated logical turn.
     }
+    // Unresolved mutations pause each scheduled affected actual destination,
+    // including participant turns, without authorizing or rewriting sends.
+    if (await repository.ownMutation?.(work.event.chat_jid, work.event.message_id) === 'uncertain') throw new ControllerError('mutation_uncertain');
     const turn = await repository.turnState(work);
     if (turn === 'lost') throw new ControllerError('lease_lost');
     if (turn === 'started') throw new ControllerError('mutation_uncertain');
-    // Own-origin correlation deliberately remains Slice 7; injected host only.
+    // Native host combines all-session active journals and durable completion
+    // markers. Unresolved destinations win; manual own events still prompt.
     const own = work.event.is_from_me
       ? await options.host.classifyOwn(work.event.canonical_chat_jid, work.event.chat_jid, work.event.message_id) : 'manual';
     if (own === 'uncertain') throw new ControllerError('mutation_uncertain');
@@ -90,7 +111,7 @@ export async function runChatWorker(repository: WorkerRepository, initial: Claim
     await context.current(); await options.turns.attach(session, context);
     if (own !== 'confirmed') {
       reason = 'preparation_failed';
-      await context.current(); await options.turns.prepare(session, context);
+      const preparation = await options.turns.prepare(session, context) ?? { usagePendingAfterCompaction: false };
       await context.current();
       if (!await repository.beginTurn(work)) throw new ControllerError('mutation_uncertain');
       // Crash from here without a durable marker is uncertain, never auto-prompted.
@@ -101,6 +122,9 @@ export async function runChatWorker(repository: WorkerRepository, initial: Claim
         await context.current(); prompted = true;
         await opened.prompt(work.event, options.instructions(work));
       });
+      // The real current-event assistant response has settled. If compaction
+      // made pre-prompt usage null, require its valid usage before completion.
+      await options.turns.afterPrompt?.(opened, context, preparation);
     }
     await context.current();
     const confirmedSends = await options.turns.confirmed(context);
