@@ -19,16 +19,23 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 
 	case *events.Connected:
-		c.log.Info("whatsapp: connected")
-		c.conn.HandleConnected()
+		if c.conn.HandleConnected() {
+			c.log.Info("whatsapp: connected")
+		}
 
 	case *events.Disconnected:
 		c.log.Warn("whatsapp: disconnected (transient)")
 		c.conn.HandleDisconnected()
 
 	case *events.LoggedOut:
-		c.log.Warn("whatsapp: logged out", "reason", evt.Reason)
-		c.conn.HandleLoggedOut()
+		if c.managed {
+			if c.conn.HandleLoggedOut() {
+				c.log.Error("permanent_disconnect")
+			}
+		} else {
+			c.log.Warn("whatsapp: logged out", "reason", evt.Reason)
+			c.conn.HandleLoggedOut()
+		}
 
 	case *events.StreamError:
 		c.log.Warn("whatsapp: stream error", "code", evt.Code)
@@ -36,39 +43,55 @@ func (c *Client) handleEvent(rawEvt interface{}) {
 
 	case *events.ConnectFailure:
 		// ConnectFailure carries reason codes covering bans, outdated clients,
-		// logged-out sessions, and server-side errors. Log prominently and stop
-		// reconnecting — whatsmeow already emits TemporaryBan / LoggedOut for
-		// the common fatal sub-cases, but any unhandled ConnectFailure also
-		// warrants a permanent stop to avoid hammering a rejected session.
-		c.log.Error("whatsapp: connect failure",
-			"reason", evt.Reason.String(),
-			"message", evt.Message,
-		)
-		c.conn.HandlePermanentDisconnect("connect failure: " + evt.Reason.String())
+		// logged-out sessions, and server-side errors. Managed mode commits the
+		// terminal transition before emitting its sole fixed application token.
+		if c.managed {
+			if c.conn.HandlePermanentDisconnect("") {
+				c.log.Error("permanent_disconnect")
+			}
+		} else {
+			c.log.Error("whatsapp: connect failure",
+				"reason", evt.Reason.String(),
+				"message", evt.Message,
+			)
+			c.conn.HandlePermanentDisconnect("connect failure: " + evt.Reason.String())
+		}
 
 	case *events.TemporaryBan:
-		// Account temporarily banned. The ban reason and remaining duration are
-		// logged. Do not auto-reconnect: repeated attempts during a ban window
-		// escalate the penalty.
-		c.log.Error("whatsapp: temporary ban",
-			"code", evt.Code.String(),
-			"expire", evt.Expire,
-		)
-		c.conn.HandlePermanentDisconnect("temporary ban: " + evt.Code.String())
+		// Account temporarily banned. Do not auto-reconnect during the ban.
+		if c.managed {
+			if c.conn.HandlePermanentDisconnect("") {
+				c.log.Error("permanent_disconnect")
+			}
+		} else {
+			c.log.Error("whatsapp: temporary ban",
+				"code", evt.Code.String(),
+				"expire", evt.Expire,
+			)
+			c.conn.HandlePermanentDisconnect("temporary ban: " + evt.Code.String())
+		}
 
 	case *events.ClientOutdated:
-		// WhatsApp rejected the connection because the client version is too
-		// old. Reconnecting will not help until the whatsmeow dependency is
-		// updated and the binary is redeployed.
-		c.log.Error("whatsapp: client outdated — update whatsmeow dependency and redeploy")
-		c.conn.HandlePermanentDisconnect("client outdated")
+		// WhatsApp rejected the connection because the client version is too old.
+		if c.managed {
+			if c.conn.HandlePermanentDisconnect("client outdated") {
+				c.log.Error("permanent_disconnect")
+			}
+		} else {
+			c.log.Error("whatsapp: client outdated — update whatsmeow dependency and redeploy")
+			c.conn.HandlePermanentDisconnect("client outdated")
+		}
 
 	case *events.StreamReplaced:
-		// Another device connected with the same session keys and took over the
-		// stream. Auto-reconnecting would create a reconnect fight between the
-		// two instances. Require a manual operator restart.
-		c.log.Error("whatsapp: session replaced by another device — manual restart required")
-		c.conn.HandlePermanentDisconnect("stream replaced by another device")
+		// Another device connected with the same session keys and took over.
+		if c.managed {
+			if c.conn.HandlePermanentDisconnect("stream replaced by another device") {
+				c.log.Error("permanent_disconnect")
+			}
+		} else {
+			c.log.Error("whatsapp: session replaced by another device — manual restart required")
+			c.conn.HandlePermanentDisconnect("stream replaced by another device")
+		}
 
 	case *events.KeepAliveTimeout:
 		consecutive := c.keepAlive.RecordFailure()

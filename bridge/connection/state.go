@@ -32,12 +32,55 @@ func (s ConnectionState) String() string {
 	}
 }
 
-// State returns the current connection state.
+// State returns the current connection state under the transition guard.
 func (c *Connection) State() ConnectionState {
+	c.transitionMu.Lock()
+	defer c.transitionMu.Unlock()
 	return ConnectionState(c.state.Load())
 }
 
-func (c *Connection) setState(s ConnectionState) {
-	c.state.Store(int32(s))
-	c.log.Info("connection state changed", "state", s.String())
+// transitionStateLocked is the sole connection-state write/log primitive.
+// The caller must hold transitionMu.
+func (c *Connection) transitionStateLocked(next ConnectionState) bool {
+	if next == StatePermanentlyDisconnected {
+		if c.permanent.Load() {
+			return false
+		}
+		c.permanent.Store(true)
+	} else if c.permanent.Load() {
+		return false
+	}
+	c.state.Store(int32(next))
+	c.log.Info("connection state changed", "state", next.String())
+	return true
+}
+
+// transitionState serializes every ordinary/permanent transition.
+func (c *Connection) transitionState(next ConnectionState) bool {
+	c.transitionMu.Lock()
+	defer c.transitionMu.Unlock()
+	return c.transitionStateLocked(next)
+}
+
+// markConnected linearizes connected state, retry reset, and channel
+// publication against permanent loss. The sole nested order is
+// transitionMu -> connectedMu; unlock is the reverse.
+func (c *Connection) markConnected() bool {
+	c.transitionMu.Lock()
+	defer c.transitionMu.Unlock()
+	if !c.transitionStateLocked(StateConnected) {
+		return false
+	}
+	c.retryCount.Store(0)
+	c.connectedMu.Lock()
+	defer c.connectedMu.Unlock()
+	connected := c.connectedCh
+	if connected != nil {
+		select {
+		case <-connected:
+		default:
+			close(connected)
+		}
+	}
+	return true
 }

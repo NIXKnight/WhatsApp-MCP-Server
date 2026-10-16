@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -35,19 +36,23 @@ import (
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/store"
 )
 
-// cooldownDuration is the delay imposed after a permanent disconnect before
-// the bridge is allowed to restart and attempt a new connection. A Docker or
-// systemd supervisor that restarts the process immediately will receive exit
-// code 2 and should be configured to treat that as "do not restart".
+// cooldownDuration is the delay imposed after a QR timeout or permanent
+// disconnect before the bridge may attempt a new connection.
 const cooldownDuration = 10 * time.Minute
 
-// cooldownMarkerPath returns the path of the cooldown marker file.
+// BridgeHoldExit is the dedicated supervisor hold status for pairing,
+// cooldown, QR-timeout, and permanent-disconnect dispositions.
+const BridgeHoldExit = 78
+
+var (
+	errManagedUnpaired = errors.New("bridge_managed_unpaired")
+	errBridgeCooldown  = errors.New("bridge_cooldown_active")
+)
+
 func cooldownMarkerPath(dataDir string) string {
 	return filepath.Join(dataDir, "cooldown")
 }
 
-// checkCooldownMarker reads the cooldown marker file and returns the time until
-// which the bridge must not reconnect. Returns an error if no valid marker exists.
 func checkCooldownMarker(dataDir string) (time.Time, error) {
 	data, err := os.ReadFile(cooldownMarkerPath(dataDir))
 	if err != nil {
@@ -60,103 +65,163 @@ func checkCooldownMarker(dataDir string) (time.Time, error) {
 	return time.UnixMilli(unixMs), nil
 }
 
-// writeCooldownMarker writes a marker file recording that the bridge must not
-// reconnect until now+cooldownDuration.
 func writeCooldownMarker(dataDir string) {
 	until := time.Now().Add(cooldownDuration)
 	data := []byte(strconv.FormatInt(until.UnixMilli(), 10))
-	path := cooldownMarkerPath(dataDir)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		slog.Error("failed to write cooldown marker", "path", path, "err", err)
+	if err := os.WriteFile(cooldownMarkerPath(dataDir), data, 0600); err != nil {
+		slog.Error("cooldown_marker_write_failed")
 	}
 }
 
-// clearCooldownMarker removes the cooldown marker after a successful connection.
 func clearCooldownMarker(dataDir string) {
 	_ = os.Remove(cooldownMarkerPath(dataDir))
+}
+
+func managedPreflight(managed, paired bool) error {
+	if managed && !paired {
+		return errManagedUnpaired
+	}
+	return nil
+}
+
+func classifyBridgeExit(err error, signaled bool) int {
+	if signaled {
+		return 0
+	}
+	if errors.Is(err, errManagedUnpaired) ||
+		errors.Is(err, errBridgeCooldown) ||
+		errors.Is(err, client.ErrQRTimeout) ||
+		errors.Is(err, client.ErrPermanentDisconnect) {
+		return BridgeHoldExit
+	}
+	if err != nil {
+		return 1
+	}
+	return 0
+}
+
+// finalizeBridgeExit is the sole cooldown-write policy. Only QR timeout and
+// permanent loss create a marker, and the marker is written before returning
+// the hold status.
+func finalizeBridgeExit(err error, signaled bool, dataDir string, marker func(string)) int {
+	code := classifyBridgeExit(err, signaled)
+	if code == BridgeHoldExit &&
+		(errors.Is(err, client.ErrQRTimeout) || errors.Is(err, client.ErrPermanentDisconnect)) {
+		marker(dataDir)
+	}
+	return code
+}
+
+// waitForBridgeTerminal keeps server failure, signal, and permanent loss in a
+// single testable wait boundary.
+func waitForBridgeTerminal(signalCh <-chan os.Signal, serverCh <-chan error, permanentCh <-chan error) (error, bool) {
+	select {
+	case <-signalCh:
+		return nil, true
+	case err := <-serverCh:
+		if err == nil {
+			err = errors.New("bridge_server_event_invalid")
+		}
+		return err, false
+	case err := <-permanentCh:
+		if err == nil {
+			err = errors.New("bridge_terminal_event_invalid")
+		}
+		return err, false
+	}
 }
 
 func main() { os.Exit(run()) }
 
 func run() int {
-	// ---- Load configuration ------------------------------------------------
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("configuration error", "err", err)
 		return 1
 	}
 
-	// ---- Structured logger -------------------------------------------------
-	handler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: cfg.LogLevel,
-	})
+	handler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel})
 	log := slog.New(handler).With("service", "whatsapp-bridge-go")
 	slog.SetDefault(log)
 
-	log.Info("starting", "addr", cfg.Addr, "data_dir", cfg.DataDir)
-
-	// ---- Cooldown check ----------------------------------------------------
-	// If a previous run wrote a cooldown marker (permanent disconnect / ban),
-	// refuse to start until the cooldown expires. Exit code 2 signals to
-	// systemd/Docker restart policies that this is a deliberate hold-off.
-	if until, err := checkCooldownMarker(cfg.DataDir); err == nil && until.After(time.Now()) {
-		log.Error("connection cooldown active, refusing to start",
-			"until", until.Format(time.RFC3339),
-			"remaining", time.Until(until).Round(time.Second).String(),
-		)
-		return 2
-	}
-
-	// ---- Message store -----------------------------------------------------
+	// Construct the message store and device-store-backed client before any
+	// startup output so managed pairing preflight can remain a sole-line hold.
 	st, err := store.NewStore(cfg.DatabaseURL, log.With("component", "store"))
 	if err != nil {
-		log.Error("failed to open message store", "err", err)
+		if cfg.Managed {
+			log.Error("bridge_store_init_failed")
+		} else {
+			log.Error("failed to open message store", "err", err)
+		}
 		return 1
 	}
 
-	resources := bridgeCleanup{closeStore: st.Close, log: log}
+	managedUnpaired := false
+	resources := bridgeCleanup{
+		closeStore:          st.Close,
+		log:                 log,
+		managed:             cfg.Managed,
+		suppressDiagnostics: &managedUnpaired,
+	}
 	defer resources.run()
-	var options []client.Option
+
+	options := []client.Option{client.WithManagedMode(cfg.Managed)}
 	if cfg.Notifications.Enabled {
 		options = append(options, client.WithIncomingNotifications(cfg.Notifications.ChatAllowlist, cfg.Notifications.MaxAge))
 	}
-
-	// ---- WhatsApp client ---------------------------------------------------
-	waClient, err := client.NewClient(cfg.DatabaseURL, cfg.DataDir, st, log.With("component", "client"), options...)
+	waClient, err := client.NewClient(
+		cfg.DatabaseURL,
+		cfg.DataDir,
+		st,
+		log.With("component", "client"),
+		options...,
+	)
 	if err != nil {
-		log.Error("failed to create WhatsApp client", "err", err)
+		if cfg.Managed {
+			log.Error("bridge_client_init_failed")
+		} else {
+			log.Error("failed to create WhatsApp client", "err", err)
+		}
 		return 1
 	}
-
 	resources.disconnect = waClient.Disconnect
 
-	// ---- HTTP API server ---------------------------------------------------
-	// Start the HTTP server before connecting to WhatsApp so that /api/status
-	// is reachable during QR code scanning. Docker health checks and other
-	// probes will get a 200 response with state=QR_WAITING instead of a
-	// "connection refused" error.
+	if err := managedPreflight(cfg.Managed, waClient.IsPaired()); err != nil {
+		managedUnpaired = true
+		_, _ = fmt.Fprintln(os.Stderr, errManagedUnpaired.Error())
+		return classifyBridgeExit(err, false)
+	}
+
+	// Pairing preflight deliberately precedes cooldown, all warning emission,
+	// startup logs, listener/workers, and WhatsApp Connect.
+	if until, err := checkCooldownMarker(cfg.DataDir); err == nil && until.After(time.Now()) {
+		log.Error("bridge_cooldown_active")
+		return classifyBridgeExit(errBridgeCooldown, false)
+	}
+	for _, warning := range cfg.Warnings {
+		log.Warn(warning)
+	}
+	if warning := config.NonLoopbackWarning(cfg.Addr); warning != "" {
+		log.Warn(warning)
+	}
+	log.Info("starting", "addr", cfg.Addr, "data_dir", cfg.DataDir)
+
 	embedder := embed.New(cfg.EmbedderURL, cfg.EmbedderTimeout)
-	analyzer := analyzer.New(cfg.AnalyzerURL, cfg.AnalyzerTimeout)
-	h := api.NewHandler(waClient, st, embedder, analyzer, cfg.MediaMaxDownloadAttempts, log.With("component", "api"))
+	mediaAnalyzer := analyzer.New(cfg.AnalyzerURL, cfg.AnalyzerTimeout)
+	h := api.NewHandler(waClient, st, embedder, mediaAnalyzer, cfg.MediaMaxDownloadAttempts, log.With("component", "api"))
 	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"))
 	resources.stopHTTP = srv.Shutdown
 
 	srvErrCh := make(chan error, 1)
-	go func() {
-		srvErrCh <- srv.Start()
-	}()
+	go func() { srvErrCh <- srv.Start() }()
 
-	// ---- Signal handler for graceful shutdown ------------------------------
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	// ---- Connect to WhatsApp (non-blocking) --------------------------------
 	connectCtx, connectCancel := context.WithCancel(context.Background())
 	resources.cancelConnect = connectCancel
 
-	// Notifications do not depend on WhatsApp connection state. Disabled mode
-	// constructs no sender and performs only bounded local maintenance.
 	var sender *notify.Sender
 	if cfg.Notifications.Enabled {
 		sender, err = notify.NewSender(cfg.Notifications)
@@ -185,82 +250,87 @@ func run() int {
 	}
 
 	connectErrCh := make(chan error, 1)
-	go func() {
-		connectErrCh <- waClient.Connect(connectCtx)
-	}()
+	go func() { connectErrCh <- waClient.Connect(connectCtx) }()
 
-	// Wait for connection, a fatal HTTP server error, or a signal.
 	select {
-	case err := <-connectErrCh:
+	case err = <-connectErrCh:
 		if err != nil {
-			log.Error("WhatsApp connection failed", "err", err)
-			// If the client ended up in a permanently disconnected state (ban,
-			// logged out, client outdated, etc.) write a cooldown marker so that
-			// a supervisor restart does not immediately hammer the server again.
-			if waClient.State() == client.StatePermanentlyDisconnected {
-				writeCooldownMarker(cfg.DataDir)
-				log.Error("permanent disconnect detected, cooldown marker written",
-					"cooldown", cooldownDuration.String(),
-				)
-				return 2 // exit code 2: tell supervisor not to restart yet
+			if cfg.Managed {
+				switch {
+				case errors.Is(err, client.ErrQRTimeout):
+					log.Error("qr_timeout")
+				case errors.Is(err, client.ErrPermanentDisconnect):
+					// The winning events callback already emitted the authoritative token.
+				default:
+					log.Error("bridge_connect_failed")
+				}
+			} else {
+				log.Error("WhatsApp connection failed", "err", err)
 			}
-			return 1
+			return finalizeBridgeExit(err, false, cfg.DataDir, writeCooldownMarker)
 		}
 	case sig := <-sigCh:
 		log.Info("received signal before connection established, shutting down", "signal", sig)
-		return 0
-	case err := <-srvErrCh:
-		log.Error("HTTP server error before connection established", "err", err)
-		return 1
+		return finalizeBridgeExit(nil, true, cfg.DataDir, writeCooldownMarker)
+	case err = <-srvErrCh:
+		if err == nil {
+			err = errors.New("bridge_server_event_invalid")
+		}
+		if cfg.Managed {
+			log.Error("bridge_http_failed")
+		} else {
+			log.Error("HTTP server error before connection established", "err", err)
+		}
+		return finalizeBridgeExit(err, false, cfg.DataDir, writeCooldownMarker)
 	}
 
-	// Successful connection: remove any stale cooldown marker.
 	clearCooldownMarker(cfg.DataDir)
 	log.Info("WhatsApp connection established")
 
-	// ---- Background media-retry worker -------------------------------------
-	// Re-download non-audio media that was requested on-demand and failed. It is
-	// started only after the session is up (downloading needs the live whatsmeow
-	// client) and is cancelled + awaited during graceful shutdown. When disabled
-	// the goroutine never starts.
 	if cfg.MediaRetryEnabled {
 		mrCtx, cancel := context.WithCancel(context.Background())
 		mediaRetryCancel = cancel
 		worker := mediaretry.New(
-			waClient, st,
-			cfg.MediaRetryInterval, cfg.MediaMaxDownloadAttempts, cfg.MediaRetryBatchSize,
+			waClient,
+			st,
+			cfg.MediaRetryInterval,
+			cfg.MediaMaxDownloadAttempts,
+			cfg.MediaRetryBatchSize,
 			log.With("component", "mediaretry"),
 		)
 		mediaRetryWG.Add(1)
-		go func() {
-			defer mediaRetryWG.Done()
-			worker.Run(mrCtx)
-		}()
+		go func() { defer mediaRetryWG.Done(); worker.Run(mrCtx) }()
 	} else {
 		log.Info("media-retry worker disabled")
 	}
 
-	// ---- Wait for termination signal ---------------------------------------
-	select {
-	case sig := <-sigCh:
-		log.Info("received signal, initiating graceful shutdown", "signal", sig)
-	case err := <-srvErrCh:
+	err, signaled := waitForBridgeTerminal(sigCh, srvErrCh, waClient.PermanentDisconnects())
+	if signaled {
+		log.Info("received signal, initiating graceful shutdown")
+	} else if errors.Is(err, client.ErrPermanentDisconnect) {
+		// The event layer owns the fixed managed diagnostic.
+	} else if cfg.Managed {
+		log.Error("bridge_http_failed")
+	} else {
 		log.Error("HTTP server error", "err", err)
 	}
-
-	return 0
+	return finalizeBridgeExit(err, signaled, cfg.DataDir, writeCooldownMarker)
 }
 
 // bridgeCleanup is populated as resources are acquired and deferred once.
-// Thus every return (including connection failure/cooldown exit 2) stops and
-// waits for the dispatcher before callback ingress or the store is closed.
 type bridgeCleanup struct {
-	stopHTTP      func(context.Context) error
-	cancelConnect context.CancelFunc
-	stopWorkers   func()
-	disconnect    func()
-	closeStore    func() error
-	log           *slog.Logger
+	stopHTTP            func(context.Context) error
+	cancelConnect       context.CancelFunc
+	stopWorkers         func()
+	disconnect          func()
+	closeStore          func() error
+	log                 *slog.Logger
+	managed             bool
+	suppressDiagnostics *bool
+}
+
+func (r *bridgeCleanup) diagnosticsSuppressed() bool {
+	return r.suppressDiagnostics != nil && *r.suppressDiagnostics
 }
 
 func (r *bridgeCleanup) run() {
@@ -269,7 +339,7 @@ func (r *bridgeCleanup) run() {
 	}
 	if r.stopHTTP != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		if err := r.stopHTTP(ctx); err != nil {
+		if err := r.stopHTTP(ctx); err != nil && !r.diagnosticsSuppressed() {
 			r.log.Warn("HTTP shutdown incomplete", "class", "shutdown_failed")
 		}
 		cancel()
@@ -281,8 +351,12 @@ func (r *bridgeCleanup) run() {
 		r.disconnect()
 	}
 	if r.closeStore != nil {
-		if err := r.closeStore(); err != nil {
-			r.log.Warn("store close failed", "class", "store_failed")
+		if err := r.closeStore(); err != nil && !r.diagnosticsSuppressed() {
+			if r.managed {
+				r.log.Warn("bridge_store_close_failed")
+			} else {
+				r.log.Warn("store close failed", "class", "store_failed")
+			}
 		}
 	}
 }
