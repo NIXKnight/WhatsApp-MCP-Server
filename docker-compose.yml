@@ -3,7 +3,8 @@ services:
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: whatsapp
-      POSTGRES_PASSWORD: whatsapp
+      # Compatibility default matches the existing initialized volume.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-whatsapp}"
       POSTGRES_DB: whatsapp
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -14,23 +15,104 @@ services:
       retries: 10
     restart: unless-stopped
 
+  redis:
+    image: redis:7.2.6-bookworm
+    # No ports are published. This service is attached only to the dedicated
+    # internal controller network; protected mode is disabled only there.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction", "--protected-mode", "no"]
+    volumes:
+      - controller-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - controller-internal
+
+  session-controller:
+    build:
+      context: .
+      dockerfile: session-controller/Dockerfile
+      args:
+        APP_UID: "${UID:-1000}"
+        APP_GID: "${GID:-1000}"
+    user: "${UID:-1000}:${GID:-1000}"
+    init: true
+    environment:
+      BRIDGE_NOTIFY_SECRET: "${BRIDGE_NOTIFY_SECRET:?BRIDGE_NOTIFY_SECRET is required}"
+      BRIDGE_NOTIFY_GROUP_ALLOWLIST: "${BRIDGE_NOTIFY_GROUP_ALLOWLIST:?BRIDGE_NOTIFY_GROUP_ALLOWLIST is required}"
+      BRIDGE_NOTIFY_OPERATOR_JIDS: "${BRIDGE_NOTIFY_OPERATOR_JIDS:?BRIDGE_NOTIFY_OPERATOR_JIDS is required}"
+      SESSION_CONTROLLER_REDIS_URL: "redis://redis:6379/0"
+      SESSION_CONTROLLER_BRIDGE_BASE_URL: "http://127.0.0.1:8080"
+      SESSION_CONTROLLER_HOST: "0.0.0.0"
+      SESSION_CONTROLLER_PORT: "8644"
+      SESSION_CONTROLLER_WEBHOOK_PATH: "/webhooks/whatsapp"
+      SESSION_CONTROLLER_PI_CWD: "/workspace"
+      SESSION_CONTROLLER_PI_AGENT_DIR: "/pi-agent"
+      SESSION_CONTROLLER_SESSION_DIR: "/sessions"
+      SESSION_CONTROLLER_SYSTEM_PROMPT_PATH: "/app/config/system-prompt.md"
+      SESSION_CONTROLLER_PRE_COMPACTION_PATH: "/app/config/pre-compaction.md"
+      SESSION_CONTROLLER_COMPACTION_SUMMARY_PATH: "/app/config/compaction-summary.md"
+      SESSION_CONTROLLER_PI_PROVIDER: "${SESSION_CONTROLLER_PI_PROVIDER:?SESSION_CONTROLLER_PI_PROVIDER is required}"
+      SESSION_CONTROLLER_PI_MODEL: "${SESSION_CONTROLLER_PI_MODEL:?SESSION_CONTROLLER_PI_MODEL is required}"
+      SESSION_CONTROLLER_SAFE_WORKING_WINDOW_TOKENS: "${SESSION_CONTROLLER_SAFE_WORKING_WINDOW_TOKENS:?SESSION_CONTROLLER_SAFE_WORKING_WINDOW_TOKENS is required}"
+      SESSION_CONTROLLER_MCP_COMMAND: "/opt/whatsapp-mcp/.venv/bin/whatsapp-mcp"
+      SESSION_CONTROLLER_MCP_ARGS_JSON: "[]"
+      SESSION_CONTROLLER_MCP_CWD: "/opt/whatsapp-mcp"
+      BRIDGE_URL: "http://127.0.0.1:8080"
+      MCP_TRANSPORT: "stdio"
+      WORKSPACE_DIR: "/workspace"
+      WORKSPACE_HOST_PATH: "${WORKSPACE_PATH:-./workspace}"
+    ports:
+      - "127.0.0.1:8644:8644"
+    volumes:
+      - controller-sessions:/sessions
+      - ${WORKSPACE_PATH:-./workspace}:/workspace
+      - ${PI_AGENT_DIR:?PI_AGENT_DIR is required}:/pi-agent
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      default:
+        aliases: [bridge]
+      controller-internal: {}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8644/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
   bridge:
     build: ./bridge
     user: "${UID:-1000}:${GID:-1000}"
+    network_mode: "service:session-controller"
     environment:
       BRIDGE_ADDR: "0.0.0.0:8080"
       BRIDGE_DATA_DIR: "/data"
-      DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
+      BRIDGE_MANAGED: "true"
+      DATABASE_URL: "postgres://whatsapp:${POSTGRES_PASSWORD_URI:-whatsapp}@postgres:5432/whatsapp?sslmode=disable"
       EMBEDDER_URL: "http://embedder:8000"
       ANALYZER_URL: "http://transcriber:8500"
+      BRIDGE_NOTIFY_ENABLED: "${BRIDGE_NOTIFY_ENABLED:-false}"
+      BRIDGE_NOTIFY_URL: "http://127.0.0.1:8644/webhooks/whatsapp"
+      BRIDGE_NOTIFY_SECRET: "${BRIDGE_NOTIFY_SECRET:?BRIDGE_NOTIFY_SECRET is required}"
+      BRIDGE_NOTIFY_GROUP_ALLOWLIST: "${BRIDGE_NOTIFY_GROUP_ALLOWLIST:?BRIDGE_NOTIFY_GROUP_ALLOWLIST is required}"
+      BRIDGE_NOTIFY_OPERATOR_JIDS: "${BRIDGE_NOTIFY_OPERATOR_JIDS:?BRIDGE_NOTIFY_OPERATOR_JIDS is required}"
     volumes:
       - bridge-data:/data
       - ${WORKSPACE_PATH:-./workspace}:/workspace
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      session-controller:
+        condition: service_started
     stop_grace_period: 20s
-    restart: unless-stopped
+    restart: on-failure
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/api/status"]
       interval: 10s
@@ -61,12 +143,10 @@ services:
     build: ./embedder
     user: "${UID:-1000}:${GID:-1000}"
     environment:
-      DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
+      DATABASE_URL: "postgres://whatsapp:${POSTGRES_PASSWORD_URI:-whatsapp}@postgres:5432/whatsapp?sslmode=disable"
       EMBEDDING_MODEL: "${EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}"
       EMBED_BATCH_SIZE: "${EMBED_BATCH_SIZE:-100}"
       EMBED_POLL_INTERVAL: "${EMBED_POLL_INTERVAL:-30}"
-      # Bind all interfaces inside the container so the bridge can reach it over
-      # the compose network. NOT published to the host (internal network only).
       EMBED_HTTP_ADDR: "0.0.0.0:8000"
       HF_HOME: "/home/bridge/.cache/huggingface"
     volumes:
@@ -81,19 +161,14 @@ services:
     build: ./transcriber
     user: "${UID:-1000}:${GID:-1000}"
     environment:
-      DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
+      DATABASE_URL: "postgres://whatsapp:${POSTGRES_PASSWORD_URI:-whatsapp}@postgres:5432/whatsapp?sslmode=disable"
       BRIDGE_URL: "http://bridge:8080"
-      # Whisper runs as an external HOST process; reach it via the host gateway.
       WHISPER_URL: "${WHISPER_URL:-http://host.docker.internal:8443}"
       WHISPER_MODEL: "${WHISPER_MODEL:-large-v3}"
       WHISPER_LANGUAGE: "${WHISPER_LANGUAGE:-ur}"
       TRANSCRIBE_BATCH_SIZE: "${TRANSCRIBE_BATCH_SIZE:-20}"
       TRANSCRIBE_POLL_INTERVAL: "${TRANSCRIBE_POLL_INTERVAL:-30}"
-      # Bind all interfaces inside the container so the bridge can reach it over
-      # the compose network. NOT published to the host (internal network only).
       ANALYZER_HTTP_ADDR: "0.0.0.0:8500"
-      # Re-downloaded media must land in the shared bridge data volume so both
-      # the bridge (writer) and this worker (reader) see the same path.
       REDOWNLOAD_DIR: "/data"
     volumes:
       - bridge-data:/data
@@ -113,7 +188,7 @@ services:
     ports:
       - "9090:9090"
     environment:
-      DATABASE_URL: "postgres://whatsapp:whatsapp@postgres:5432/whatsapp?sslmode=disable"
+      DATABASE_URL: "postgres://whatsapp:${POSTGRES_PASSWORD_URI:-whatsapp}@postgres:5432/whatsapp?sslmode=disable"
       BRIDGE_URL: "http://bridge:8080"
       DASHBOARD_HOST: "0.0.0.0"
       DASHBOARD_PORT: "9090"
@@ -128,3 +203,9 @@ volumes:
   postgres-data:
   bridge-data:
   embedder-cache:
+  controller-redis-data:
+  controller-sessions:
+
+networks:
+  controller-internal:
+    internal: true

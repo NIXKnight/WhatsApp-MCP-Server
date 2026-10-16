@@ -24,7 +24,9 @@ RUN apk add --no-cache ca-certificates tzdata
 RUN mkdir /data && chmod 777 /data
 
 COPY --from=builder /build/whatsapp-bridge /usr/local/bin/whatsapp-bridge
+COPY --chmod=0555 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/local/bin/whatsapp-bridge"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/usr/local/bin/whatsapp-bridge"]
