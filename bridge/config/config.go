@@ -2,10 +2,12 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +22,10 @@ const defaultEmbedderTimeout = 2 * time.Second
 // transcriber service. Analysis is heavy (video frame extraction, audio
 // transcription) so the deadline is generous relative to other outbound calls.
 const defaultAnalyzerTimeout = 180 * time.Second
+
+// NonLoopbackWarningToken is the fixed warning emitted when the bridge API is
+// configured on a non-loopback address.
+const NonLoopbackWarningToken = "bridge_config_non_loopback_BRIDGE_ADDR"
 
 // Media-retry worker defaults. The worker re-downloads non-audio media that was
 // requested on-demand and failed (download_attempts > 0). The poll interval is
@@ -36,6 +42,10 @@ const (
 type Config struct {
 	// Notifications controls the opt-in metadata-only incoming-message relay.
 	Notifications Notifications
+	// Managed selects the supervisor-managed, non-interactive lifecycle.
+	Managed bool
+	// Warnings contains sorted, deduplicated, value-free optional-setting warnings.
+	Warnings []string
 	// Addr is the TCP address to bind the HTTP server to (default: 127.0.0.1:8080).
 	Addr string
 	// DataDir is the directory for media file storage.
@@ -72,9 +82,14 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables, applying defaults for
-// any unset variables. It validates the data directory exists and is writable,
-// and warns if the bind address is not restricted to the loopback interface.
+// any unset variables. It validates the data directory exists and is writable.
+// Loading is deliberately output-free; callers decide when warnings are safe
+// to emit.
 func Load() (*Config, error) {
+	managed, err := parseManaged(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
 	notifications, err := loadNotifications(os.Getenv)
 	if err != nil {
 		return nil, err
@@ -95,27 +110,18 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid BRIDGE_LOG_LEVEL %q: %w", logLevelStr, err)
 	}
 
-	// Security: warn if the API is being bound to a non-loopback address.
-	// This bridge has no authentication; it must not be reachable from the network.
-	if !isLoopbackAddr(addr) {
-		fmt.Fprintf(os.Stderr,
-			"WARNING: BRIDGE_ADDR %q does not start with 127.0.0.1 or localhost. "+
-				"The bridge API has no authentication and should only be accessible locally.\n",
-			addr,
-		)
-	}
-
 	absDataDir, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolving BRIDGE_DATA_DIR: %w", err)
 	}
-
 	if err := ensureDataDir(absDataDir); err != nil {
 		return nil, fmt.Errorf("preparing data directory %q: %w", absDataDir, err)
 	}
 
-	return &Config{
+	warnings := newWarningCollector()
+	cfg := &Config{
 		Notifications:            notifications,
+		Managed:                  managed,
 		Addr:                     addr,
 		DataDir:                  absDataDir,
 		DatabaseURL:              databaseURL,
@@ -124,11 +130,35 @@ func Load() (*Config, error) {
 		EmbedderTimeout:          defaultEmbedderTimeout,
 		AnalyzerURL:              analyzerURL,
 		AnalyzerTimeout:          defaultAnalyzerTimeout,
-		MediaRetryEnabled:        getEnvBool("MEDIA_RETRY_ENABLED", true),
-		MediaRetryInterval:       getEnvDuration("MEDIA_RETRY_INTERVAL", defaultMediaRetryInterval),
-		MediaMaxDownloadAttempts: getEnvInt("MEDIA_MAX_DOWNLOAD_ATTEMPTS", defaultMediaMaxDownloadAttempts),
-		MediaRetryBatchSize:      getEnvInt("MEDIA_RETRY_BATCH_SIZE", defaultMediaRetryBatchSize),
-	}, nil
+		MediaRetryEnabled:        getEnvBoolWithWarnings(os.Getenv, "MEDIA_RETRY_ENABLED", true, warnings),
+		MediaRetryInterval:       getEnvDurationWithWarnings(os.Getenv, "MEDIA_RETRY_INTERVAL", defaultMediaRetryInterval, warnings),
+		MediaMaxDownloadAttempts: getEnvIntWithWarnings(os.Getenv, "MEDIA_MAX_DOWNLOAD_ATTEMPTS", defaultMediaMaxDownloadAttempts, warnings),
+		MediaRetryBatchSize:      getEnvIntWithWarnings(os.Getenv, "MEDIA_RETRY_BATCH_SIZE", defaultMediaRetryBatchSize, warnings),
+	}
+	cfg.Warnings = warnings.sorted()
+	return cfg, nil
+}
+
+func parseManaged(getenv func(string) string) (bool, error) {
+	switch getenv("BRIDGE_MANAGED") {
+	case "":
+		return false, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New("BRIDGE_MANAGED_invalid")
+	}
+}
+
+// NonLoopbackWarning returns a fixed, value-free warning token for a
+// non-loopback bind address, or an empty string for a loopback address.
+func NonLoopbackWarning(addr string) string {
+	if isLoopbackAddr(addr) {
+		return ""
+	}
+	return NonLoopbackWarningToken
 }
 
 // isLoopbackAddr returns true when addr is bound to the loopback interface.
@@ -145,46 +175,78 @@ func getEnv(key, def string) string {
 	return def
 }
 
-// getEnvBool parses a boolean env var (1/t/T/TRUE/true/0/f/false/...). An unset
-// or unparseable value falls back to def, with a warning on a parse failure.
+type warningCollector map[string]struct{}
+
+func newWarningCollector() warningCollector { return make(warningCollector) }
+
+func (w warningCollector) add(class, key string) {
+	if w != nil {
+		w["bridge_config_invalid_"+class+"_"+key] = struct{}{}
+	}
+}
+
+func (w warningCollector) sorted() []string {
+	out := make([]string, 0, len(w))
+	for warning := range w {
+		out = append(out, warning)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// getEnvBool parses a boolean env var. An unset or unparseable value falls
+// back to def. Config loading uses the collector variant to retain a fixed
+// warning without writing output.
 func getEnvBool(key string, def bool) bool {
-	v := os.Getenv(key)
+	return getEnvBoolWithWarnings(os.Getenv, key, def, nil)
+}
+
+func getEnvBoolWithWarnings(getenv func(string) string, key string, def bool, warnings warningCollector) bool {
+	v := getenv(key)
 	if v == "" {
 		return def
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: %s=%q is not a boolean, using default %v\n", key, v, def)
+		warnings.add("bool", key)
 		return def
 	}
 	return b
 }
 
-// getEnvDuration parses a Go duration env var (e.g. "3m", "90s"). An unset or
-// unparseable value falls back to def, with a warning on a parse failure.
+// getEnvDuration parses a Go duration env var (e.g. "3m", "90s"). An unset
+// or unparseable value falls back to def.
 func getEnvDuration(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
+	return getEnvDurationWithWarnings(os.Getenv, key, def, nil)
+}
+
+func getEnvDurationWithWarnings(getenv func(string) string, key string, def time.Duration, warnings warningCollector) time.Duration {
+	v := getenv(key)
 	if v == "" {
 		return def
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: %s=%q is not a duration, using default %s\n", key, v, def)
+		warnings.add("duration", key)
 		return def
 	}
 	return d
 }
 
-// getEnvInt parses an integer env var. An unset, unparseable, or non-positive
-// value falls back to def, with a warning on a parse failure.
+// getEnvInt parses a positive integer env var. An unset, unparseable, or
+// non-positive value falls back to def.
 func getEnvInt(key string, def int) int {
-	v := os.Getenv(key)
+	return getEnvIntWithWarnings(os.Getenv, key, def, nil)
+}
+
+func getEnvIntWithWarnings(getenv func(string) string, key string, def int, warnings warningCollector) int {
+	v := getenv(key)
 	if v == "" {
 		return def
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
-		fmt.Fprintf(os.Stderr, "WARNING: %s=%q is not a positive integer, using default %d\n", key, v, def)
+		warnings.add("int", key)
 		return def
 	}
 	return n

@@ -1,10 +1,10 @@
 # WhatsApp Bridge
 
-Go HTTP server (layers L2/L3) that connects to WhatsApp via [whatsmeow](https://go.mau.fi/whatsmeow), captures every event into PostgreSQL, and exposes a REST API on `127.0.0.1:8080`. The Python FastMCP server consumes this API to deliver 20 MCP tools to any MCP/LLM host; Python enrichment workers (embedder, transcriber) read and write the same database. This bridge owns the schema and is the single writer to PostgreSQL.
+Go HTTP server (layers L2/L3) that connects to WhatsApp via [whatsmeow](https://go.mau.fi/whatsmeow), captures every event into PostgreSQL, and exposes a REST API on `127.0.0.1:8080`. The Python FastMCP server consumes this API to deliver 21 MCP tools to any MCP/LLM host; Python enrichment workers (embedder, transcriber) read and write the same database. This bridge owns the schema and is the single writer to PostgreSQL.
 
 ## Overview
 
-The bridge wraps the [whatsmeow](https://go.mau.fi/whatsmeow) library (WhatsApp Web multi-device protocol) and persists messages, chats, contacts, media metadata, links, telemetry, and watermarks into **PostgreSQL with the `pgvector` extension**. It implements a supervised connection state machine with exponential backoff, QR-code pairing, keepalive monitoring, and a post-ban cooldown. On top of capture it provides hybrid full-text + vector search, a background media-retry worker, a per-tool telemetry sink, and a thin media-analysis proxy to the L3 transcriber.
+The bridge wraps the [whatsmeow](https://go.mau.fi/whatsmeow) library (WhatsApp Web multi-device protocol) and persists messages, chats, contacts, media metadata, links, telemetry, and watermarks into **PostgreSQL with the `pgvector` extension**. It implements a supervised connection state machine with exponential backoff, QR-code pairing, keepalive monitoring, and a post-ban `BridgeHoldExit=78` cooldown; panic-like or ordinary status 2 remains restartable. On top of capture it provides hybrid full-text + vector search, a background media-retry worker, a per-tool telemetry sink, and a thin media-analysis proxy to the L3 transcriber.
 
 Security: the API has **no authentication** and must only be reachable on the loopback interface (`127.0.0.1` / `localhost`) or a compose-internal network. The bridge logs a warning at startup if `BRIDGE_ADDR` is not loopback.
 
@@ -49,7 +49,7 @@ The Dockerfile is a multi-stage build: a `golang:1.26-alpine` builder compiles t
 |----------|---------|-------------|
 | `DATABASE_URL` | (required) | PostgreSQL DSN. Example: `postgres://user:pass@host:5432/whatsapp?sslmode=disable`. The process exits if unset. |
 | `BRIDGE_ADDR` | `127.0.0.1:8080` | TCP bind address for the HTTP server. A warning is logged if this is not a loopback address — the API has no auth. |
-| `BRIDGE_DATA_DIR` | `./data` | Directory for **downloaded media files** (and the cooldown marker). Created if missing; must be writable. Session/device data lives in PostgreSQL, not here. |
+| `BRIDGE_DATA_DIR` | `./data` | Directory for **downloaded media files** (and the `BridgeHoldExit=78` cooldown marker). Created if missing; must be writable. Session/device data lives in PostgreSQL, not here. |
 | `BRIDGE_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, or `error`. Logs are JSON to stderr. |
 | `EMBEDDER_URL` | `http://embedder:8000` | Base URL of the L3 embedder, called for query-time embeddings during hybrid search. |
 | `ANALYZER_URL` | `http://transcriber:8500` | Base URL of the L3 transcriber, called by the `/api/media/analyze` proxy. |
@@ -57,10 +57,12 @@ The Dockerfile is a multi-stage build: a `golang:1.26-alpine` builder compiles t
 | `MEDIA_RETRY_INTERVAL` | `3m` | Poll cadence of the media-retry worker. Doubles as the cross-cycle backoff between attempts for a single row. Go duration syntax (e.g. `90s`, `5m`). |
 | `MEDIA_MAX_DOWNLOAD_ATTEMPTS` | `3` | Max re-download attempts for one media row before it is flagged `download_permanently_failed`. |
 | `MEDIA_RETRY_BATCH_SIZE` | `10` | Maximum retry-eligible rows processed per cycle. |
+| `BRIDGE_MANAGED` | `false` | Exact lowercase `true`/`false`. Managed mode never emits a QR and returns reserved hold status 78 when pairing or a permanent reconnect action is required. |
 | `BRIDGE_NOTIFY_ENABLED` | `false` | Opt-in incoming metadata relay; no automatic WhatsApp actions. |
 | `BRIDGE_NOTIFY_URL` | (required when enabled) | Private HTTPS or literal-loopback HTTP `/webhooks/<route>` endpoint. |
 | `BRIDGE_NOTIFY_SECRET` | (required when enabled) | At least 32 bytes of operator-provided HMAC key material; byte-counted, never generated or stored in the outbox. |
-| `BRIDGE_NOTIFY_CHAT_ALLOWLIST` | (required when enabled) | Exact comma-separated full chat JIDs; no wildcard or implicit entire inbox. |
+| `BRIDGE_NOTIFY_GROUP_ALLOWLIST` | (required when enabled) | Exact comma-separated canonical numeric `@g.us` JIDs. |
+| `BRIDGE_NOTIFY_OPERATOR_JIDS` | (required when enabled) | Exact comma-separated operator PN/LID aliases sharing one private session. |
 | `BRIDGE_NOTIFY_TIMEOUT` | `5s` | Request deadline. |
 | `BRIDGE_NOTIFY_POLL_INTERVAL` | `1s` | Enabled dispatcher poll cadence. |
 | `BRIDGE_NOTIFY_MIN_INTERVAL` | `2s` | Minimum global attempt spacing. |
@@ -68,6 +70,8 @@ The Dockerfile is a multi-stage build: a `golang:1.26-alpine` builder compiles t
 | `BRIDGE_NOTIFY_MAX_ATTEMPTS` | `10` | Committed claims before dead-lettering. |
 | `BRIDGE_NOTIFY_MAX_AGE` | `24h` | Expiry from original receipt, frozen per event. |
 | `BRIDGE_NOTIFY_RETENTION` | `7d` | Retention after terminal transition. |
+
+Managed systemd bridge runs read transitional shared compatibility `~/.config/whatsapp-bridge/env` (the exact 29-name current-consumer union: `DATABASE_URL`, `PG_DSN`, `BRIDGE_ADDR`, `BRIDGE_DATA_DIR`, `BRIDGE_LOG_LEVEL`, `EMBEDDER_URL`, `ANALYZER_URL`, `MEDIA_RETRY_ENABLED`, `MEDIA_RETRY_INTERVAL`, `MEDIA_MAX_DOWNLOAD_ATTEMPTS`, `MEDIA_RETRY_BATCH_SIZE`, `BRIDGE_URL`, `LOG_LEVEL`, `MCP_TRANSPORT`, `MCP_HOST`, `MCP_PORT`, `WORKSPACE_DIR`, `WORKSPACE_HOST_PATH`, `EMBEDDING_MODEL`, `EMBED_BATCH_SIZE`, `EMBED_POLL_INTERVAL`, `EMBED_HTTP_ADDR`, `WHISPER_URL`, `TRANSCRIBE_BATCH_SIZE`, `TRANSCRIBE_POLL_INTERVAL`, `ANALYZER_HTTP_ADDR`, `DASHBOARD_HOST`, `DASHBOARD_PORT`, and `CONFIG_PATH`), bridge-only `~/.config/whatsapp-bridge/relay.env`, then shared authentication/admission `~/.config/whatsapp-notifications/env`. The shared compatibility file remains transitional until a later dedicated-file migration. The bridge unit retains all three files but launches with exact `ExecStart=/usr/bin/env BRIDGE_ADDR=127.0.0.1:8080 BRIDGE_LOG_LEVEL=info %h/.local/bin/whatsapp-bridge`, so the command-local assignments make loopback/info authoritative despite `EnvironmentFile=` taking precedence over `Environment=` regardless of directive order; the controller reads only the shared notification file plus its controller-only file, applies `UnsetEnvironment=DATABASE_URL`, and never receives the database DSN. `relay.env` exclusively owns `BRIDGE_NOTIFY_ENABLED`, `BRIDGE_NOTIFY_URL`, and optional documented delivery tuning; the shared file exclusively owns secret/group/operator values. Installer-managed directories/files are `0700`/`0600`, reject symlink/non-directory and symlink/non-regular paths, preserve content, and never print values. Initial/repair pairing is private foreground only with `BRIDGE_MANAGED=false BRIDGE_LOG_LEVEL=info`, never `debug`; Compose first starts PostgreSQL, Redis, and the controller namespace with delivery disabled, then uses attached `docker compose run --rm --no-deps -e BRIDGE_MANAGED=false -e BRIDGE_NOTIFY_ENABLED=false -e BRIDGE_LOG_LEVEL=info bridge`, requires that command-local notification disablement to override conflicting `.env`, retains all volumes, and starts the managed bridge afterward. QR output is temporary authentication material and must never enter shared logs/captures. Managed mode never generates a QR and selects discard-only SQL-store/migration, WhatsMeow, and `waLogAdapter` dependency logging before construction; details are neither buffered nor replayed. The separate application event path remains authoritative: managed mode calls the terminal handler first and emits exactly one fixed `permanent_disconnect` only for its winner, with reason/message/code/expire values absent; foreground emits its current event-specific detailed permanent records in their exact order before calling the handler. Accepted Connected/QR success restores retry count before channel publication/logging, and foreground retains exact `QR code scanned successfully` only after accepted QR handling; managed mode never enters QR. Managed unpaired startup emits only fixed `bridge_managed_unpaired`; it, an active cooldown, wrapped QR timeout, wrapped startup permanent disconnect, and one-shot post-connect permanent disconnect return exported `BridgeHoldExit=78` with application fixed classes only. Foreground dependency logs and QR remain unchanged; ordinary cancellation/failures return 1 and actual signals return 0. Status 78 is reserved for application holds and does not collide with Go runtime's panic-like status 2. Compose uses the signal-forwarding bridge entrypoint to map child `BridgeHoldExit=78` to container 0 only when `BRIDGE_MANAGED` is exact `true`; exact `false` or unset preserves child 78 so the documented foreground `docker compose run` reports timeout/hold failure. Child 2 and every other status remain preserved after signal-interrupted waits settle.
 
 See [Hermes notifications](../docs/hermes-notifications.md) for exact bounds,
 privacy limitations, disabled cleanup, required receiver permission verification,
@@ -87,11 +91,12 @@ DATABASE_URL='postgres://user:pass@localhost:5432/whatsapp?sslmode=disable' \
 
 All endpoints return JSON. Errors return `{"error":"...","code":"..."}` with an appropriate HTTP status. Query parameters and request bodies use snake_case (e.g. `chat_jid`, `message_id`, `quoted_message_id`). The router is [chi](https://github.com/go-chi/chi); a global 60s request timeout applies to every route except `POST /api/media/analyze` (190s).
 
-25 routes are registered in `bridge/api/server.go`:
+26 routes are registered in `bridge/api/server.go`:
 
 ```
 GET    /api/status
 GET    /api/messages
+GET    /api/messages/{id}
 GET    /api/messages/{id}/context
 GET    /api/messages/{id}/similar
 PUT    /api/messages/{id}/embedding
@@ -150,7 +155,7 @@ DISCONNECTED -----> CONNECTING -----> CONNECTED
 ### Key Features
 
 - **Exponential Backoff**: failed connections retry with delays of 1s, 2s, 4s, 8s, 16s, 32s, 60s (the schedule caps at 60s and repeats).
-- **Cooldown Marker**: after a permanent disconnect (ban, logout, client outdated), a `cooldown` marker file is written under `BRIDGE_DATA_DIR` recording a 10-minute hold-off, and the process exits with **code 2**. On the next start, if the marker is still in the future, the bridge refuses to start and exits 2 again — signalling systemd/Docker restart policies to wait rather than hammer WhatsApp. A successful connection clears the marker.
+- **Cooldown Marker**: after a permanent disconnect (ban, logout, client outdated), a `cooldown` marker file is written under `BRIDGE_DATA_DIR` recording a 10-minute hold-off, and the process returns exported **`BridgeHoldExit=78`**. An active marker returns the same sole supervisor hold status; panic-like or ordinary status 2 remains restartable. A successful connection clears the marker.
 - **Keepalive Monitoring**: a forced reconnect is triggered after **3 consecutive** `KeepAliveTimeout` events. whatsmeow's own auto-reconnect is disabled so the bridge runs a single, deterministic reconnect loop.
 - **Event Handlers**: handle `Connected`, `Disconnected`, `LoggedOut`, `TemporaryBan`, `ClientOutdated`, `ConnectFailure`, and `StreamReplaced`.
 
@@ -160,7 +165,7 @@ DISCONNECTED -----> CONNECTING -----> CONNECTED
 
 PostgreSQL is the single source of truth. The bridge opens one `pgx` pool (`stdlib.OpenDB`, max 10 open / 5 idle connections) and serialises every write through a single writer goroutine. The whatsmeow device store uses the same database via `sqlstore.New(ctx, "pgx", databaseURL, ...)`, so credentials and key material live in PostgreSQL — there are no `.db` files and no SQLite anywhere.
 
-Schema is **bridge-owned**: only `bridge/migrations/` creates or alters tables, applied at startup with [golang-migrate](https://github.com/golang-migrate/migrate) (embedded via `iofs`). There are **10 migration pairs**: `000001` and `000003`–`000011` (no `000002`). Never edit a committed migration; add the next numbered pair.
+Schema is **bridge-owned**: only `bridge/migrations/` creates or alters tables, applied at startup with [golang-migrate](https://github.com/golang-migrate/migrate) (embedded via `iofs`). There are **11 migration pairs** through `000012`: `000001` and `000003`–`000012` (no `000002`). Never edit a committed migration; add the next numbered pair.
 
 Key tables and the materialized view:
 
@@ -200,13 +205,15 @@ A bounded background goroutine (gated by `MEDIA_RETRY_ENABLED`) re-downloads **r
 
 An independent single dispatcher leases committed outbox events, signs generic
 Hermes HMAC V2 POSTs, and records bounded retry/terminal state. It never sends
-from a whatsmeow callback or store transaction. Only first supported insertions
-from live incoming events in an explicit allowlist notify; imports, recovery
-origins, self events, edits and duplicate updates do not. Receiver acceptance
-is not agent completion or exactly-once execution. Disabled mode creates no
-new events or HTTP sender; local expiry/pruning runs in bounded minute batches.
-This is the database-handoff pattern plus an optional outbound webhook, not a
-new message bus. Configuration and operational gates are in the linked guide.
+from a whatsmeow callback or store transaction. First supported insertions from
+live remote or own events in exact configured group/operator chats notify;
+imports, recovery origins, edits and duplicate updates do not. The controller
+classifies own events as manual, confirmed Pi-originated context-only, or
+unresolved/uncertain rather than excluding them universally. Receiver acceptance
+is not agent completion or exactly-once execution. Disabled mode creates no new
+events or HTTP sender; local expiry/pruning runs in bounded minute batches. This
+is the database-handoff pattern plus an optional outbound webhook, not a new
+message bus. Configuration and operational gates are in the linked guide.
 
 ### Telemetry
 
@@ -218,7 +225,7 @@ new message bus. Configuration and operational gates are in the linked guide.
 bridge/
 ├── README.md                   This file
 ├── go.mod / go.sum             Module definition and checksums
-├── main.go                     Entry point: config, cooldown marker, lifecycle, graceful shutdown
+├── main.go                     Entry point: config, BridgeHoldExit=78 cooldown marker, lifecycle, graceful shutdown
 ├── config/
 │   └── config.go               Environment-variable parsing and validation
 ├── client/
@@ -270,8 +277,8 @@ bridge/
 │   └── links.go                URL/link extraction from message content
 ├── migrations/
 │   ├── embed.go                go:embed of the .sql migration files
-│   └── 000001 + 000003–000011  golang-migrate up/down pairs (PostgreSQL + pgvector schema)
-└── data/                       Runtime directory for downloaded media + cooldown marker
+│   └── 000001 + 000003–000012  11 up/down pairs; no 000002 (PostgreSQL + pgvector schema)
+└── data/                       Runtime directory for downloaded media + BridgeHoldExit=78 cooldown marker
     └── .gitkeep
 ```
 
@@ -285,11 +292,13 @@ The bridge handles `SIGINT` and `SIGTERM` with an ordered shutdown:
 4. Close the PostgreSQL store: admission closes, the writer drains queued writes, then the `pgx` pool is closed.
 
 A single cleanup path also covers startup errors and pre-connection signals.
-Migration 011 is additive, but an old binary embedding only migrations through
-010 cannot start against version 011. Routine rollback disables notifications
-on a migration-aware binary; destructive down requires separate authorization.
+Migration 012 is additive, but a pre-v2 binary that does not embed the current
+migration cannot start against the version-12 database. Routine rollback disables
+notifications on a migration-aware binary; destructive down requires separate
+authorization. The current inventory is 11 pairs through `000012` (`000001` and
+`000003`–`000012`; no `000002`).
 
-If a shutdown signal arrives before the initial WhatsApp connection is established, the bridge tears down and exits immediately without writing a cooldown marker.
+If a shutdown signal arrives before the initial WhatsApp connection is established, the bridge tears down and exits immediately without writing a `BridgeHoldExit=78` cooldown marker.
 
 ## Logging
 
@@ -320,8 +329,13 @@ The bridge runs golang-migrate `Up()` on every start. Ensure the role in `DATABA
 
 ### QR Code Not Appearing
 
-- Ensure the terminal is wide enough (at least 80 columns).
-- Set `BRIDGE_LOG_LEVEL=debug` and check for connection-setup errors.
+Pair only in an approved operator-private foreground terminal with exact:
+
+```bash
+BRIDGE_MANAGED=false BRIDGE_LOG_LEVEL=info ./whatsapp-bridge
+```
+
+Keep the terminal at least 80 columns wide. Never use debug logging for pairing, and never redirect, record, share, or persist the QR output.
 
 ### Connection Drops Frequently
 
@@ -331,8 +345,8 @@ The bridge runs golang-migrate `Up()` on every start. Ensure the role in `DATABA
 
 ### "TemporaryBan" or "ClientOutdated" Events
 
-- These are permanent disconnects: the bridge writes a 10-minute cooldown marker and exits with code 2.
-- Wait out the cooldown (10 minutes) before restarting.
+- These are permanent disconnects: the bridge writes a 10-minute cooldown marker and returns exported `BridgeHoldExit=78`, the only non-restartable supervisor hold.
+- Wait out the `BridgeHoldExit=78` cooldown (10 minutes) before restarting; panic-like or ordinary status 2 remains restartable.
 - If `ClientOutdated` persists, update only to a reviewed whatsmeow pin (currently `go.mau.fi/whatsmeow@v0.0.0-20261007111105-c386243a72ba`); do not use `@latest`.
 
 ### Port Already in Use
@@ -365,7 +379,7 @@ writes a revision-plus-source-digest directory marked `NONDEPLOYABLE`. This is
 a same-source, same-toolchain check; it is not a claim of reproducibility
 across different Go toolchains or dependency caches.
 
-The host systemd unit must treat exit status 2 as a deliberate cooldown
-(`RestartPreventExitStatus=2`). The pairing QR is emitted on stdout; production
+The host systemd unit must treat exported `BridgeHoldExit=78` as the sole deliberate cooldown
+(`RestartPreventExitStatus=78`); panic-like or ordinary status 2 remains restartable. The pairing QR is emitted on stdout; production
 supervision should discard stdout and pairing must be performed separately in
-an approved private foreground terminal, never captured in the journal.
+an approved private foreground terminal with exact `BRIDGE_MANAGED=false BRIDGE_LOG_LEVEL=info`, never debug and never captured in the journal.

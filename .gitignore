@@ -23,3 +23,18 @@ build/
 /bridge/dist/
 bridge/whatsapp-bridge
 .playwright*
+
+# Root operator environment is never committed; named templates remain allowed.
+/.env
+/.env.*
+!/.env.example
+!/.env.template
+
+# Session controller build/test/runtime artifacts (package-lock.json is committed)
+/session-controller/dist/
+/session-controller/coverage/
+/session-controller/.vitest/
+/session-controller/node_modules/
+/session-controller/*.tsbuildinfo
+/session-controller/runtime/
+/session-controller/sessions/

@@ -34,6 +34,13 @@ const (
 	StatePermanentlyDisconnected = connection.StatePermanentlyDisconnected
 )
 
+// Fixed lifecycle sentinels are aliases of the connection package values so
+// errors.Is retains identity through this package boundary.
+var (
+	ErrQRTimeout           = connection.ErrQRTimeout
+	ErrPermanentDisconnect = connection.ErrPermanentDisconnect
+)
+
 // maxKeepaliveFailures is the number of consecutive keep-alive timeouts after
 // which the client forces a reconnect.
 const maxKeepaliveFailures = 3
@@ -46,6 +53,7 @@ type Client struct {
 	conn    *connection.Connection
 	log     *slog.Logger
 	dataDir string
+	managed bool
 	// The handler registration is removed on terminal shutdown, draining ingress.
 	eventHandlerID uint32
 	stopOnce       sync.Once
@@ -60,9 +68,19 @@ type Client struct {
 // client, attaches event handlers, and prepares (but does not start) the
 // connection state machine.
 func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Logger, options ...Option) (*Client, error) {
-	waLogger := newWALogger(log)
-	dbLog := newWALogger(log.With("component", "wastore"))
+	// Apply options before constructing any dependency so managed mode can select
+	// discard-only dependency logging from the first operation onward.
+	c := &Client{
+		Store:     st,
+		log:       log,
+		dataDir:   dataDir,
+		keepAlive: connection.NewKeepaliveTracker(maxKeepaliveFailures),
+	}
+	for _, option := range options {
+		option(c)
+	}
 
+	waLogger, dbLog := dependencyLoggers(log, c.managed)
 	container, err := sqlstore.New(context.Background(), "pgx", databaseURL, dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("open whatsapp device store: %w", err)
@@ -72,7 +90,9 @@ func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Lo
 	if err != nil {
 		if err == sql.ErrNoRows {
 			deviceStore = container.NewDevice()
-			log.Info("no existing device found, created new device")
+			if !c.managed {
+				log.Info("no existing device found, created new device")
+			}
 		} else {
 			return nil, fmt.Errorf("get first device: %w", err)
 		}
@@ -88,26 +108,24 @@ func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Lo
 	// so having two concurrent reconnect loops is redundant and makes behaviour
 	// non-deterministic. Our loop already handles KeepAliveTimeout events.
 	wa.EnableAutoReconnect = false
-
-	c := &Client{
-		WA:        wa,
-		Store:     st,
-		log:       log,
-		dataDir:   dataDir,
-		keepAlive: connection.NewKeepaliveTracker(maxKeepaliveFailures),
-	}
-
-	// Wire event handlers before creating the connection manager so that
-	// Connected/Disconnected events from the initial connect are handled.
-	conn := connection.NewConnection(wa, log)
-	c.conn = conn
-
-	for _, option := range options {
-		option(c)
-	}
+	c.WA = wa
+	c.conn = connection.NewConnection(wa, log, c.managed)
 	c.eventHandlerID = wa.AddEventHandler(c.handleEvent)
 
 	return c, nil
+}
+
+// WithManagedMode selects managed lifecycle behavior. False preserves the
+// foreground constructor, logging, and QR behavior.
+func WithManagedMode(managed bool) Option {
+	return func(c *Client) { c.managed = managed }
+}
+
+func dependencyLoggers(log *slog.Logger, managed bool) (waLog.Logger, waLog.Logger) {
+	if managed {
+		return waLog.Noop, waLog.Noop
+	}
+	return newWALogger(log), newWALogger(log.With("component", "wastore"))
 }
 
 // Connect starts the WhatsApp connection. If no session exists, it displays
@@ -133,6 +151,29 @@ func (c *Client) Disconnect() {
 // State returns the current connection state.
 func (c *Client) State() ConnectionState {
 	return c.conn.State()
+}
+
+// IsPaired reports authoritative pairing state from the WhatsMeow device ID.
+func (c *Client) IsPaired() bool {
+	return c != nil && c.WA != nil && c.WA.Store != nil && c.WA.Store.ID != nil
+}
+
+// PermanentDisconnects exposes the manager's one-shot fixed terminal event.
+func (c *Client) PermanentDisconnects() <-chan error {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	return c.conn.PermanentDisconnects()
+}
+
+// IsConnected reports the underlying live transport state.
+func (c *Client) IsConnected() bool {
+	return c != nil && c.WA != nil && c.WA.IsConnected()
+}
+
+// IsLoggedIn reports the underlying live login state.
+func (c *Client) IsLoggedIn() bool {
+	return c != nil && c.WA != nil && c.WA.IsLoggedIn()
 }
 
 // DataDir returns the configured data directory.

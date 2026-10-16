@@ -26,9 +26,13 @@ export async function requireBaseline(client: CommandPort): Promise<void> {
   const persistence = await client.sendCommand(['INFO', 'persistence']);
   if (typeof persistence !== 'string' || !/^aof_enabled:1\r?$/m.test(persistence) || !/^aof_last_write_status:ok\r?$/m.test(persistence)) throw new ControllerError('store_unavailable');
 }
-export async function connectRedis(config: ControllerConfig['redis']): Promise<RedisConnections> {
+export type RedisClientFactory = typeof createClient;
+export async function connectRedis(
+  config: ControllerConfig['redis'],
+  clientFactory: RedisClientFactory = createClient
+): Promise<RedisConnections> {
   const options = { url: config.url, RESP: 2 as const, disableOfflineQueue: true, socket: { reconnectStrategy: false as const, connectTimeout: 5000 } };
-  const writer = createClient(options), reader = createClient(options), mapping = createClient(options);
+  const writer = clientFactory(options), reader = clientFactory(options), mapping = clientFactory(options);
   let healthy = true, closing = false, tail: Promise<unknown> = Promise.resolve(), closed: Promise<void> | undefined;
   const broken = () => { healthy = false; };
   for (const client of [writer, reader, mapping]) { client.on('error', broken); client.on('end', broken); }
@@ -37,7 +41,12 @@ export async function connectRedis(config: ControllerConfig['redis']): Promise<R
     await reader.connect();
     await mapping.connect(); await requireBaseline(mapping);
   } catch {
-    for (const client of [mapping, reader, writer]) if (client.isOpen) client.destroy();
+    // Partial startup owns all three constructed clients. A throwing isOpen
+    // getter or destroy must not skip either remaining cleanup attempt, and no
+    // dynamic cleanup exception may replace the public fixed classification.
+    for (const client of [mapping, reader, writer]) {
+      try { if (client.isOpen) client.destroy(); } catch { /* best effort */ }
+    }
     throw new ControllerError('store_unavailable');
   }
   const ready = () => healthy && !closing && writer.isReady && reader.isReady && mapping.isReady;
@@ -60,18 +69,23 @@ export async function connectRedis(config: ControllerConfig['redis']): Promise<R
     close() {
       if (closed) return closed;
       closing = true;
+      let failed = false;
       // Interrupt only blocking reads, never in-flight durable writes.
-      if (reader.isOpen) reader.destroy();
-      closed = tail.then(async () => {
-        const closingClients: Promise<unknown>[] = [];
-        if (mapping.isOpen) closingClients.push(mapping.close());
-        if (writer.isOpen) closingClients.push(writer.close());
-        const settled = await Promise.allSettled(closingClients);
-        if (settled.some(result => result.status === 'rejected')) throw new ControllerError('store_unavailable');
-      }).catch(() => {
-        if (mapping.isOpen) mapping.destroy();
-        if (writer.isOpen) writer.destroy();
-      });
+      try { if (reader.isOpen) reader.destroy(); } catch { failed = true; }
+      closed = (async () => {
+        try { await tail; } catch { failed = true; }
+        const closingClients = [mapping, writer];
+        const settled = await Promise.allSettled(closingClients.map(async client => {
+          if (client.isOpen) await client.close();
+        }));
+        if (settled.some(result => result.status === 'rejected')) failed = true;
+        // A rejected close may leave a socket open. Attempt every destroy before
+        // surfacing one fixed store failure to the lifecycle.
+        for (const client of [reader, ...closingClients]) {
+          try { if (client.isOpen) client.destroy(); } catch { failed = true; }
+        }
+        if (failed) throw new ControllerError('store_unavailable');
+      })();
       return closed;
     }
   };
