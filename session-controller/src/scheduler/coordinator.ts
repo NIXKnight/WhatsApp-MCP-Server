@@ -10,7 +10,7 @@ export const timerWait: WaitPort = {
     catch { if (!signal.aborted) throw new ControllerError('internal_failed'); }
   }
 };
-export interface Coordinator extends DrainPort { start(): Promise<void> }
+export interface Coordinator extends DrainPort { start(): Promise<void>; failClosed(): void }
 export interface CoordinatorOptions {
   scheduler: ControllerConfig['scheduler'];
   pollMs: number; ids: IdSource;
@@ -33,12 +33,16 @@ export function createCoordinator(repository: CoordinatorRepository, options: Co
   const active = new Map<string, Promise<void>>();
   const recovery = createRecovery(repository);
   const stop = new AbortController(), heartbeatStop = new AbortController();
-  let app: Fence | undefined, live = false, started = false, stopped = false, lost = false, position = 0;
+  let app: Fence | undefined, live = false, started = false, stopped = false, position = 0, lossReported = false;
   let startTask: Promise<void> | undefined, loop: Promise<void> = Promise.resolve(), heartbeat: Promise<void> = Promise.resolve();
   const lose = () => {
-    if (lost) return;
-    lost = true; live = false; stopped = true;
-    stop.abort(); heartbeatStop.abort(); emit({ class: 'lease_lost' });
+    if (lossReported) return;
+    lossReported = true;
+    live = false;
+    stopped = true;
+    stop.abort();
+    heartbeatStop.abort();
+    emit({ class: 'lease_lost' });
   };
   const coordinator: Coordinator = {
     start() {
@@ -87,6 +91,7 @@ export function createCoordinator(repository: CoordinatorRepository, options: Co
       })();
       return startTask;
     },
+    failClosed() { lose(); },
     stopScheduling() { stopped = true; stop.abort(); },
     async drain() {
       coordinator.stopScheduling();
