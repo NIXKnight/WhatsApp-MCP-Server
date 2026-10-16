@@ -1,0 +1,28 @@
+name: "${SYNTHETIC_COMPOSE_PROJECT:?set a fresh test-only Compose project name}"
+
+services:
+  redis:
+    profiles: ["synthetic-test-only"]
+    image: redis:7.2.6-bookworm
+    command:
+      - redis-server
+      - --bind
+      - 0.0.0.0
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - ""
+      - --protected-mode
+      - "yes"
+    tmpfs:
+      - /data:rw,noexec,nosuid,nodev,mode=0700
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: "no"

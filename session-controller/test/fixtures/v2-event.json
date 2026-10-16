@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "event_type": "whatsapp.message.received",
+  "event_id": "10101010101010101010101010101010",
+  "message_id": "SYNTHETIC_MESSAGE_41",
+  "event_timestamp": "2033-05-18T03:33:20.123456789Z",
+  "received_at": "2033-05-18T03:33:21Z",
+  "chat_sequence": 41,
+  "sender_jid": "500@s.whatsapp.net",
+  "sender_alt_jid": "500@lid",
+  "is_from_me": false,
+  "chat_kind": "group",
+  "chat_jid": "100@g.us",
+  "canonical_chat_jid": "100@g.us"
+}
