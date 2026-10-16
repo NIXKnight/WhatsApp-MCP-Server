@@ -7,6 +7,7 @@ import { createServer } from 'node:net';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
+import { Duplex } from 'node:stream';
 const argv = new Map(); for (let i = 2; i < process.argv.length; i += 2) argv.set(process.argv[i], process.argv[i + 1]);
 const root = resolve(argv.get('--controller-root') ?? process.env['SYNTHETIC_CONTROLLER_ROOT'] ?? process.cwd());
 const rawBinary = argv.get('--redis-binary') ?? process.env['PHASE10_OWNED_REDIS_BINARY'];
@@ -41,23 +42,52 @@ async function worker() {
     return;
   }
   const m = await modules(), chat = m.domain.canonicalChatId('100@g.us'), policy = { groups: [chat], operatorJids: ['300@lid'] };
-  if (mode === 'expire') { const admin = createClient({ url: `redis://127.0.0.1:${port}/0`, disableOfflineQueue: true, socket: { reconnectStrategy: false } }); admin.on('error', () => {}); await admin.connect(); await admin.hSet(m.keyModule.APP, 'until', '1'); await admin.hSet(m.keyModule.keys(chat).lease, 'until', '1'); await admin.close(); line({ barrier: 'expired' }); return; }
-  const connections = await m.client.connectRedis({ url: `redis://127.0.0.1:${port}/0`, waitAofMs: 2000, blockMs: 10 }); let index;
-  const repo = await m.repository.createRepository(connections, policy, { findEvent: (c, id) => index.findEvent(c, id), classifyOwn: (c, actual, id) => index.classifyOwn(c, actual, id) });
+  const expected = { pid: Number(process.env['SYNTHETIC_REDIS_PID']), runId: process.env['SYNTHETIC_REDIS_RUN_ID'] };
+  if (!Number.isSafeInteger(expected.pid) || expected.pid <= 0 || !/^[0-9a-f]{40}$/.test(expected.runId ?? '')) throw new Error('worker_config_invalid');
+  if (mode === 'expire') { const admin = createClient({ url: `redis://127.0.0.1:${port}/0`, disableOfflineQueue: true, socket: { reconnectStrategy: false } }); admin.on('error', () => {}); try { await admin.connect(); await verifyRedisIdentity(admin, expected); await admin.hSet(m.keyModule.APP, 'until', '1'); await admin.hSet(m.keyModule.keys(chat).lease, 'until', '1'); line({ barrier: 'expired' }); } finally { if (admin.isOpen) admin.destroy(); } return; }
+  const connections = await m.client.connectRedis({ url: `redis://127.0.0.1:${port}/0`, waitAofMs: 2000, blockMs: 10 }); let index, repo, host, runner;
+  try {
+  await verifyConnections(connections, expected);
+  repo = await m.repository.createRepository(connections, policy, { findEvent: (c, id) => index.findEvent(c, id), classifyOwn: (c, actual, id) => index.classifyOwn(c, actual, id) });
   const rows = await Promise.all(repo.chats.map(async c => { const state = await repo.readChat(c); return { chat: c, ...(state.session ? { binding: state.session } : {}) }; }));
   index = m.completion.createCompletionIndex(sessionRoot, policy, { list: async () => rows.map(r => ({ ...r })) }, async (actual, id) => (await repo.ownMutation(actual, id)) === 'uncertain');
-  try {
     if (mode === 'accept' || mode === 'claim') { const accepted = await repo.accept(event(Number(process.env['SYNTHETIC_SEQUENCE']))); if (!['accepted', 'duplicate'].includes(accepted.status)) throw new Error('accept_failed'); if (mode === 'accept') { line({ barrier: 'accepted' }); await new Promise(() => {}); }
       const app = await repo.acquireApp('a'.repeat(32), 120000); if (!app) throw new Error('app_failed'); const claimed = await repo.claimNext(chat, app, 'b'.repeat(32), 120000, 1000); if (claimed.status !== 'claimed') throw new Error('claim_failed'); line({ barrier: 'claimed' }); await new Promise(() => {}); }
-    const host = m.sessionHost.createSessionHost({ cwd: '/tmp', root: sessionRoot, sdk: sdk(turnLog), index, current: async work => { if (!await repo.checkWork(work)) throw new m.domain.ControllerError('lease_lost'); }, bind: async (work, binding) => { const ok = await repo.bindSession(work, binding); if (ok) rows.find(r => r.chat === work.event.canonical_chat_jid).binding = binding; return ok; } });
+    host = m.sessionHost.createSessionHost({ cwd: '/tmp', root: sessionRoot, sdk: sdk(turnLog), index, current: async work => { if (!await repo.checkWork(work)) throw new m.domain.ControllerError('lease_lost'); }, bind: async (work, binding) => { const ok = await repo.bindSession(work, binding); if (ok) rows.find(r => r.chat === work.event.canonical_chat_jid).binding = binding; return ok; } });
     let ids = 0; const turns = { attach: async () => {}, prepare: async () => ({ usagePendingAfterCompaction: false }), run: async (_s, _c, prompt) => prompt(), confirmed: async () => [] };
-    const runner = m.coordinator.createCoordinator(repo, { scheduler: { concurrency: 1, leaseMs: 120000, renewMs: 10000, gapTimeoutMs: 1000 }, pollMs: 10, ids: { next: () => (++ids).toString(16).padStart(32, '0') }, worker: { instructions: () => 'SYNTHETIC', host, turns, wait: m.coordinator.timerWait, diagnostics: { emit() {} } } });
+    runner = m.coordinator.createCoordinator(repo, { scheduler: { concurrency: 1, leaseMs: 120000, renewMs: 10000, gapTimeoutMs: 1000 }, pollMs: 10, ids: { next: () => (++ids).toString(16).padStart(32, '0') }, worker: { instructions: () => 'SYNTHETIC', host, turns, wait: m.coordinator.timerWait, diagnostics: { emit() {} } } });
     await runner.start(); const wanted = Number(process.env['SYNTHETIC_SEQUENCE']); for (let n = 0; n < 1000; n++) { if ((await repo.readChat(chat)).lastCompletedSequence >= wanted) break; await sleep(5); if (n === 999) throw new Error('consume_timeout'); }
     runner.stopScheduling(); await runner.drain(); await host.close(); line({ barrier: 'completed' });
-  } finally { await repo.close(); }
+  } finally {
+    let first;
+    const attempt = async (action, fixed) => { try { await action(); } catch { first ??= new Error(fixed); } };
+    await attempt(async () => { if (runner) { runner.stopScheduling(); await runner.drain(); } }, 'worker_drain_failed');
+    await attempt(async () => { await host?.close(); }, 'worker_host_cleanup_failed');
+    await attempt(() => connections.close(), 'worker_connections_cleanup_failed');
+    if (first) throw first;
+  }
 }
 async function reservePort() { const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening'); const address = server.address(); if (!address || typeof address === 'string') throw new Error('port_failed'); const port = address.port; await new Promise((r, j) => server.close(e => e ? j(e) : r())); return port; }
-async function waitRedis(port) { for (let n = 0; n < 300; n++) { const probe = createClient({ url: `redis://127.0.0.1:${port}/0`, disableOfflineQueue: true, socket: { reconnectStrategy: false, connectTimeout: 100 } }); probe.on('error', () => {}); try { await probe.connect(); await probe.ping(); await probe.close(); return; } catch { if (probe.isOpen) probe.destroy(); await sleep(10); } } throw new Error('redis_start_failed'); }
+function parseRedisIdentity(reply) {
+  if (typeof reply !== 'string' || Buffer.byteLength(reply, 'utf8') > 16384) throw new Error('owned_redis_identity_invalid');
+  const field = name => { const rows = reply.split('\n').map(row => row.replace(/\r$/, '')).filter(row => row.startsWith(`${name}:`)); if (rows.length !== 1) throw new Error('owned_redis_identity_invalid'); return rows[0].slice(name.length + 1); };
+  const pidText = field('process_id'), pid = Number(pidText), runId = field('run_id');
+  if (field('redis_version') !== '7.2.6' || !/^[1-9]\d*$/.test(pidText) || !Number.isSafeInteger(pid) || !/^[0-9a-f]{40}$/.test(runId)) throw new Error('owned_redis_identity_invalid');
+  return { pid, runId };
+}
+async function verifyRedisIdentity(port, expected) { const actual = parseRedisIdentity(await Promise.race([port.sendCommand(['INFO', 'server']), sleep(1000).then(() => { throw new Error('owned_redis_identity_timeout'); })])); if (actual.pid !== expected.pid || actual.runId !== expected.runId) throw new Error('owned_redis_identity_mismatch'); }
+async function verifyConnections(connections, expected) { for (const port of [connections.writer, connections.reader, connections.mapping]) await verifyRedisIdentity(port, expected); }
+function assertRedisLive(child) { if (!child || !Number.isSafeInteger(child.pid) || !child.pid || child.exitCode !== null || child.signalCode !== null) throw new Error('owned_redis_child_not_live'); }
+async function waitRedis(port, child) {
+  for (let n = 0; n < 300; n++) {
+    assertRedisLive(child);
+    const probe = createClient({ url: `redis://127.0.0.1:${port}/0`, disableOfflineQueue: true, socket: { reconnectStrategy: false, connectTimeout: 100 } }); probe.on('error', () => {}); let connected = false;
+    try { await Promise.race([probe.connect(), childClose(child).then(() => { throw new Error('owned_redis_child_not_live'); })]); connected = true; assertRedisLive(child); const identity = parseRedisIdentity(await Promise.race([probe.sendCommand(['INFO', 'server']), childClose(child).then(() => { throw new Error('owned_redis_child_not_live'); }), sleep(1000).then(() => { throw new Error('owned_redis_identity_timeout'); })])); if (identity.pid !== child.pid) throw new Error('owned_redis_identity_mismatch'); await verifyRedisIdentity(probe, identity); assertRedisLive(child); return identity; }
+    catch { assertRedisLive(child); if (connected) throw new Error('owned_redis_identity_mismatch'); await sleep(10); }
+    finally { if (probe.isOpen) probe.destroy(); }
+  }
+  throw new Error('redis_start_failed');
+}
 async function redisChild(port, directory, ownership) {
   const child = trackChild(spawn(binary, ['--bind', '127.0.0.1', '--port', String(port), '--dir', directory, '--appendonly', 'yes', '--appendfsync', 'always', '--maxmemory-policy', 'noeviction', '--save', '', '--daemonize', 'no'], { stdio: 'ignore', env: { PATH: '/usr/bin:/bin' } }));
   const closed = childClose(child).then(result => { ownership.settled = true; return result; });
@@ -95,7 +125,7 @@ async function redisVersion(ownership) {
     throw new Error('redis_version_probe_failed');
   }
 }
-function childBarrier(mode, port, turnLog, sessionRoot, sequence, expected) { const child = trackChild(spawn(process.execPath, [resolve(process.argv[1]), '--controller-root', root, '--redis-binary', binary], { stdio: ['ignore', 'pipe', 'ignore'], env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', SYNTHETIC_CRASH_WORKER: mode, SYNTHETIC_REDIS_PORT: String(port), SYNTHETIC_TURN_LOG: turnLog, SYNTHETIC_SESSION_ROOT: sessionRoot, SYNTHETIC_SEQUENCE: String(sequence) } }));
+function childBarrier(mode, port, turnLog, sessionRoot, sequence, expected, identity) { const child = trackChild(spawn(process.execPath, [resolve(process.argv[1]), '--controller-root', root, '--redis-binary', binary], { stdio: ['ignore', 'pipe', 'ignore'], env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', SYNTHETIC_CRASH_WORKER: mode, SYNTHETIC_REDIS_PORT: String(port), SYNTHETIC_REDIS_PID: String(identity?.pid ?? ''), SYNTHETIC_REDIS_RUN_ID: identity?.runId ?? '', SYNTHETIC_TURN_LOG: turnLog, SYNTHETIC_SESSION_ROOT: sessionRoot, SYNTHETIC_SEQUENCE: String(sequence) } }));
   const barrierCaptureLimit = 4096; let buffered = '', settled = false, stopping = false;
   const barrier = new Promise((ok, fail) => {
     const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timeout); fn(value); };
@@ -113,14 +143,41 @@ function childBarrier(mode, port, turnLog, sessionRoot, sequence, expected) { co
     });
     child.once('exit', code => { if (!stopping && code !== 0) finish(fail, new Error('child_failed')); });
   }); return { child, barrier }; }
-async function delayedCloseTest() { const child = trackChild(spawn(process.execPath, ['-e', "const {spawn}=require('node:child_process');const inherited=spawn(process.execPath,['-e','setTimeout(()=>{},150)'],{stdio:['ignore',1,2]});inherited.unref();"], { stdio: ['ignore', 'pipe', 'pipe'] })); await once(child, 'exit'); let settled = false; void childClose(child).then(() => { settled = true; }); await sleep(10); if (settled) throw new Error('delayed_close_fixture_invalid'); await terminate(child); if (!settled) throw new Error('owned_child_exit_timeout'); line({ status: 'close-settled' }); }
-async function parent() { if (process.env['SYNTHETIC_CRASH_USE_DOCKER'] === '1') throw new Error('docker_opt_in_requires_external_compose_runner'); const versionProbe = { child: undefined }; const redisOwnership = { child: undefined, closed: undefined, settled: true }; let directory, redis, controller;
+async function delayedCloseTest() {
+  // fd 3 belongs to this parent. The ready holder inherits its read side and
+  // stdout/stderr, and cannot exit until this parent ends the release pipe.
+  const holder = "process.stdin.resume();process.stdin.once('end',()=>process.exit(0));process.send('ready');process.disconnect();";
+  const leader = `const {spawn}=require('node:child_process');const held=spawn(process.execPath,['-e',${JSON.stringify(holder)}],{stdio:[3,1,2,'ipc']});held.once('error',()=>process.exit(1));held.once('message',message=>{if(message!=='ready')process.exit(1);held.unref();process.exit(0);});`;
+  let child, releasePipe, closing, deadline;
+  try {
+    child = trackChild(spawn(process.execPath, ['-e', leader], { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] }));
+    const pipe = child.stdio[3]; if (!(pipe instanceof Duplex)) throw new Error('delayed_close_fixture_invalid');
+    releasePipe = pipe; pipe.on('error', () => {});
+    const closePromise = childClose(child); let closeSettled = false, terminationSettled = false;
+    void closePromise.then(() => { closeSettled = true; });
+    await Promise.race([once(child, 'exit'), new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error('delayed_close_exit_timeout')), 2000); })]);
+    clearTimeout(deadline);
+    await new Promise(resolveTurn => setImmediate(resolveTurn));
+    if (child.exitCode !== 0 || closeSettled) throw new Error('delayed_close_fixture_invalid');
+    closing = terminate(child).then(() => { terminationSettled = true; }); void closing.catch(() => {});
+    await new Promise(resolveTurn => setImmediate(resolveTurn));
+    if (closeSettled || terminationSettled) throw new Error('delayed_close_fixture_invalid');
+    pipe.end(); await closing; await closePromise;
+    if (!closeSettled || !terminationSettled) throw new Error('owned_child_exit_timeout');
+  } finally {
+    clearTimeout(deadline); releasePipe?.end();
+    const results = await Promise.allSettled([closing, terminate(child)]);
+    if (results.some(result => result.status === 'rejected')) throw new Error('owned_child_exit_timeout');
+  }
+  line({ status: 'close-settled' });
+}
+async function parent() { if (process.env['SYNTHETIC_CRASH_USE_DOCKER'] === '1') throw new Error('docker_opt_in_requires_external_compose_runner'); const versionProbe = { child: undefined }; const redisOwnership = { child: undefined, closed: undefined, settled: true }; let directory, redis, controller, identity;
   try { const version = await redisVersion(versionProbe); directory = await mkdtemp('/tmp/whatsapp-synthetic-crash-'); const sessionRoot = join(directory, 'sessions'), port = await reservePort(), turnLog = join(directory, 'logical-turns.log');
-    if (process.env['SYNTHETIC_CRASH_TEST_BARRIER_TIMEOUT'] === '1') { const started = childBarrier('never_barrier', port, turnLog, sessionRoot, 0, 'never'); controller = started.child; await started.barrier; throw new Error('barrier_timeout_test_failed'); }
-    redis = await redisChild(port, directory, redisOwnership); await waitRedis(port);
-    { const started = childBarrier('accept', port, turnLog, sessionRoot, 1, 'accepted'); controller = started.child; await started.barrier; } await terminate(controller, 'SIGKILL'); controller = undefined; { const started = childBarrier('consume', port, turnLog, sessionRoot, 1, 'completed'); controller = started.child; await started.barrier; } await terminate(controller); controller = undefined;
-    { const started = childBarrier('claim', port, turnLog, sessionRoot, 2, 'claimed'); controller = started.child; await started.barrier; } await terminate(controller, 'SIGKILL'); controller = undefined; { const started = childBarrier('expire', port, turnLog, sessionRoot, 2, 'expired'); controller = started.child; await started.barrier; } await terminate(controller); controller = undefined; { const started = childBarrier('consume', port, turnLog, sessionRoot, 2, 'completed'); controller = started.child; await started.barrier; } await terminate(controller); controller = undefined;
-    { const started = childBarrier('accept', port, turnLog, sessionRoot, 3, 'accepted'); controller = started.child; await started.barrier; } await terminate(controller, 'SIGKILL'); controller = undefined; await terminate(redis, 'SIGKILL'); if (redisOwnership.child === redis) redisOwnership.child = undefined; redis = undefined; redis = await redisChild(port, directory, redisOwnership); await waitRedis(port); { const started = childBarrier('consume', port, turnLog, sessionRoot, 3, 'completed'); controller = started.child; await started.barrier; } await terminate(controller); controller = undefined;
+    redis = await redisChild(port, directory, redisOwnership); identity = await waitRedis(port, redis);
+    if (process.env['SYNTHETIC_CRASH_TEST_BARRIER_TIMEOUT'] === '1') { const started = childBarrier('never_barrier', port, turnLog, sessionRoot, 0, 'never', identity); controller = started.child; await started.barrier; throw new Error('barrier_timeout_test_failed'); }
+    { const started = childBarrier('accept', port, turnLog, sessionRoot, 1, 'accepted', identity); controller = started.child; await started.barrier; } await terminate(controller, 'SIGKILL'); controller = undefined; { const started = childBarrier('consume', port, turnLog, sessionRoot, 1, 'completed', identity); controller = started.child; await started.barrier; } await terminate(controller); controller = undefined;
+    { const started = childBarrier('claim', port, turnLog, sessionRoot, 2, 'claimed', identity); controller = started.child; await started.barrier; } await terminate(controller, 'SIGKILL'); controller = undefined; { const started = childBarrier('expire', port, turnLog, sessionRoot, 2, 'expired', identity); controller = started.child; await started.barrier; } await terminate(controller); controller = undefined; { const started = childBarrier('consume', port, turnLog, sessionRoot, 2, 'completed', identity); controller = started.child; await started.barrier; } await terminate(controller); controller = undefined;
+    { const started = childBarrier('accept', port, turnLog, sessionRoot, 3, 'accepted', identity); controller = started.child; await started.barrier; } await terminate(controller, 'SIGKILL'); controller = undefined; await terminate(redis, 'SIGKILL'); if (redisOwnership.child === redis) redisOwnership.child = undefined; redis = undefined; const previousIdentity = identity; redis = await redisChild(port, directory, redisOwnership); identity = await waitRedis(port, redis); if (identity.runId === previousIdentity.runId) throw new Error('redis_restart_identity_invalid'); { const started = childBarrier('consume', port, turnLog, sessionRoot, 3, 'completed', identity); controller = started.child; await started.barrier; } await terminate(controller); controller = undefined;
     const turns = (await readFile(turnLog, 'utf8')).trim().split('\n'); if (turns.length !== 3) throw new Error('logical_turn_count_invalid'); line({ status: 'ok', redisVersion: version, queuedRestart: true, pelRestart: true, redisAofRestart: true, logicalTurns: turns.length });
   } finally {
     let cleanupFailure;
