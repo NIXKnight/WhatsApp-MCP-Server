@@ -1,6 +1,6 @@
 # WhatsApp MCP Server
 
-Python FastMCP server exposing 20 WhatsApp tools over the Model Context Protocol. Communicates with the Go WhatsApp bridge via REST HTTP, allowing Claude Code and Claude Desktop to send messages, check unread chats, react to / edit / revoke messages, search history, download and analyze media, and more.
+Python FastMCP server exposing 21 WhatsApp tools over the Model Context Protocol. Communicates with the Go WhatsApp bridge via REST HTTP, allowing Claude Code and Claude Desktop to send messages, check unread chats, react to / edit / revoke messages, search history, download and analyze media, and more.
 
 ## Overview
 
@@ -125,12 +125,13 @@ Add this to `~/.claude/claude_desktop_config.json`:
 
 ## MCP Tools Reference
 
-20 tools across five modules (`src/whatsapp_mcp/tools/`). All tools communicate with the Go bridge and return JSON strings. Errors raise `RuntimeError` with descriptive messages.
+21 tools across five modules (`src/whatsapp_mcp/tools/`). All tools communicate with the Go bridge and return JSON strings. Errors raise `RuntimeError` with descriptive messages.
 
-### Message Tools (10 tools)
+### Message Tools (11 tools)
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
+| `get_message` | `chat_jid`, `message_id` | Retrieve one exact message using its actual source chat JID (`chat_jid`) plus exact message ID (`message_id`); the canonical chat JID selects the conversation/session and is not a substitute storage key |
 | `send_message` | `to`, `text`, `quoted_message_id?`, `quoted_participant?`, `mentions?` | Send a plain-text message to an individual contact; supports optional `mentions` list for @-mentions |
 | `check_new_messages` | `since` (Unix ms), `limit?` (1-500, default 100), `chat_jid?` | Poll for new messages since a Unix millisecond timestamp; optionally restrict to a single chat |
 | `get_messages` | `jid`, `limit?` (default 20, max 500) | Retrieve recent messages from a specific chat (individual or group), newest first |
@@ -141,6 +142,8 @@ Add this to `~/.claude/claude_desktop_config.json`:
 | `edit_message` | `chat_jid`, `message_id`, `new_text` | Edit the text of a message previously sent by this account |
 | `revoke_message` | `chat_jid`, `message_id`, `sender?` | Revoke (delete for everyone) a message; supply `sender` only when an admin revokes another member's message |
 | `check_triggers` | `jids`, `mention_jid?`, `sender_jids?`, `limit?` (default 100), `dry_run?` (default False) | Batched multi-chat check using per-chat server-side watermarks; advances each watermark unless `dry_run` |
+
+Bare-metal `whatsapp-mcp-server.service` still reads `~/.config/whatsapp-bridge/env` together with the bridge, embedder, transcriber, and dashboard units. Treat that file as transitional shared compatibility configuration until a later dedicated-file migration; relay `BRIDGE_NOTIFY_*` and shared notification authentication/admission keys remain in their dedicated files rather than this compatibility file.
 
 ### Contact Tools (2 tools)
 
