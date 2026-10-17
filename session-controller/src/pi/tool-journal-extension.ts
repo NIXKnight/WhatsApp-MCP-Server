@@ -11,6 +11,19 @@ const fields = { send_message: 'to', send_group_message: 'jid', send_auto_messag
 type Tool = keyof typeof fields;
 const toolOf = (name: string): Tool | undefined => Object.keys(fields).find(t => name === `mcp__${WHATSAPP_SERVER}__${t}`) as Tool | undefined;
 const fail = () => new ControllerError('mutation_uncertain');
+const promptFailureCategory = (error: unknown): string => {
+  if (error instanceof ControllerError) return error.code;
+  if (error instanceof Error && error.name === 'AbortError') return 'aborted';
+  const status = typeof error === 'object' && error !== null && 'status' in error ? Number(error.status) : undefined;
+  if (status === 401 || status === 403) return 'authentication';
+  if (status === 429) return 'rate_limit';
+  if (status === 400 || status === 413) return 'request_rejected';
+  if (error instanceof TypeError) return 'transport';
+  return 'unknown';
+};
+const reportPromptFailure = (error: unknown): void => {
+  try { console.error(JSON.stringify({ level: 'ERROR', component: 'journal', event: 'prompt_failed', category: promptFailureCategory(error) })); } catch {}
+};
 const object = (v: unknown): Record<string, unknown> | undefined => v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
 const responseKeys: Record<Tool, readonly ['message_id', 'success']> = {
   send_message: ['message_id', 'success'], send_group_message: ['message_id', 'success'], send_auto_message: ['message_id', 'success'],
@@ -222,6 +235,7 @@ export function createToolJournal(ports: Pick<RedisRepository, 'nativeJournal' |
         }
         if (promptFailed) {
           classifiedPromptFailure = true;
+          reportPromptFailure(promptFailure);
           // A confirmed send is retained, but failure after that side effect is
           // a session failure rather than an unknown mutation outcome.
           if (current.some(a => a.status === 'confirmed')) throw new ControllerError('session_failed');
