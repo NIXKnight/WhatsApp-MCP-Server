@@ -15,7 +15,7 @@ export const MessageIdSchema = Type.String({ minLength: 1, maxLength: 512 });
 export const TimestampSchema = Type.String({ pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+-]\\d{2}:\\d{2})$', maxLength: 40 });
 export const VersionSchema = Type.String({ pattern: '^[A-Za-z0-9._-]{1,64}$' });
 export const StreamIdSchema = Type.String({ pattern: '^(0|[1-9]\\d*)-(0|[1-9]\\d*)$', maxLength: 64 });
-export const ErrorClassSchema = literalSet('config_invalid', 'signature_invalid', 'payload_invalid', 'policy_denied', 'body_too_large', 'body_invalid', 'request_timeout', 'store_unavailable', 'identity_conflict', 'not_ready', 'intake_closed', 'internal_failed', 'listen_failed', 'lease_lost', 'sequence_gap', 'session_failed', 'mutation_uncertain', 'usage_unknown', 'preparation_failed', 'checkpoint_invalid', 'compaction_failed', 'restore_failed');
+export const ErrorClassSchema = literalSet('config_invalid', 'signature_invalid', 'payload_invalid', 'policy_denied', 'body_too_large', 'body_invalid', 'request_timeout', 'store_unavailable', 'identity_conflict', 'not_ready', 'intake_closed', 'internal_failed', 'listen_failed', 'lease_lost', 'sequence_gap', 'session_failed', 'mutation_uncertain', 'usage_unknown', 'preparation_failed', 'checkpoint_invalid', 'compaction_capacity', 'compaction_failed', 'restore_failed');
 export type ErrorClass = Static<typeof ErrorClassSchema>;
 export class ControllerError extends Error {
   constructor(readonly code: ErrorClass) { super(code); this.name = 'ControllerError'; }
@@ -85,7 +85,7 @@ export interface ReadinessPort { isReady(): boolean }
 export interface IntakeLifecycle { stopIntake(): void; close(): Promise<void> }
 export interface DrainPort { stopScheduling(): void; drain(): Promise<void> }
 
-export const PauseReasonSchema = literalSet('lease_lost', 'sequence_gap', 'session_failed', 'mutation_uncertain', 'usage_unknown', 'preparation_failed', 'checkpoint_invalid', 'compaction_failed', 'restore_failed');
+export const PauseReasonSchema = literalSet('lease_lost', 'sequence_gap', 'session_failed', 'mutation_uncertain', 'usage_unknown', 'preparation_failed', 'checkpoint_invalid', 'compaction_capacity', 'compaction_failed', 'restore_failed');
 export type PauseReason = Static<typeof PauseReasonSchema>;
 // Epochs are decimal strings: Redis counters must not round through JS/Lua floats.
 export const FenceSchema = Type.Object({ owner: OpaqueIdSchema, epoch: Type.String({ pattern: '^[1-9]\\d*$', maxLength: 32 }), expiresAtMs: CounterSchema }, closed);
@@ -154,10 +154,37 @@ export const CheckpointV1Schema = Type.Object({
   confirmedToolOutcomes: Type.Array(Type.Object({ attemptId: OpaqueIdSchema, tool: MutationToolSchema, destination: ChatJidSchema, messageId: MessageIdSchema }, closed), { maxItems: 256 })
 }, closed);
 export type CheckpointV1 = Static<typeof CheckpointV1Schema>;
-const checkpointRecordFields = { checkpointId: OpaqueIdSchema, checkpoint: CheckpointV1Schema };
+const FileGenerationIntegerSchema = Type.String({ pattern: '^(0|[1-9]\\d*)$', maxLength: 32 });
+export const SessionFileGenerationSchema = Type.Object({
+  device: FileGenerationIntegerSchema,
+  inode: FileGenerationIntegerSchema,
+  size: FileGenerationIntegerSchema,
+  mtimeNs: FileGenerationIntegerSchema,
+  ctimeNs: FileGenerationIntegerSchema
+}, closed);
+export type SessionFileGeneration = Static<typeof SessionFileGenerationSchema>;
+export const CheckpointRecoveryBindingV1Schema = Type.Object({
+  version: Type.Literal(1),
+  eventId: OpaqueIdSchema,
+  eventFingerprint: EventFingerprintSchema,
+  streamId: StreamIdSchema,
+  session: SessionBindingSchema,
+  generation: SessionFileGenerationSchema
+}, closed);
+export type CheckpointRecoveryBindingV1 = Static<typeof CheckpointRecoveryBindingV1Schema>;
+// `recovery` is optional only so records written before recovery binding was
+// introduced remain readable/reconcilable. Every new prepare must supply the
+// exact stable file generation; Lua refuses generic repair of an unbound record.
+const checkpointRecordFields = {
+  checkpointId: OpaqueIdSchema,
+  checkpoint: CheckpointV1Schema,
+  recovery: Type.Optional(CheckpointRecoveryBindingV1Schema)
+};
 export const CheckpointRecordSchema = Type.Union([
   Type.Object({ ...checkpointRecordFields, phase: Type.Literal('prepared') }, closed),
-  Type.Object({ ...checkpointRecordFields, phase: literalSet('compacted', 'restored'), compactionEntryId: Type.String({ minLength: 1, maxLength: 128 }) }, closed)
+  Type.Object({ ...checkpointRecordFields, phase: Type.Literal('aborted') }, closed),
+  Type.Object({ ...checkpointRecordFields, phase: Type.Literal('compacted'), compactionEntryId: Type.String({ minLength: 1, maxLength: 128 }) }, closed),
+  Type.Object({ ...checkpointRecordFields, phase: Type.Literal('restored'), compactionEntryId: Type.String({ minLength: 1, maxLength: 128 }) }, closed)
 ]);
 export type CheckpointRecord = Static<typeof CheckpointRecordSchema>;
 export interface CheckpointPort {

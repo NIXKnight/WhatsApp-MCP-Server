@@ -137,7 +137,7 @@ export async function runChatWorker(repository: WorkerRepository, initial: Claim
     if (!await repository.complete(work, proof)) throw new ControllerError('lease_lost');
   } catch (error) {
     if (error instanceof ControllerError) {
-      const allowed: readonly PauseReason[] = ['lease_lost', 'sequence_gap', 'session_failed', 'mutation_uncertain', 'usage_unknown', 'preparation_failed', 'checkpoint_invalid', 'compaction_failed', 'restore_failed'];
+      const allowed: readonly PauseReason[] = ['lease_lost', 'sequence_gap', 'session_failed', 'mutation_uncertain', 'usage_unknown', 'preparation_failed', 'checkpoint_invalid', 'compaction_capacity', 'compaction_failed', 'restore_failed'];
       if (allowed.includes(error.code as PauseReason)) reason = error.code as PauseReason;
     }
     if (!lost && options.appCurrent()) {

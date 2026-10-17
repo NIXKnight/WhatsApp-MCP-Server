@@ -1,9 +1,10 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, type ControllerConfig } from './config.js';
+import { loadConfig, loadRecoveryConfig, type ControllerConfig, type RecoveryConfig } from './config.js';
 import {
   ControllerError,
   type CompletionIndexPort,
@@ -11,18 +12,24 @@ import {
   type DiagnosticPort,
   type PiHostPort,
   type PiSessionPort,
-  type WaitPort
+  type WaitPort,
+  type SessionFileGeneration
 } from './domain.js';
 import { createDiagnostics } from './diagnostics.js';
 import { createWebhookServer } from './intake/server.js';
-import { connectRedis } from './redis/client.js';
-import { createRepository, readSessionMappings, type RedisRepository } from './redis/repository.js';
+import { connectRedis, type RedisConnections } from './redis/client.js';
+import { createRepository, legacyCompactionRepairDigest, readSessionMappings, type CompactionRepairClaim, type RedisRepository } from './redis/repository.js';
 import { createCompletionIndex, type CompletionIndex } from './pi/completion-index.js';
 import { loadPromptPolicy } from './pi/prompt-policy.js';
 import { loadNativeSdk, type SdkSession } from './pi/mcp-loader.js';
 import { createToolJournal, type JournalAttachment } from './pi/tool-journal-extension.js';
 import type { CheckpointExtension } from './compaction/checkpoint-extension.js';
 import { createCompactor, type Compactor } from './compaction/compactor.js';
+import { provePreparedCompactionOrphan } from './compaction/orphan-recovery.js';
+import {
+  consumeRecoveryManifest, discardRecoveryManifest, publishRecoveryManifest, stageRecoveryManifest,
+  type StagedRecoveryManifest
+} from './compaction/recovery-manifest.js';
 import { createSessionHost, type SessionHost } from './pi/session-host.js';
 import {
   createCoordinator,
@@ -171,7 +178,9 @@ export function createLazyPiHost(options: {
           import('./compaction/checkpoint-extension.js'),
           createPromptModelRuntime(options.config)
         ]);
-        options.checkpoint.initialize(createCheckpointExtension(options.repository, options.config.compaction));
+        options.checkpoint.initialize(createCheckpointExtension(options.repository, {
+          ...options.config.compaction, sessionDir: options.config.pi.sessionDir
+        }));
         const sdk = await loadNativeSdk(options.config, options.policy, modelRuntime, extensions);
         const host = createSessionHost({
           cwd: options.config.pi.cwd,
@@ -190,7 +199,7 @@ export function createLazyPiHost(options: {
             await context.current();
             const state = await options.repository.readChat(context.work().event.canonical_chat_jid);
             if (!state.session) throw new ControllerError('compaction_failed');
-            return options.checkpoint.run(state.session.sessionId, session, context, seed, instructions, '');
+            return options.checkpoint.run(state.session.sessionId, state.session, session, context, seed, instructions, '');
           }
         });
         initialized = host;
@@ -658,14 +667,280 @@ export async function checkPiInventory(
   }
 }
 
+export interface CompactionRecoveryStatus {
+  readonly status: 'compaction_recovery_complete' | 'compaction_recovery_failed';
+  readonly scanned: number;
+  readonly repaired: number;
+  readonly skipped: number;
+  readonly failed: number;
+}
+interface CompactionRecoveryRepository extends Pick<RedisRepository,
+  'chats' | 'acquireApp' | 'renewApp' | 'releaseApp' | 'createCompactionRepairIntent' |
+  'claimCompactionRepair' | 'releaseCompactionRepair' | 'abortCompactionRepair' |
+  'renew' | 'checkWork' | 'close'> {}
+export interface CompactionRecoveryDependencies {
+  load(): RecoveryConfig;
+  connect(config: RecoveryConfig['redis']): Promise<RedisConnections>;
+  repository(connections: RedisConnections, config: RecoveryConfig): Promise<CompactionRecoveryRepository>;
+  prove(config: RecoveryConfig, claim: CompactionRepairClaim): Promise<SessionFileGeneration>;
+  consumeManifest(path: string): Promise<string>;
+  id(): string;
+  status(value: CompactionRecoveryStatus): void;
+}
+const productionCompactionRecovery: CompactionRecoveryDependencies = {
+  load: loadRecoveryConfig,
+  connect: connectRedis,
+  repository: (connections, config) => createRepository(connections, config.admission, {
+    findEvent: async () => { throw new ControllerError('session_failed'); },
+    classifyOwn: async () => { throw new ControllerError('session_failed'); }
+  }, undefined, { initialize: false }),
+  prove: (config, claim) => provePreparedCompactionOrphan(
+    config.pi.sessionDir, claim.binding, claim.work.event.event_id,
+    claim.checkpoint, config.compaction.checkpointMaxBytes
+  ),
+  consumeManifest: consumeRecoveryManifest,
+  id: () => randomBytes(16).toString('hex'),
+  status(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+};
+function equalPrivateDigest(left: string, right: string): boolean {
+  const a = Buffer.from(left, 'utf8'), b = Buffer.from(right, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+let compactionRecoveryActive = false;
+/** Explicit one-time operator repair. It owns no listener, coordinator, bridge,
+ * Pi runtime, model, MCP process, prompt, provider, or tool execution path. */
+export async function recoverCompactionFailures(
+  overrides: Partial<CompactionRecoveryDependencies> = {}
+): Promise<number> {
+  const dependencies = { ...productionCompactionRecovery, ...overrides };
+  const counts = { scanned: 0, repaired: 0, skipped: 0, failed: 0 };
+  if (compactionRecoveryActive) {
+    dependencies.status({ status: 'compaction_recovery_failed', ...counts, failed: 1 });
+    return 1;
+  }
+  compactionRecoveryActive = true;
+  const restoreConsole = silenceInventoryConsole();
+  let connections: RedisConnections | undefined;
+  let repository: CompactionRecoveryRepository | undefined;
+  let app: Awaited<ReturnType<CompactionRecoveryRepository['acquireApp']>>;
+  try {
+    try {
+      const config = dependencies.load();
+      connections = await dependencies.connect(config.redis);
+      repository = await dependencies.repository(connections, config);
+      app = await repository.acquireApp(dependencies.id(), config.scheduler.leaseMs);
+      if (!app) throw new ControllerError('lease_lost');
+      // A manifest is one-shot operator intent. Bound records do not need one.
+      const legacyIntent = config.manifestPath === undefined
+        ? undefined : await dependencies.consumeManifest(config.manifestPath);
+      for (const chat of repository.chats) {
+        counts.scanned++;
+        const renewedApp = await repository.renewApp(app, config.scheduler.leaseMs);
+        if (!renewedApp) throw new ControllerError('lease_lost');
+        app = renewedApp;
+        const candidate = await repository.claimCompactionRepair(
+          chat, app, dependencies.id(), config.scheduler.leaseMs, legacyIntent
+        );
+        if (candidate.status === 'ineligible') { counts.skipped++; continue; }
+        if (candidate.status !== 'claimed') { counts.failed++; continue; }
+
+        let claim = candidate.claim;
+        let repaired = false, failed = false, heartbeatFailed = false;
+        const stop = new AbortController();
+        const heartbeat = (async () => {
+          while (!stop.signal.aborted) {
+            await timerWait.wait(config.scheduler.renewMs, stop.signal);
+            if (stop.signal.aborted) break;
+            const nextApp = await repository!.renewApp(app!, config.scheduler.leaseMs);
+            if (!nextApp) throw new ControllerError('lease_lost');
+            app = nextApp;
+            claim = { ...claim, work: { ...claim.work, ownership: { ...claim.work.ownership, app: nextApp } } };
+            const ownership = await repository!.renew(claim.work, config.scheduler.leaseMs);
+            if (!ownership) throw new ControllerError('lease_lost');
+            claim = { ...claim, work: { ...claim.work, ownership } };
+          }
+        })().catch(() => { heartbeatFailed = true; });
+        try {
+          const first = await dependencies.prove(config, claim);
+          if (heartbeatFailed) throw new ControllerError('lease_lost');
+          const second = await dependencies.prove(config, claim);
+          if (heartbeatFailed || !isDeepStrictEqual(first, second)) throw new ControllerError('restore_failed');
+          if (!claim.checkpoint.recovery) {
+            const expected = claim.legacyIntentDigest;
+            if (!expected || !equalPrivateDigest(legacyCompactionRepairDigest(claim, second), expected)) {
+              throw new ControllerError('restore_failed');
+            }
+          }
+          // Drain both serialized renewal operations before either terminal
+          // operation can be queued. The validated recovery lease headroom
+          // covers check-work plus durable abort after this final renewal.
+          stop.abort(); await heartbeat;
+          if (heartbeatFailed) throw new ControllerError('lease_lost');
+          if (!await repository.checkWork(claim.work) || !await repository.abortCompactionRepair(claim, second)) {
+            throw new ControllerError('restore_failed');
+          }
+          repaired = true;
+        } catch { failed = true; }
+        finally {
+          stop.abort();
+          try { await heartbeat; } catch { failed = true; }
+          if (!repaired) {
+            try { if (!await repository.releaseCompactionRepair(claim)) failed = true; }
+            catch { failed = true; }
+          }
+        }
+        if (repaired && !failed) counts.repaired++; else counts.failed++;
+      }
+      if (!await repository.releaseApp(app)) counts.failed++;
+      app = undefined;
+    } catch { counts.failed++; }
+    finally {
+      if (app && repository) {
+        try { if (!await repository.releaseApp(app)) counts.failed++; } catch { counts.failed++; }
+      }
+      if (repository) {
+        try { await repository.close(); } catch { counts.failed++; }
+      } else if (connections) {
+        try { await connections.close(); } catch { counts.failed++; }
+      }
+    }
+    const failed = counts.failed > 0;
+    dependencies.status({ status: failed ? 'compaction_recovery_failed' : 'compaction_recovery_complete', ...counts });
+    return failed ? 1 : 0;
+  } finally {
+    restoreConsole();
+    compactionRecoveryActive = false;
+  }
+}
+
+export interface CompactionRecoveryIntentStatus {
+  readonly status: 'compaction_recovery_intent_created' | 'compaction_recovery_intent_failed';
+  readonly scanned: number;
+  readonly eligible: number;
+  readonly failed: number;
+}
+interface CompactionRecoveryManifestDependencies extends CompactionRecoveryDependencies {
+  stageManifest(path: string, digest: string): Promise<StagedRecoveryManifest>;
+  publishManifest(stage: StagedRecoveryManifest): Promise<void>;
+  discardManifest(stage: StagedRecoveryManifest): Promise<void>;
+}
+/** Separate explicit operator step for legacy records. It privately snapshots
+ * one exact Redis tuple, fsyncs an unpublished digest manifest, releases the
+ * repair fence, then atomically publishes that one-shot intent. */
+export async function createCompactionRecoveryManifest(
+  overrides: Partial<CompactionRecoveryManifestDependencies> = {}
+): Promise<number> {
+  const dependencies = {
+    ...productionCompactionRecovery,
+    stageManifest: stageRecoveryManifest,
+    publishManifest: publishRecoveryManifest,
+    discardManifest: discardRecoveryManifest,
+    ...overrides
+  };
+  const counts = { scanned: 0, eligible: 0, failed: 0 };
+  let connections: RedisConnections | undefined, repository: CompactionRecoveryRepository | undefined;
+  let app: Awaited<ReturnType<CompactionRecoveryRepository['acquireApp']>>;
+  const restoreConsole = silenceInventoryConsole();
+  try {
+    try {
+      const config = dependencies.load();
+      if (!config.manifestPath) throw new ControllerError('config_invalid');
+      connections = await dependencies.connect(config.redis);
+      repository = await dependencies.repository(connections, config);
+      app = await repository.acquireApp(dependencies.id(), config.scheduler.leaseMs);
+      if (!app) throw new ControllerError('lease_lost');
+      let digest: string | undefined, selected: CompactionRepairClaim | undefined;
+      let selectedReleased = false, releaseAttempted = false, heartbeatFailed = false;
+      let staged: StagedRecoveryManifest | undefined, published = false;
+      const stop = new AbortController();
+      let heartbeat: Promise<void> | undefined;
+      try {
+        for (const chat of repository.chats) {
+          counts.scanned++;
+          const renewed = await repository.renewApp(app, config.scheduler.leaseMs);
+          if (!renewed) throw new ControllerError('lease_lost');
+          app = renewed;
+          const candidate = await repository.createCompactionRepairIntent(
+            chat, app, dependencies.id(), config.scheduler.leaseMs
+          );
+          if (candidate.status === 'ineligible') continue;
+          if (candidate.status !== 'claimed') throw new ControllerError('restore_failed');
+          counts.eligible++;
+          if (selected) {
+            if (!await repository.releaseCompactionRepair(candidate.claim)) throw new ControllerError('lease_lost');
+            continue;
+          }
+          selected = candidate.claim;
+          heartbeat = (async () => {
+            while (!stop.signal.aborted) {
+              await timerWait.wait(config.scheduler.renewMs, stop.signal);
+              if (stop.signal.aborted) break;
+              const nextApp = await repository!.renewApp(app!, config.scheduler.leaseMs);
+              if (!nextApp) throw new ControllerError('lease_lost');
+              app = nextApp;
+              selected = { ...selected!, work: { ...selected!.work, ownership: {
+                ...selected!.work.ownership, app: nextApp
+              } } };
+              const ownership = await repository!.renew(selected.work, config.scheduler.leaseMs);
+              if (!ownership) throw new ControllerError('lease_lost');
+              selected = { ...selected, work: { ...selected.work, ownership } };
+            }
+          })().catch(() => { heartbeatFailed = true; });
+          const first = await dependencies.prove(config, selected);
+          const second = await dependencies.prove(config, selected);
+          if (heartbeatFailed || !isDeepStrictEqual(first, second)) throw new ControllerError('restore_failed');
+          digest = legacyCompactionRepairDigest(selected, second);
+        }
+        if (counts.eligible !== 1 || !digest || !selected || heartbeatFailed) throw new ControllerError('restore_failed');
+        // The staged inode is durable but cannot be consumed at the configured
+        // path. Keep renewal active for file I/O, then drain it before release.
+        staged = await dependencies.stageManifest(config.manifestPath, digest);
+        stop.abort(); if (heartbeat) await heartbeat;
+        if (heartbeatFailed) throw new ControllerError('lease_lost');
+        releaseAttempted = true;
+        if (!await repository.releaseCompactionRepair(selected)) throw new ControllerError('lease_lost');
+        selectedReleased = true;
+        await dependencies.publishManifest(staged);
+        published = true;
+      } finally {
+        // No selected-fence terminal operation may race a queued app/chat
+        // renewal. A failed terminal release is never retried as success and
+        // its unpublished file can never authorize later recovery.
+        stop.abort(); if (heartbeat) await heartbeat;
+        if (staged && !published) {
+          try { await dependencies.discardManifest(staged); } catch {}
+        }
+        if (selected && !selectedReleased && !releaseAttempted) {
+          try { selectedReleased = await repository.releaseCompactionRepair(selected); } catch {}
+        }
+      }
+      if (heartbeatFailed || !selectedReleased || !published) throw new ControllerError('lease_lost');
+      if (!await repository.releaseApp(app)) counts.failed++;
+      app = undefined;
+    } catch { counts.failed++; }
+    finally {
+      if (app && repository) { try { if (!await repository.releaseApp(app)) counts.failed++; } catch { counts.failed++; } }
+      if (repository) { try { await repository.close(); } catch { counts.failed++; } }
+      else if (connections) { try { await connections.close(); } catch { counts.failed++; } }
+    }
+    const failed = counts.failed > 0;
+    process.stdout.write(`${JSON.stringify({ status: failed ? 'compaction_recovery_intent_failed' : 'compaction_recovery_intent_created', ...counts } satisfies CompactionRecoveryIntentStatus)}\n`);
+    return failed ? 1 : 0;
+  } finally { restoreConsole(); }
+}
+
 export interface CliDependencies {
   lifecycle(): Promise<number>;
   inventory(): Promise<number>;
+  recovery(): Promise<number>;
+  recoveryIntent(): Promise<number>;
   invalid(): void;
 }
 const productionCli: CliDependencies = {
   lifecycle: run,
   inventory: checkPiInventory,
+  recovery: recoverCompactionFailures,
+  recoveryIntent: createCompactionRecoveryManifest,
   invalid: () => { process.stderr.write('{"status":"command_invalid"}\n'); }
 };
 export async function runCli(
@@ -674,6 +949,8 @@ export async function runCli(
 ): Promise<number> {
   if (args.length === 0) return dependencies.lifecycle();
   if (args.length === 1 && args[0] === '--check-pi-inventory') return dependencies.inventory();
+  if (args.length === 1 && args[0] === '--recover-compaction-failures') return dependencies.recovery();
+  if (args.length === 1 && args[0] === '--create-compaction-recovery-manifest') return dependencies.recoveryIntent();
   dependencies.invalid();
   return 2;
 }

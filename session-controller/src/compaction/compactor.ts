@@ -63,7 +63,9 @@ export function createCompactor(options: CompactorOptions): Compactor {
     // Reconcile every latest Redis record, including restored, from one exact
     // durable active-branch entry. Recovery never regenerates a summary, calls
     // the model, or invokes compact; Redis transitions depend only on phase.
-    let settled = latest;
+    // Aborted is terminal historical evidence for an operator-proven orphan. It
+    // deliberately has no Pi compaction entry and therefore needs no restore.
+    let settled = latest?.phase === 'aborted' ? undefined : latest;
     if (settled) {
       const original = settled;
       await context.current(); const recovered = await withRecovery(session).reconcileCheckpoint(original);
@@ -90,7 +92,10 @@ export function createCompactor(options: CompactorOptions): Compactor {
         case 'restored':
           break;
       }
-      await context.current(); settled = await options.repository.checkpoints.latest(context.work().event.canonical_chat_jid);
+      await context.current();
+      const recoveredLatest = await options.repository.checkpoints.latest(context.work().event.canonical_chat_jid);
+      if (recoveredLatest?.phase === 'aborted') throw new ControllerError('restore_failed');
+      settled = recoveredLatest;
       if (!settled || settled.phase !== 'restored' || settled.compactionEntryId !== recovered.entryId ||
           settled.checkpointId !== original.checkpointId || !isDeepStrictEqual(settled.checkpoint, recovered.checkpoint)) throw new ControllerError('restore_failed');
     }

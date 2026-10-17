@@ -1,11 +1,11 @@
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, open, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { CompactionEntry, CompactionResult, ExtensionContext, SessionBeforeCompactEvent, SessionCompactEvent, SessionEntry, SessionStartEvent } from '@earendil-works/pi-coding-agent';
-import { canonicalChatId, ControllerError, eventId, fingerprintEvent, type CheckpointV1, type ClaimedWork, type PiSessionPort } from '../../src/domain.js';
+import { canonicalChatId, ControllerError, eventId, fingerprintEvent, type CheckpointRecord, type CheckpointV1, type ClaimedWork, type PiSessionPort } from '../../src/domain.js';
 import type { ControllerConfig } from '../../src/config.js';
 import { assertSupportedEntries, checkpointIdentity, confirmedHistory, containsSensitive, renderCheckpointSummary, validateCheckpoint } from '../../src/compaction/checkpoint.js';
 import { createCompactor } from '../../src/compaction/compactor.js';
@@ -13,7 +13,7 @@ import { createCheckpointExtension } from '../../src/compaction/checkpoint-exten
 import { BINDING_TYPE, COMPLETION_TYPE, createCompletionIndex } from '../../src/pi/completion-index.js';
 import { MUTATION_TYPE } from '../../src/pi/tool-journal-extension.js';
 import { createSessionHost } from '../../src/pi/session-host.js';
-import type { SdkManager, SdkPort, SdkSession } from '../../src/pi/mcp-loader.js';
+import { loadExactPrepareCompaction, type SdkManager, type SdkPort, type SdkSession } from '../../src/pi/mcp-loader.js';
 import { createJournalTurns, runChatWorker, type TurnContext, type TurnPorts, type WorkerOptions, type WorkerRepository } from '../../src/scheduler/chat-worker.js';
 
 const chat = canonicalChatId('100@g.us'), other = canonicalChatId('200@g.us');
@@ -73,22 +73,48 @@ describe('strict checkpoint and active-branch history', () => {
   });
 });
 
+describe('exact pinned Pi compactability preflight', () => {
+  it('matches deployed post-compaction and sufficient-history branches without model work or mutation', async () => {
+    const prepare = await loadExactPrepareCompaction();
+    const user = (id: string, parentId: string | null, size: number): SessionEntry => ({
+      type: 'message', id, parentId, timestamp: '2033-05-18T03:33:20Z',
+      message: { role: 'user', content: 'x'.repeat(size), timestamp: 1 }
+    });
+    const old = user('OLD', null, 200000);
+    const prior = { type: 'compaction', id: 'PRIOR', parentId: 'OLD', timestamp: '2033-05-18T03:33:21Z',
+      summary: 'PRIOR_SUMMARY', firstKeptEntryId: 'OLD', tokensBefore: 50000 } satisfies SessionEntry;
+    const recent = user('RECENT', 'PRIOR', 1000);
+    const settings = { enabled: false, reserveTokens: 16384, keepRecentTokens: 32768 };
+    expect(prepare([old, prior, recent], settings)).toBeUndefined();
+    const enough = [user('ONE', null, 2000), user('TWO', 'ONE', 2000), user('THREE', 'TWO', 2000)];
+    expect(prepare(enough, { ...settings, keepRecentTokens: 100 })).toBeDefined();
+  });
+});
+
 describe('typed armed Pi 1.1 adapter', () => {
-  it('finishes fallible preparation before one armed manual compaction and persists transitions', async () => {
+  it('finishes compactability and fallible preparation before one armed manual compaction and persists transitions', async () => {
     const phases: string[] = []; let record: { checkpointId: string; phase: 'prepared' | 'compacted' | 'restored'; checkpoint: CheckpointV1; compactionEntryId?: string } | undefined;
+    writeFileSync(binding.sessionFile, '{}\n', { mode: 0o600 });
     const extension = createCheckpointExtension({ checkpoints: {
       prepare: async (_work: ClaimedWork, value: typeof record) => { phases.push('prepared'); record = value; return true; },
       transition: async (_work: ClaimedWork, _id: string, phase: 'compacted' | 'restored', entry: string) => { if (!record) return false; record = { ...record, phase, compactionEntryId: entry }; phases.push(phase); return true; }, latest: async () => record
-    } } as never, compaction);
+    } } as never, { ...compaction, sessionDir: '/tmp' });
     const branch = [{ type: 'message' as const, id: 'SYNTHETIC_KEPT', parentId: null, timestamp: '2033-05-18T03:33:20Z', message: { role: 'user' as const, content: 'hello', timestamp: 1 } }];
     const seed = checkpoint(); let modelCheckpoint: CheckpointV1 = { ...seed, createdAt: '2033-05-18T03:33:24Z' };
+    let compactable = false, providerCalls = 0, preflightGeneration = 'stable', changeAfterProvider = false;
     let returnedVariant: (value: CompactionResult, entry: CompactionEntry) => unknown = value => value;
-    const ctx = { sessionManager: { getSessionId: () => binding.sessionId, getBranch: () => branch, buildSessionProjection: () => ({ entries: [{ sourceEntry: branch[0]!, messages: [branch[0]!.message] }], messages: [branch[0]!.message], thinkingLevel: 'off', model: null }) }, isIdle: () => true, getContextUsage: () => ({ tokens: 9000, contextWindow: 10000, percent: 90 }), model: { id: 'SYNTHETIC_MODEL' }, modelRegistry: { complete: async () => ({ content: [{ type: 'text' as const, text: JSON.stringify(modelCheckpoint) }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }) } } as unknown as ExtensionContext;
+    const ctx = { sessionManager: { getSessionId: () => binding.sessionId, getBranch: () => branch, buildSessionProjection: () => ({ entries: [{ sourceEntry: branch[0]!, messages: [branch[0]!.message] }], messages: [branch[0]!.message], thinkingLevel: 'off', model: null }) }, isIdle: () => true, getContextUsage: () => ({ tokens: 9000, contextWindow: 10000, percent: 90 }), model: { id: 'SYNTHETIC_MODEL' }, modelRegistry: { complete: async () => { providerCalls++; if (changeAfterProvider) preflightGeneration = 'changed'; return ({ content: [{ type: 'text' as const, text: JSON.stringify(modelCheckpoint) }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }); } } } as unknown as ExtensionContext;
     extension.events.sessionStart({ type: 'session_start', reason: 'new' } satisfies SessionStartEvent, ctx);
     const before = { type: 'session_before_compact', preparation: { firstKeptEntryId: 'SYNTHETIC_KEPT', messagesToSummarize: [], turnPrefixMessages: [], isSplitTurn: false, tokensBefore: 9000, fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() }, settings: { enabled: false, reserveTokens: 100, keepRecentTokens: 100 } }, branchEntries: branch, customInstructions: 'SYNTHETIC', reason: 'manual', willRetry: false, signal: new AbortController().signal } satisfies SessionBeforeCompactEvent;
-    const compact = { compact: async () => { phases.push('compact-call'); const supplied = extension.events.beforeCompact(before, ctx); const value = supplied?.compaction; if (!value || !value.usage) throw new Error(); const entry = { type: 'compaction', id: 'SYNTHETIC_ENTRY', parentId: null, timestamp: '2033-05-18T03:33:23Z', summary: value.summary, firstKeptEntryId: value.firstKeptEntryId, tokensBefore: value.tokensBefore, usage: value.usage, details: value.details, fromHook: true } satisfies CompactionEntry; extension.events.compact({ type: 'session_compact', compactionEntry: entry, fromExtension: true, reason: 'manual', willRetry: false } satisfies SessionCompactEvent, ctx); return returnedVariant(value, entry) as CompactionResult; } };
-    await expect(extension.run(binding.sessionId, compact, turn, seed, 'PREPARE', 'SUMMARY')).rejects.toThrow('checkpoint_invalid');
-    expect(phases).toEqual([]); modelCheckpoint = seed;
+    const compact = { compactionPreflight: () => compactable ? preflightGeneration : false, compact: async () => { phases.push('compact-call'); const supplied = extension.events.beforeCompact(before, ctx); const value = supplied?.compaction; if (!value || !value.usage) throw new Error(); const entry = { type: 'compaction', id: 'SYNTHETIC_ENTRY', parentId: null, timestamp: '2033-05-18T03:33:23Z', summary: value.summary, firstKeptEntryId: value.firstKeptEntryId, tokensBefore: value.tokensBefore, usage: value.usage, details: value.details, fromHook: true } satisfies CompactionEntry; extension.events.compact({ type: 'session_compact', compactionEntry: entry, fromExtension: true, reason: 'manual', willRetry: false } satisfies SessionCompactEvent, ctx); return returnedVariant(value, entry) as CompactionResult; } };
+    await expect(extension.run(binding.sessionId, binding, compact, turn, seed, 'PREPARE', 'SUMMARY')).rejects.toThrow('compaction_capacity');
+    expect(phases).toEqual([]); expect(providerCalls).toBe(0);
+    compactable = true;
+    await expect(extension.run(binding.sessionId, binding, compact, turn, seed, 'PREPARE', 'SUMMARY')).rejects.toThrow('checkpoint_invalid');
+    expect(phases).toEqual([]); expect(providerCalls).toBe(1); modelCheckpoint = seed;
+    changeAfterProvider = true; preflightGeneration = 'stable';
+    await expect(extension.run(binding.sessionId, binding, compact, turn, seed, 'PREPARE', 'SUMMARY')).rejects.toThrow('compaction_capacity');
+    expect(phases).toEqual([]); changeAfterProvider = false; preflightGeneration = 'stable';
     const malformedReturned: Array<(value: CompactionResult, entry: CompactionEntry) => unknown> = [
       value => ({ ...value, details: null }),
       value => ({ ...value, details: [] }),
@@ -99,12 +125,17 @@ describe('typed armed Pi 1.1 adapter', () => {
     ];
     for (const variant of malformedReturned) {
       phases.length = 0; returnedVariant = variant;
-      await expect(extension.run(binding.sessionId, compact, turn, seed, 'PREPARE', 'SUMMARY')).rejects.toThrow('compaction_failed');
+      await expect(extension.run(binding.sessionId, binding, compact, turn, seed, 'PREPARE', 'SUMMARY')).rejects.toThrow('compaction_failed');
       expect(phases).toEqual(['prepared', 'compact-call']);
     }
     phases.length = 0; returnedVariant = value => value;
-    const result = await extension.run(binding.sessionId, compact, turn, seed, 'PREPARE', 'SUMMARY');
+    const result = await extension.run(binding.sessionId, binding, compact, turn, seed, 'PREPARE', 'SUMMARY');
+    const preparedGeneration = (record as CheckpointRecord | undefined)?.recovery?.generation;
+    const fileStatus = statSync(binding.sessionFile, { bigint: true });
+    expect(preparedGeneration).toEqual({ device: fileStatus.dev.toString(), inode: fileStatus.ino.toString(),
+      size: fileStatus.size.toString(), mtimeNs: fileStatus.mtimeNs.toString(), ctimeNs: fileStatus.ctimeNs.toString() });
     expect(phases).toEqual(['prepared', 'compact-call']); await result.compacted(); await result.restored(); expect(phases).toEqual(['prepared', 'compact-call', 'compacted', 'restored']);
+    unlinkSync(binding.sessionFile);
   });
 });
 
@@ -211,10 +242,11 @@ describe('merged worker pre-compaction and post-prompt accounting', () => {
       expect.soft(f.effects).not.toContain('begin'); expect.soft(f.effects).not.toContain('prompt');
     }
   });
-  it('runs all four isolated pre-prompt failures with exact pauses before begin/prompt', async () => {
+  it('runs isolated pre-prompt failures with exact pauses before begin/prompt', async () => {
     for (const [reason, make] of [
       ['usage_unknown', () => workerFixture(chat, { tokens: 1, contextWindow: 0, percent: 1 }, undefined, false)],
       ['checkpoint_invalid', () => { const f = workerFixture(); Object.assign(f.session, { history: async () => { throw new ControllerError('checkpoint_invalid'); } }); return f; }],
+      ['compaction_capacity', () => { const f = workerFixture(); Object.assign(f.session, { compact: async () => { throw new ControllerError('compaction_capacity'); } }); return f; }],
       ['compaction_failed', () => { const f = workerFixture(); Object.assign(f.session, { compact: async () => { throw new ControllerError('compaction_failed'); } }); return f; }],
       ['restore_failed', () => { const f = workerFixture(); f.latest({ checkpointId: 'c'.repeat(32), phase: 'prepared', checkpoint: checkpoint() }); return f; }]
     ] as const) {
@@ -236,6 +268,14 @@ describe('merged worker pre-compaction and post-prompt accounting', () => {
       expect(f.effects.includes('transition:compacted')).toBe(phase === 'prepared');
       expect(f.effects.includes('transition:restored')).toBe(phase !== 'restored');
     }
+  });
+  it('treats an aborted checkpoint as terminal history and retries through current usage without reconciliation', async () => {
+    const f = workerFixture(chat, { tokens: 1000, contextWindow: 10000, percent: 10 });
+    f.latest({ checkpointId: 'c'.repeat(32), phase: 'aborted', checkpoint: checkpoint() });
+    await runChatWorker(f.repository, work(), f.options);
+    expect(f.effects).not.toContain('reconcile');
+    expect(f.effects).toContain('prompt');
+    expect(f.effects).toContain('complete');
   });
   it('an unrelated chat progresses while the affected chat fails pre-prompt usage', async () => {
     const bad = workerFixture(chat, { tokens: 1, contextWindow: 0, percent: 1 }, undefined, false); const good = workerFixture(other, { tokens: 1000, contextWindow: 10000, percent: 10 });
