@@ -10,7 +10,7 @@ import {
   type CompletionProof, type CompletionIndexPort, type MutationAttempt, type CheckpointRecord
 } from '../../src/domain.js';
 import { connectRedis, requireBaseline, type RedisConnections, type CommandPort } from '../../src/redis/client.js';
-import { createRepository, readSessionMappings, type RedisRepository } from '../../src/redis/repository.js';
+import { createRepository, legacyCompactionRepairDigest, readSessionMappings, type RedisRepository } from '../../src/redis/repository.js';
 import { APP, GLOBAL_EVENTS, GROUP, keys } from '../../src/redis/keys.js';
 const binary = process.env['SYNTHETIC_REDIS_TEST_BINARY'];
 // Never connect to a supplied URL/service. Only spawn an explicit executable
@@ -35,10 +35,14 @@ function proof(work: ClaimedWork): CompletionProof {
     session: { canonicalChatId: work.event.canonical_chat_jid, sessionId: 'TEST_SESSION', sessionFile: '/tmp/synthetic-session.jsonl' } };
 }
 function checkpoint(work: ClaimedWork): CheckpointRecord {
+  const session = proof(work).session;
   return { checkpointId: 'd'.repeat(32), phase: 'prepared', checkpoint: { version: 1,
     canonicalChatId: work.event.canonical_chat_jid, lastCompletedSequence: work.event.chat_sequence - 1,
     policyVersion: 'test-v1', templateVersion: 'test-v1', createdAt: '2033-05-18T03:33:22Z',
-    goals: [], decisions: [], constraints: [], verifiedFacts: [], pendingWork: [], approvalBoundaries: [], nextSteps: [], confirmedToolOutcomes: [] } };
+    goals: [], decisions: [], constraints: [], verifiedFacts: [], pendingWork: [], approvalBoundaries: [], nextSteps: [], confirmedToolOutcomes: [] },
+    recovery: { version: 1, eventId: work.event.event_id, eventFingerprint: fingerprintEvent(work.event),
+      streamId: work.streamId, session,
+      generation: { device: '1', inode: '1', size: '1', mtimeNs: '1', ctimeNs: '1' } } };
 }
 function attempt(work: ClaimedWork): MutationAttempt {
   return { version: 1, attemptId: 'c'.repeat(32), eventId: work.event.event_id, canonicalChatId: work.event.canonical_chat_jid,
@@ -322,6 +326,114 @@ suite('isolated synthetic Redis 7.2 AOF integration', () => {
     expect(await repository.journal.uncertain(work, 'c'.repeat(32))).toBe(true);
     expect(await repository.journal.confirm(work, 'c'.repeat(32), 'TEST_SENT')).toBe(false);
     expect((await repository.journal.list(chat))[0]?.status).toBe('uncertain'); expect((await repository.readChat(chat)).pause).toBe('mutation_uncertain');
+  });
+  it('does not initialize a missing namespace in recovery mode and requires exact configured state.chat', async () => {
+    const k = keys(other); await admin.del(Object.values(k));
+    const recovery = await createRepository(connections, policy, index, undefined, { initialize: false });
+    expect(await recovery.readChat(other)).toEqual({ canonicalChatId: other, lastCompletedSequence: 0 });
+    expect(await Promise.all(Object.values(k).map(key => admin.exists(key)))).toEqual(Object.values(k).map(() => 0));
+    const app = await recovery.acquireApp(appId, OWNERSHIP_MS); if (!app) throw new Error('synthetic_app_failed');
+    expect((await recovery.claimCompactionRepair(other, app, workerId, OWNERSHIP_MS)).status).toBe('ineligible');
+    expect(await Promise.all(Object.values(k).map(key => admin.exists(key)))).toEqual(Object.values(k).map(() => 0));
+    expect(await recovery.releaseApp(app)).toBe(true);
+  });
+
+  it('binds new checkpoints to the exact event/fingerprint/stream/session and gates legacy repair on private intent', async () => {
+    const work = await claim(), p = proof(work), c = checkpoint(work), k = keys(chat);
+    expect(await repository.bindSession(work, p.session)).toBe(true);
+    expect(await repository.checkpoints.prepare(work, c)).toBe(true);
+    expect(await repository.pause(work, 'compaction_failed')).toBe(true);
+    const bound = await repository.checkpoints.latest(chat);
+    if (!bound || bound.phase !== 'prepared' || !bound.recovery) throw new Error('synthetic_bound_checkpoint_missing');
+    expect(bound.recovery).toEqual({ version: 1, eventId: work.event.event_id,
+      eventFingerprint: fingerprintEvent(work.event), streamId: work.streamId, session: p.session,
+      generation: { device: '1', inode: '1', size: '1', mtimeNs: '1', ctimeNs: '1' } });
+    expect(await repository.releaseApp(work.ownership.app)).toBe(true);
+    const app = await repository.acquireApp('f'.repeat(32), OWNERSHIP_MS); if (!app) throw new Error('synthetic_app_failed');
+
+    const substitutions = [
+      { ...bound, recovery: { ...bound.recovery, eventId: '9'.repeat(32) } },
+      { ...bound, recovery: { ...bound.recovery, eventFingerprint: 'sha256:v1:' + '0'.repeat(64) } },
+      { ...bound, recovery: { ...bound.recovery, streamId: '0-0' } },
+      { ...bound, recovery: { ...bound.recovery, session: { ...bound.recovery.session, sessionId: 'SUBSTITUTED' } } }
+    ];
+    for (const substituted of substitutions) {
+      await admin.set(k.checkpoint, JSON.stringify(substituted));
+      expect((await repository.claimCompactionRepair(chat, app, workerId, OWNERSHIP_MS)).status).toBe('unsafe');
+    }
+    await admin.set(k.checkpoint, JSON.stringify(bound));
+    await admin.hSet(k.state, 'chat', other);
+    expect((await repository.claimCompactionRepair(chat, app, workerId, OWNERSHIP_MS)).status).toBe('ineligible');
+    await admin.hSet(k.state, 'chat', chat);
+
+    const legacy = { checkpointId: bound.checkpointId, phase: bound.phase, checkpoint: bound.checkpoint };
+    await admin.set(k.checkpoint, JSON.stringify(legacy));
+    expect((await repository.claimCompactionRepair(chat, app, workerId, OWNERSHIP_MS)).status).toBe('intent_required');
+    const intentClaim = await repository.createCompactionRepairIntent(chat, app, workerId, OWNERSHIP_MS);
+    expect(intentClaim.status).toBe('claimed');
+    if (intentClaim.status !== 'claimed') throw new Error('synthetic_legacy_intent_claim_failed');
+    const legacyGeneration = { device: '1', inode: '1', size: '1', mtimeNs: '1', ctimeNs: '1' };
+    const intent = legacyCompactionRepairDigest(intentClaim.claim, legacyGeneration);
+    expect(await repository.releaseCompactionRepair(intentClaim.claim)).toBe(true);
+    const candidate = await repository.claimCompactionRepair(chat, app, workerId, OWNERSHIP_MS, intent);
+    expect(candidate.status).toBe('claimed'); if (candidate.status !== 'claimed') throw new Error('synthetic_legacy_claim_failed');
+    expect(candidate.claim.checkpoint.recovery).toBeUndefined();
+    expect(await repository.abortCompactionRepair(candidate.claim, legacyGeneration)).toBe(true);
+    expect((await repository.checkpoints.latest(chat))?.phase).toBe('aborted');
+  });
+
+  it('repairs only a strictly fenced prepared compaction orphan and preserves all queued work state', async () => {
+    const work = await claim();
+    await repository.accept(event(2));
+    const p = proof(work), c = checkpoint(work);
+    expect(await repository.bindSession(work, p.session)).toBe(true);
+    expect(await repository.checkpoints.prepare(work, c)).toBe(true);
+    expect(await repository.pause(work, 'compaction_failed')).toBe(true);
+    expect(await repository.acquireApp('f'.repeat(32), OWNERSHIP_MS)).toBeUndefined();
+    const k = keys(chat);
+    const before = {
+      stream: await admin.xLen(k.stream), pel: await admin.sendCommand(['XPENDING', k.stream, GROUP]),
+      pelEntry: await admin.sendCommand(['XPENDING', k.stream, GROUP, '-', '+', '10']),
+      events: await admin.hLen(k.events), sequences: await admin.hLen(k.sequences),
+      cursor: await admin.hGet(k.state, 'cursor')
+    };
+    expect(await repository.releaseApp(work.ownership.app)).toBe(true);
+    const app = await repository.acquireApp('f'.repeat(32), OWNERSHIP_MS); if (!app) throw new Error('synthetic_app_failed');
+    expect((await repository.claimCompactionRepair(chat, { ...app, epoch: '999' }, 'e'.repeat(32), OWNERSHIP_MS)).status).toBe('lost');
+    await admin.hSet(k.state, 'pause', 'session_failed');
+    expect((await repository.claimCompactionRepair(chat, app, 'e'.repeat(32), OWNERSHIP_MS)).status).toBe('ineligible');
+    await admin.hSet(k.state, 'pause', 'compaction_failed');
+    await admin.hSet(k.state, 'turnEvent', work.event.event_id);
+    expect((await repository.claimCompactionRepair(chat, app, 'e'.repeat(32), OWNERSHIP_MS)).status).toBe('unsafe');
+    await admin.hDel(k.state, 'turnEvent'); await admin.hSet(k.tools, 'TEST', '{}');
+    expect((await repository.claimCompactionRepair(chat, app, 'e'.repeat(32), OWNERSHIP_MS)).status).toBe('unsafe');
+    await admin.del(k.tools);
+    const candidate = await repository.claimCompactionRepair(chat, app, 'e'.repeat(32), OWNERSHIP_MS);
+    expect(candidate.status).toBe('claimed'); if (candidate.status !== 'claimed') throw new Error('synthetic_repair_claim_failed');
+    expect((await repository.claimCompactionRepair(chat, app, '1'.repeat(32), OWNERSHIP_MS)).status).toBe('busy');
+    expect(await repository.checkWork(candidate.claim.work)).toBe(true);
+    const stale = { ...candidate.claim, work: { ...candidate.claim.work, ownership: { ...candidate.claim.work.ownership,
+      chat: { ...candidate.claim.work.ownership.chat, epoch: '999' } } } };
+    expect(await repository.abortCompactionRepair(stale, candidate.claim.checkpoint.recovery!.generation)).toBe(false);
+    expect((await repository.checkpoints.latest(chat))?.phase).toBe('prepared');
+    expect((await repository.readChat(chat)).pause).toBe('compaction_failed');
+    expect(await repository.abortCompactionRepair(candidate.claim, candidate.claim.checkpoint.recovery!.generation)).toBe(true);
+    expect((await repository.checkpoints.latest(chat))?.phase).toBe('aborted');
+    expect((await repository.readChat(chat)).pause).toBeUndefined();
+    expect(await admin.xLen(k.stream)).toBe(before.stream);
+    expect(await admin.sendCommand(['XPENDING', k.stream, GROUP])).toEqual(before.pel);
+    const afterPelEntry = await admin.sendCommand(['XPENDING', k.stream, GROUP, '-', '+', '10']) as unknown[][];
+    const beforePelEntry = before.pelEntry as unknown as unknown[][];
+    expect(afterPelEntry.map(row => [row[0], row[1], row[3]])).toEqual(beforePelEntry.map(row => [row[0], row[1], row[3]]));
+    expect(Number(afterPelEntry[0]?.[2])).toBeGreaterThanOrEqual(Number(beforePelEntry[0]?.[2]));
+    expect(await admin.hLen(k.events)).toBe(before.events);
+    expect(await admin.hLen(k.sequences)).toBe(before.sequences);
+    expect(await admin.hGet(k.state, 'cursor')).toBe(before.cursor);
+    const retry = await repository.claimNext(chat, app, workerId, OWNERSHIP_MS, 1000);
+    expect(retry.status).toBe('claimed'); if (retry.status !== 'claimed') throw new Error('synthetic_retry_claim_failed');
+    const next = { ...checkpoint(retry.work), checkpointId: 'e'.repeat(32) };
+    expect(await repository.checkpoints.prepare(retry.work, next)).toBe(true);
+    expect((await repository.checkpoints.latest(chat))?.checkpointId).toBe(next.checkpointId);
   });
   it('persists mapping/checkpoint; enforces prepared-compacted-restored transitions', async () => {
     const work = await claim(), p = proof(work), c = checkpoint(work); await repository.bindSession(work, p.session);

@@ -1,12 +1,14 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { ExtensionFactory, AgentSession, CompactionResult, ExtensionContext, SessionStartEvent, SessionBeforeCompactEvent, SessionBeforeCompactResult, SessionCompactEvent, SessionCompactFailedEvent, SessionShutdownEvent } from '@earendil-works/pi-coding-agent';
 import { convertToLlm, serializeConversation } from '@earendil-works/pi-coding-agent';
-import { checked, ControllerError, CheckpointV1Schema, type CheckpointV1, type CheckpointRecord } from '../domain.js';
+import { checked, ControllerError, CheckpointV1Schema, fingerprintEvent, type CheckpointV1, type CheckpointRecord, type SessionBinding } from '../domain.js';
 import type { ControllerConfig } from '../config.js';
 import type { TurnContext } from '../scheduler/chat-worker.js';
 import type { RedisRepository } from '../redis/repository.js';
+import type { SdkSession } from '../pi/mcp-loader.js';
 import { assertSupportedEntries, checkpointIdentity, renderCheckpointSummary, validateCheckpoint } from './checkpoint.js';
+import { captureStableSessionFileGeneration } from './orphan-recovery.js';
 interface Armed { checkpointId: string; replacement: Readonly<{ compaction: CompactionResult }>; compactEvent?: SessionCompactEvent; failed: boolean }
 export interface CompactionEventPort {
   sessionStart(event: SessionStartEvent, context: ExtensionContext): void;
@@ -18,11 +20,15 @@ export interface CompactionEventPort {
 export interface CheckpointExtension {
   extension: ExtensionFactory;
   events: CompactionEventPort;
-  run(sessionId: string, session: Pick<AgentSession, 'compact'>, context: TurnContext, seed: CheckpointV1, preparationPrompt: string, summaryPrompt: string): Promise<{ entryId: string; checkpointId: string; checkpoint: CheckpointV1; compacted(): Promise<void>; restored(): Promise<void> }>;
+  run(sessionId: string, binding: SessionBinding, session: Pick<AgentSession, 'compact'> & Pick<SdkSession, 'compactionPreflight'>, context: TurnContext, seed: CheckpointV1, preparationPrompt: string, summaryPrompt: string): Promise<{ entryId: string; checkpointId: string; checkpoint: CheckpointV1; compacted(): Promise<void>; restored(): Promise<void> }>;
 }
 const fixed = () => new ControllerError('compaction_failed');
 function compactionDetails(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function branchGeneration(value: readonly unknown[]): string {
+  try { return createHash('sha256').update('sc:pi-active-branch:v1\0', 'utf8').update(JSON.stringify(value), 'utf8').digest('hex'); }
+  catch { throw fixed(); }
 }
 function freeze<T>(value: T): Readonly<T> {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -30,7 +36,7 @@ function freeze<T>(value: T): Readonly<T> {
   }
   return value;
 }
-export function createCheckpointExtension(repository: Pick<RedisRepository, 'checkpoints'>, config: ControllerConfig['compaction']): CheckpointExtension {
+export function createCheckpointExtension(repository: Pick<RedisRepository, 'checkpoints'>, config: ControllerConfig['compaction'] & { sessionDir: string }): CheckpointExtension {
   const maximumBytes = config.checkpointMaxBytes;
   const armed = new Map<string, Armed>(), runtimes = new Map<string, ExtensionContext>();
   const events = {
@@ -50,7 +56,7 @@ export function createCheckpointExtension(repository: Pick<RedisRepository, 'che
     pi.on('session_compact_failed', events.compactFailed);
     pi.on('session_shutdown', events.shutdown);
   };
-  return { extension, events, async run(id, session, context, seed, preparationPrompt, summaryPrompt) {
+  return { extension, events, async run(id, sessionBinding, session, context, seed, preparationPrompt, summaryPrompt) {
     const runtime = runtimes.get(id);
     if (!runtime || runtime.sessionManager.getSessionId() !== id || !runtime.isIdle()) throw fixed();
     if (armed.has(id)) throw fixed();
@@ -60,7 +66,15 @@ export function createCheckpointExtension(repository: Pick<RedisRepository, 'che
       // Every fallible operation, including branch preparation, model work,
       // checkpoint validation/rendering and durable prepare, precedes arming.
       await context.current();
+      // This is the exact pure prepareCompaction branch/settings decision that
+      // the imminent AgentSession.compact() call will repeat. It must precede
+      // both the checkpoint provider and durable `prepared` write: a required
+      // but impossible compaction is a fixed capacity/configuration pause, not
+      // a provider failure and never a restorable checkpoint.
+      const initialPreflight = session.compactionPreflight?.();
+      if (initialPreflight !== true && typeof initialPreflight !== 'string') throw new ControllerError('compaction_capacity');
       const branch = runtime.sessionManager.getBranch(); assertSupportedEntries(branch);
+      const initialBranchGeneration = branchGeneration(branch);
       const projection = runtime.sessionManager.buildSessionProjection();
       const firstKeptEntryId = projection.entries.at(-1)?.sourceEntry.id;
       const tokensBefore = runtime.getContextUsage()?.tokens;
@@ -74,6 +88,15 @@ export function createCheckpointExtension(repository: Pick<RedisRepository, 'che
       await context.current(); if (!runtime.model) throw fixed();
       const response = await runtime.modelRegistry.complete(runtime.model, { messages: [{ role: 'user', content: [{ type: 'text', text: request }], timestamp: Date.now() }] },
         { maxTokens: Math.min(8192, Math.max(1024, Math.ceil(maximumBytes / 4))), cacheRetention: 'none', sessionId: id });
+      // Provider work is not authority to persist. Re-run the exact pinned Pi
+      // decision immediately and require the same branch/settings generation.
+      await context.current();
+      const finalPreflight = session.compactionPreflight?.();
+      if ((finalPreflight !== true && typeof finalPreflight !== 'string') ||
+          finalPreflight !== initialPreflight ||
+          branchGeneration(runtime.sessionManager.getBranch()) !== initialBranchGeneration) {
+        throw new ControllerError('compaction_capacity');
+      }
       const text = response.content.filter((v): v is { type: 'text'; text: string } => v.type === 'text').map(v => v.text).join('');
       if (!text.trim() || Buffer.byteLength(text, 'utf8') > maximumBytes) throw fixed();
       let parsed: unknown; try { parsed = JSON.parse(text); } catch { throw fixed(); }
@@ -84,8 +107,17 @@ export function createCheckpointExtension(repository: Pick<RedisRepository, 'che
       const result: CompactionResult = { summary: expectedSummary, firstKeptEntryId,
         tokensBefore, usage: response.usage, details: { version: 1, checkpointId, checkpoint } };
       const replacement = freeze(structuredClone({ compaction: result }));
-      const record: CheckpointRecord = { checkpointId, phase: 'prepared', checkpoint };
-      await context.current(); if (!await repository.checkpoints.prepare(context.work(), record)) throw fixed();
+      await context.current();
+      // This stable named-file generation is the last operation before the
+      // durable prepare. Recovery must prove this exact generation, not infer
+      // preparation from mutable JSONL timestamps.
+      const fileGeneration = await captureStableSessionFileGeneration(config.sessionDir, sessionBinding);
+      const work = context.work();
+      const record: CheckpointRecord = { checkpointId, phase: 'prepared', checkpoint, recovery: {
+        version: 1, eventId: work.event.event_id, eventFingerprint: fingerprintEvent(work.event),
+        streamId: work.streamId, session: sessionBinding, generation: fileGeneration
+      } };
+      if (!await repository.checkpoints.prepare(work, record)) throw fixed();
       await context.current();
       const state: Armed = { checkpointId, replacement, failed: false };
       armed.set(id, state); isArmed = true;

@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import Value from 'typebox/value';
-import { loadConfig, validateConfig } from '../src/config.js';
+import { loadConfig, loadRecoveryConfig, validateConfig } from '../src/config.js';
 import { createDiagnostics } from '../src/diagnostics.js';
-import { AcceptanceSchema, canonicalChatId, CheckpointV1Schema, CheckpointRecordSchema, CompletionMarkerSchema, CompletionProofSchema, ControllerError, eventId, MutationStateSchema, OwnershipSchema, WorkStateSchema } from '../src/domain.js';
+import { AcceptanceSchema, canonicalChatId, CheckpointRecoveryBindingV1Schema, CheckpointV1Schema, CheckpointRecordSchema, CompletionMarkerSchema, CompletionProofSchema, ControllerError, eventId, MutationStateSchema, OwnershipSchema, WorkStateSchema } from '../src/domain.js';
 
 const testKey = 'TEST_ONLY_NON_SENSITIVE_HMAC_FIXTURE';
 function environment(): Record<string, string> {
@@ -34,6 +34,7 @@ describe('strict configuration', () => {
     expect(c.admission.groups).toEqual(['100@g.us', '200@g.us']);
     expect(c.admission.operatorJids).toEqual(['300@lid', '400@s.whatsapp.net']);
     expect(c.compaction.headroomPercent).toBe(15);
+    expect(c.compaction.defaultContextWindowTokens).toBe(262144);
     expect(c.bridge).toEqual({ baseUrl: 'http://127.0.0.1:8080', pollMs: 1000, requestTimeoutMs: 2000 });
     const explicit = { ...environment(), SESSION_CONTROLLER_BRIDGE_BASE_URL: 'http://[::1]:18080/', SESSION_CONTROLLER_BRIDGE_POLL_MS: '250', SESSION_CONTROLLER_BRIDGE_REQUEST_TIMEOUT_MS: '750' };
     expect(loadConfig(explicit).bridge).toEqual({ baseUrl: 'http://[::1]:18080', pollMs: 250, requestTimeoutMs: 750 });
@@ -64,6 +65,23 @@ describe('strict configuration', () => {
     const e = environment(); e['BRIDGE_NOTIFY_SECRET'] = 'é'.repeat(15) + 'x'; rejects(e);
     e['BRIDGE_NOTIFY_SECRET'] = 'é'.repeat(16); e['SESSION_CONTROLLER_REDIS_URL'] = 'redis://redis:6379';
     expect(loadConfig(e).redis.url.startsWith('redis://redis:')).toBe(true);
+  });
+  it('loads recovery-only inputs without parsing webhook/provider/MCP secrets', () => {
+    const e = environment();
+    delete e['BRIDGE_NOTIFY_SECRET']; delete e['SESSION_CONTROLLER_PI_CWD'];
+    delete e['SESSION_CONTROLLER_PI_AGENT_DIR']; delete e['SESSION_CONTROLLER_SYSTEM_PROMPT_PATH'];
+    delete e['SESSION_CONTROLLER_PRE_COMPACTION_PATH']; delete e['SESSION_CONTROLLER_COMPACTION_SUMMARY_PATH'];
+    delete e['SESSION_CONTROLLER_MCP_COMMAND']; delete e['SESSION_CONTROLLER_MCP_ARGS_JSON']; delete e['SESSION_CONTROLLER_MCP_CWD'];
+    e['SESSION_CONTROLLER_COMPACTION_RECOVERY_MANIFEST'] = '/tmp/controller-state/recovery.json';
+    const recovery = loadRecoveryConfig(e);
+    expect(recovery).toEqual({
+      admission: { groups: ['100@g.us', '200@g.us'], operatorJids: ['300@lid', '400@s.whatsapp.net'] },
+      redis: { url: 'redis://127.0.0.1:6379/0', waitAofMs: 3000, blockMs: 1000 },
+      scheduler: { leaseMs: 30000, renewMs: 5000 }, pi: { sessionDir: '/tmp/synthetic-sessions' },
+      compaction: { checkpointMaxBytes: 65536 }, manifestPath: '/tmp/controller-state/recovery.json'
+    });
+    expect(() => loadRecoveryConfig({ ...e, SESSION_CONTROLLER_COMPACTION_RECOVERY_MANIFEST: 'relative' })).toThrow('config_invalid');
+    expect(() => loadRecoveryConfig({ ...e, SESSION_CONTROLLER_WAIT_AOF_MS: '7000' })).toThrow('config_invalid');
   });
   it('rejects unknown nested config keys and numeric coercion', () => {
     const c = loadConfig(environment());
@@ -101,9 +119,16 @@ describe('domain contracts and redacted diagnostics', () => {
     expect(Value.Check(CheckpointV1Schema, checkpoint)).toBe(true);
     const record = { checkpointId: 'b'.repeat(32), checkpoint, phase: 'prepared' };
     expect(Value.Check(CheckpointRecordSchema, record)).toBe(true);
+    expect(Value.Check(CheckpointRecordSchema, { ...record, phase: 'aborted' })).toBe(true);
+    expect(Value.Check(CheckpointRecordSchema, { ...record, phase: 'aborted', compactionEntryId: 'TEST_ENTRY1' })).toBe(false);
     expect(Value.Check(CheckpointRecordSchema, { ...record, phase: 'restored' })).toBe(false);
     expect(Value.Check(CheckpointRecordSchema, { ...record, phase: 'restored', compactionEntryId: 'TEST_ENTRY1' })).toBe(true);
     expect(Value.Check(CheckpointV1Schema, { ...checkpoint, extra: 'TEST_EXTRA' })).toBe(false);
+    const recovery = { version: 1, eventId: 'a'.repeat(32), eventFingerprint: 'sha256:v1:' + 'a'.repeat(64),
+      streamId: '1-0', session: proof.session,
+      generation: { device: '1', inode: '2', size: '3', mtimeNs: '4', ctimeNs: '5' } };
+    expect(Value.Check(CheckpointRecoveryBindingV1Schema, recovery)).toBe(true);
+    expect(Value.Check(CheckpointRecoveryBindingV1Schema, { ...recovery, generation: { ...recovery.generation, extra: '6' } })).toBe(false);
   });
   it('emits only fixed class, opaque ID, hash, bounded count and timestamp', () => {
     const lines: string[] = [];

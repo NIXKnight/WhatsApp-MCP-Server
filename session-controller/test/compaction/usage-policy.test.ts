@@ -15,6 +15,20 @@ describe('safe usage policy', () => {
     expect(policy.decide({ tokens: 7000, contextWindow: 8000, percent: 87.5 }, { event: 0, tools: 0, prompt: 0 })).toMatchObject({ status: 'compact', effectiveWindow: 8000, projectedTokens: 7140 });
     expect(policy.decide({ tokens: 8310, contextWindow: 10000, percent: 83.1 }, incoming)).toMatchObject({ status: 'compact', projectedTokens: 8510 });
   });
+  it('applies the 262144 window, 15% headroom, 8192 fixed reserves, and provider cap matrix', () => {
+    const large = createUsagePolicy({ ...config, safeWorkingWindowTokens: 262144,
+      defaultContextWindowTokens: 262144, responseReserveTokens: 4096,
+      preparationReserveTokens: 2048, summaryReserveTokens: 2048 });
+    const none = { event: 0, tools: 0, prompt: 0 };
+    expect(large.decide({ tokens: 50000, contextWindow: 262144, percent: 19.1 }, none)).toMatchObject({
+      status: 'ok', effectiveWindow: 262144, projectedTokens: 58192
+    });
+    expect(large.decide({ tokens: 214630, contextWindow: 262144, percent: 81.9 }, none).status).toBe('ok');
+    expect(large.decide({ tokens: 214631, contextWindow: 262144, percent: 81.9 }, none).status).toBe('compact');
+    expect(large.decide({ tokens: 103220, contextWindow: 131072, percent: 78.8 }, none)).toMatchObject({
+      status: 'compact', effectiveWindow: 131072, projectedTokens: 111412
+    });
+  });
   it.each([
     undefined,
     { tokens: null, contextWindow: 10000, percent: 0 },

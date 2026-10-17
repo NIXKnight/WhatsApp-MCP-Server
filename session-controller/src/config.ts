@@ -16,6 +16,15 @@ export const ConfigSchema = Type.Object({
   compaction: Type.Object({ safeWorkingWindowTokens: integer(1024, 10000000), defaultContextWindowTokens: integer(1024, 10000000), headroomPercent: integer(1, 99), responseReserveTokens: integer(1, 1000000), preparationReserveTokens: integer(1, 1000000), summaryReserveTokens: integer(1, 1000000), checkpointMaxBytes: integer(1024, 262144) }, closed)
 }, closed);
 export type ControllerConfig = Static<typeof ConfigSchema>;
+export const RecoveryConfigSchema = Type.Object({
+  admission: ConfigSchema.properties.admission,
+  redis: ConfigSchema.properties.redis,
+  scheduler: Type.Object({ leaseMs: integer(3000, 300000), renewMs: integer(100, 100000) }, closed),
+  pi: Type.Object({ sessionDir: path }, closed),
+  compaction: Type.Object({ checkpointMaxBytes: integer(1024, 262144) }, closed),
+  manifestPath: Type.Optional(path)
+}, closed);
+export type RecoveryConfig = Static<typeof RecoveryConfigSchema>;
 export function validateConfig(value: unknown): ControllerConfig {
   const c = checked(ConfigSchema, value, 'config_invalid');
   if (c.auth.secret.trim() === '' || c.auth.secret === 'INSECURE_NO_AUTH' || Buffer.byteLength(c.auth.secret, 'utf8') < 32) throw new ControllerError('config_invalid');
@@ -35,7 +44,7 @@ export function validateConfig(value: unknown): ControllerConfig {
   if (b.responseReserveTokens + b.preparationReserveTokens + b.summaryReserveTokens >= window) throw new ControllerError('config_invalid');
   return { ...c, bridge: { ...c.bridge, baseUrl: bridge.origin } };
 }
-export function loadConfig(env: Readonly<Record<string, string | undefined>> = process.env): ControllerConfig {
+function envReaders(env: Readonly<Record<string, string | undefined>>) {
   const required = (key: string): string => { const v = env[key]; if (v === undefined || v === '') throw new ControllerError('config_invalid'); return v; };
   const number = (key: string, fallback?: number): number => {
     const v = env[key];
@@ -44,6 +53,43 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
     const n = Number(v); if (!Number.isSafeInteger(n)) throw new ControllerError('config_invalid'); return n;
   };
   const list = (key: string): string[] => [...new Set(required(key).split(',').map(v => v.trim()))];
+  return { required, number, list };
+}
+function validateRecoveryRedis(value: Static<typeof ConfigSchema>['redis']): void {
+  let u: URL;
+  try { u = new URL(value.url); } catch { throw new ControllerError('config_invalid'); }
+  if (u.protocol !== 'redis:' || !['127.0.0.1', '[::1]', 'localhost', 'redis'].includes(u.hostname) ||
+      u.username || u.password || u.search || u.hash ||
+      (u.pathname !== '' && u.pathname !== '/' && u.pathname !== '/0') ||
+      (u.port && !/^[1-9]\d*$/.test(u.port))) throw new ControllerError('config_invalid');
+}
+/** Recovery deliberately parses only Redis/admission/lease/session proof inputs.
+ * Webhook secrets, provider credentials, prompts, MCP commands and bridge
+ * settings are outside this process and cannot leak through recovery errors. */
+export function loadRecoveryConfig(env: Readonly<Record<string, string | undefined>> = process.env): RecoveryConfig {
+  const { required, number, list } = envReaders(env);
+  const value = checked(RecoveryConfigSchema, {
+    admission: { groups: list('BRIDGE_NOTIFY_GROUP_ALLOWLIST'), operatorJids: list('BRIDGE_NOTIFY_OPERATOR_JIDS') },
+    redis: { url: required('SESSION_CONTROLLER_REDIS_URL'), waitAofMs: number('SESSION_CONTROLLER_WAIT_AOF_MS', 3000), blockMs: number('SESSION_CONTROLLER_BLOCK_MS', 1000) },
+    scheduler: { leaseMs: number('SESSION_CONTROLLER_LEASE_MS', 30000), renewMs: number('SESSION_CONTROLLER_RENEW_MS', 5000) },
+    pi: { sessionDir: required('SESSION_CONTROLLER_SESSION_DIR') },
+    compaction: { checkpointMaxBytes: number('SESSION_CONTROLLER_CHECKPOINT_MAX_BYTES', 65536) },
+    ...(env['SESSION_CONTROLLER_COMPACTION_RECOVERY_MANIFEST'] ? { manifestPath: env['SESSION_CONTROLLER_COMPACTION_RECOVERY_MANIFEST'] } : {})
+  }, 'config_invalid');
+  validateRecoveryRedis(value.redis);
+  // Recovery drains app/chat renewal before terminal check/abort or release.
+  // Reject leases that cannot cover the final serialized durability barriers
+  // plus one renewal interval of scheduling headroom.
+  if (value.scheduler.renewMs * 3 >= value.scheduler.leaseMs ||
+      value.scheduler.renewMs + value.redis.waitAofMs * 4 >= value.scheduler.leaseMs || !isAbsolute(value.pi.sessionDir) ||
+      /[\x00-\x1f]/.test(value.pi.sessionDir) ||
+      (value.manifestPath !== undefined && (!isAbsolute(value.manifestPath) || /[\x00-\x1f]/.test(value.manifestPath)))) {
+    throw new ControllerError('config_invalid');
+  }
+  return value;
+}
+export function loadConfig(env: Readonly<Record<string, string | undefined>> = process.env): ControllerConfig {
+  const { required, number, list } = envReaders(env);
   let args: unknown;
   try { args = JSON.parse(required('SESSION_CONTROLLER_MCP_ARGS_JSON')); } catch { throw new ControllerError('config_invalid'); }
   return validateConfig({
@@ -55,6 +101,6 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
     scheduler: { concurrency: number('SESSION_CONTROLLER_CONCURRENCY', 4), leaseMs: number('SESSION_CONTROLLER_LEASE_MS', 30000), renewMs: number('SESSION_CONTROLLER_RENEW_MS', 5000), gapTimeoutMs: number('SESSION_CONTROLLER_GAP_TIMEOUT_MS', 30000) },
     pi: { cwd: required('SESSION_CONTROLLER_PI_CWD'), agentDir: required('SESSION_CONTROLLER_PI_AGENT_DIR'), sessionDir: required('SESSION_CONTROLLER_SESSION_DIR'), systemPromptPath: required('SESSION_CONTROLLER_SYSTEM_PROMPT_PATH'), preCompactionPath: required('SESSION_CONTROLLER_PRE_COMPACTION_PATH'), compactionSummaryPath: required('SESSION_CONTROLLER_COMPACTION_SUMMARY_PATH'), policyVersion: env['SESSION_CONTROLLER_POLICY_VERSION'] ?? '1', templateVersion: env['SESSION_CONTROLLER_TEMPLATE_VERSION'] ?? '1', ...(env['SESSION_CONTROLLER_PI_PROVIDER'] !== undefined ? { provider: env['SESSION_CONTROLLER_PI_PROVIDER'] } : {}), ...(env['SESSION_CONTROLLER_PI_MODEL'] !== undefined ? { model: env['SESSION_CONTROLLER_PI_MODEL'] } : {}) },
     mcp: { command: required('SESSION_CONTROLLER_MCP_COMMAND'), args, cwd: required('SESSION_CONTROLLER_MCP_CWD') },
-    compaction: { safeWorkingWindowTokens: number('SESSION_CONTROLLER_SAFE_WORKING_WINDOW_TOKENS'), defaultContextWindowTokens: number('SESSION_CONTROLLER_DEFAULT_CONTEXT_WINDOW_TOKENS', 32768), headroomPercent: number('SESSION_CONTROLLER_COMPACTION_HEADROOM_PERCENT', 15), responseReserveTokens: number('SESSION_CONTROLLER_RESPONSE_RESERVE_TOKENS', 4096), preparationReserveTokens: number('SESSION_CONTROLLER_PREPARATION_RESERVE_TOKENS', 2048), summaryReserveTokens: number('SESSION_CONTROLLER_SUMMARY_RESERVE_TOKENS', 2048), checkpointMaxBytes: number('SESSION_CONTROLLER_CHECKPOINT_MAX_BYTES', 65536) }
+    compaction: { safeWorkingWindowTokens: number('SESSION_CONTROLLER_SAFE_WORKING_WINDOW_TOKENS'), defaultContextWindowTokens: number('SESSION_CONTROLLER_DEFAULT_CONTEXT_WINDOW_TOKENS', 262144), headroomPercent: number('SESSION_CONTROLLER_COMPACTION_HEADROOM_PERCENT', 15), responseReserveTokens: number('SESSION_CONTROLLER_RESPONSE_RESERVE_TOKENS', 4096), preparationReserveTokens: number('SESSION_CONTROLLER_PREPARATION_RESERVE_TOKENS', 2048), summaryReserveTokens: number('SESSION_CONTROLLER_SUMMARY_RESERVE_TOKENS', 2048), checkpointMaxBytes: number('SESSION_CONTROLLER_CHECKPOINT_MAX_BYTES', 65536) }
   });
 }

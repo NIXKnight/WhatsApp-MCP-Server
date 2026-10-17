@@ -3,6 +3,7 @@ import type {
   ResourceLoader, SessionManager, SettingsManager
 } from '@earendil-works/pi-coding-agent';
 import type { McpAdapterOptions, ServerEntry } from 'pi-mcp-adapter/types';
+import { createHash } from 'node:crypto';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, parse, resolve } from 'node:path';
@@ -21,6 +22,10 @@ type SdkSessionDelegate = Pick<AgentSession,
   'bindExtensions' | 'setAutoCompactionEnabled' | 'getAllTools' | 'getActiveToolNames' |
   'getCallableToolNames' | 'getToolDefinition' | 'extensionRunner'>;
 export interface SdkSession extends SdkSessionDelegate {
+  /** Exact, synchronous Pi manual-compaction preparation probe. A successful
+   * probe returns a private digest of the exact branch/model/settings snapshot,
+   * allowing the caller to require an identical immediate second probe. */
+  compactionPreflight?(): string | boolean;
   dispose(): void | Promise<void>;
 }
 export interface SdkPort {
@@ -39,6 +44,20 @@ export type NativeSdkLoadMode =
     };
 type PiSdkModule = typeof import('@earendil-works/pi-coding-agent');
 export type PiSdkImporter = () => Promise<PiSdkModule>;
+export type ExactPrepareCompaction = (
+  entries: ReturnType<SessionManager['getBranch']>,
+  settings: ReturnType<SettingsManager['getCompactionSettings']>
+) => unknown;
+export async function loadExactPrepareCompaction(): Promise<ExactPrepareCompaction> {
+  // Pi 1.1.0 does not re-export prepareCompaction from its package root. Resolve
+  // the pinned installed entry point and load the exact internal pure function
+  // used by AgentSession.compact(), rather than duplicating its cut-point logic.
+  const entry = import.meta.resolve('@earendil-works/pi-coding-agent');
+  const moduleUrl = new URL('./core/compaction/compaction.js', entry);
+  const loaded = await import(moduleUrl.href) as { prepareCompaction?: unknown };
+  if (typeof loaded.prepareCompaction !== 'function') throw new ControllerError('config_invalid');
+  return loaded.prepareCompaction as ExactPrepareCompaction;
+}
 type AdapterMcpConfig = NonNullable<McpAdapterOptions['config']>;
 type ControllerMcpServer = ServerEntry & {
   command: string; args: string[]; cwd: string; env: Record<string, string>;
@@ -366,7 +385,9 @@ export async function loadNativeSdk(
   if (Object.prototype.hasOwnProperty.call(process.env, 'MCP_DIRECT_TOOLS')) {
     throw new ControllerError('config_invalid');
   }
-  const [sdk, adapterModule] = await Promise.all([importSdk(), importAdapter()]);
+  const [sdk, adapterModule, exactPrepareCompaction] = await Promise.all([
+    importSdk(), importAdapter(), loadExactPrepareCompaction()
+  ]);
   const adapter = adapterModule.createMcpAdapter({ config: createControllerMcpConfig(config) });
   const statusBySession = new WeakMap<SdkSession, AdapterStatusTracker>();
   return {
@@ -481,6 +502,19 @@ export async function loadNativeSdk(
         getActiveToolNames: session.getActiveToolNames.bind(session),
         getCallableToolNames: session.getCallableToolNames.bind(session),
         getToolDefinition: session.getToolDefinition.bind(session),
+        compactionPreflight() {
+          const selected = session.model;
+          if (!selected || !session.isIdle) return false;
+          const branch = session.sessionManager.getBranch();
+          const settings = session.settingsManager.getCompactionSettings(selected);
+          if (exactPrepareCompaction(branch, settings) === undefined) return false;
+          try {
+            return 'sha256:v1:' + createHash('sha256')
+              .update('sc:pi-compaction-preflight:v1\0', 'utf8')
+              .update(JSON.stringify([selected.provider, selected.id, settings, branch]), 'utf8')
+              .digest('hex');
+          } catch { return false; }
+        },
         dispose() {
           disposing ??= (async () => {
             try { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); }

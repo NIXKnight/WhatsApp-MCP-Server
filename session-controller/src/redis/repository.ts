@@ -1,14 +1,15 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { Type } from 'typebox';
 import {
-  checked, ControllerError, OpaqueIdSchema, StreamIdSchema, FenceSchema, OwnershipSchema, ChatStateSchema,
+  checked, ControllerError, OpaqueIdSchema, StreamIdSchema, FenceSchema, OwnershipSchema, ChatStateSchema, NotificationV2Schema,
   SessionBindingSchema, CompletionProofSchema, MutationAttemptSchema, MutationStateSchema,
-  CheckpointRecordSchema, PauseReasonSchema, MessageIdSchema, EventFingerprintSchema, ChatJidSchema, fingerprintEvent, systemClock,
+  CheckpointRecordSchema, CheckpointRecoveryBindingV1Schema, SessionFileGenerationSchema, PauseReasonSchema, MessageIdSchema, EventFingerprintSchema, ChatJidSchema, fingerprintEvent, systemClock,
   type AdmissionPolicy, type CanonicalChatId, type CompletionIndexPort,
   type WorkRepository, type Fence, type ChatState, type ClaimedWork, type SessionBinding,
   type Ownership, type PauseReason, type CompletionProof, type MutationAttempt, type MutationState,
   type MutationJournalPort, type CheckpointPort, type CheckpointRecord, type ClaimResult,
-  type Acceptance, type Clock
+  type Acceptance, type Clock, type SessionFileGeneration, type NotificationV2
 } from '../domain.js';
 import { parsePayload } from '../intake/payload.js';
 import { strings, type RedisConnections } from './client.js';
@@ -20,6 +21,7 @@ const recoveryDeletedCount = Type.Integer({ minimum: 0, maximum: 1280 });
 const absoluteMilliseconds = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 const positiveAbsoluteMilliseconds = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
 const entryId = Type.String({ minLength: 1, maxLength: 128 });
+const legacyIntent = Type.String({ pattern: '^sha256:v1:[0-9a-f]{64}$', minLength: 74, maxLength: 74 });
 const JournalEnvelopeSchema = Type.Object({ version: Type.Literal(1), eventFingerprint: EventFingerprintSchema,
   session: SessionBindingSchema, state: MutationStateSchema }, { additionalProperties: false });
 function journalState(raw: string, chat: CanonicalChatId): MutationState {
@@ -35,6 +37,22 @@ function journalRecord(raw: string, chat: CanonicalChatId) {
 function json(raw: string): unknown {
   try { return JSON.parse(raw); } catch { throw new ControllerError('store_unavailable'); }
 }
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+  if (!value || typeof value !== 'object') throw new ControllerError('checkpoint_invalid');
+  return '{' + Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, child]) => JSON.stringify(key) + ':' + canonicalJson(child)).join(',') + '}';
+}
+function legacyRepairDigest(event: NotificationV2, streamId: string, session: SessionBinding,
+  checkpoint: Extract<CheckpointRecord, { phase: 'prepared' }>, generation: SessionFileGeneration): string {
+  const exactGeneration = checked(SessionFileGenerationSchema, generation, 'restore_failed');
+  const exactEvent = checked(NotificationV2Schema, event, 'restore_failed');
+  const material = canonicalJson({ version: 1, domain: 'sc:legacy-compaction-repair:v3',
+    event: { value: exactEvent, eventFingerprint: fingerprintEvent(exactEvent), streamId },
+    session: binding(session), checkpoint, generation: exactGeneration });
+  return 'sha256:v1:' + createHash('sha256').update(material, 'utf8').digest('hex');
+}
 function binding(value: SessionBinding): SessionBinding {
   const b = checked(SessionBindingSchema, value, 'session_failed');
   return { canonicalChatId: b.canonicalChatId, sessionId: b.sessionId, sessionFile: b.sessionFile };
@@ -45,8 +63,37 @@ function verifiedProof(value: unknown, chat: CanonicalChatId, id: string): Compl
   return p;
 }
 export type PelRecovery = { status: 'ok'; next: string; claimed: number; deleted: number } | { status: 'lost' | 'busy' | 'paused' };
+export interface CompactionRepairClaim {
+  readonly work: ClaimedWork;
+  readonly binding: SessionBinding;
+  readonly checkpoint: Extract<CheckpointRecord, { phase: 'prepared' }>;
+  /** Present only for an explicitly authorized legacy repair. Never log it. */
+  readonly legacyIntentDigest?: string;
+}
+export function legacyCompactionRepairDigest(claim: CompactionRepairClaim, generation: SessionFileGeneration): string {
+  if (claim.checkpoint.recovery) throw new ControllerError('checkpoint_invalid');
+  return legacyRepairDigest(claim.work.event, claim.work.streamId, claim.binding, claim.checkpoint, generation);
+}
+function samePrivateDigest(left: string, right: string): boolean {
+  const a = Buffer.from(left, 'utf8'), b = Buffer.from(right, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+export type CompactionRepairClaimResult =
+  | { status: 'claimed'; claim: CompactionRepairClaim }
+  | { status: 'ineligible' | 'intent_required' | 'unsafe' | 'busy' | 'lost' };
 export interface RedisRepository extends WorkRepository {
   recoverPending(chat: CanonicalChatId, app: Fence, consumer: string, start: string, count: number): Promise<PelRecovery>;
+  /** Acquire the exact repair fence for one eligible unbound legacy tuple.
+   * The caller must prove its file and explicitly release the fence. */
+  createCompactionRepairIntent(chat: CanonicalChatId, app: Fence, owner: string, leaseMs: number): Promise<CompactionRepairClaimResult>;
+  /** Recovery-only lease acquisition. It never claims/acks/deletes a stream row.
+   * An unbound legacy record additionally requires a private expected-state digest. */
+  claimCompactionRepair(chat: CanonicalChatId, app: Fence, owner: string, leaseMs: number, legacyIntentDigest?: string): Promise<CompactionRepairClaimResult>;
+  /** Release only the exact repair chat fence; prepared/pause state is retained. */
+  releaseCompactionRepair(claim: CompactionRepairClaim): Promise<boolean>;
+  /** Atomically re-proves Redis-side orphan conditions and every durable binding,
+   * marks prepared aborted, clears only compaction_failed, and releases repair. */
+  abortCompactionRepair(claim: CompactionRepairClaim, generation: SessionFileGeneration): Promise<boolean>;
   checkWork(work: ClaimedWork): Promise<boolean>;
   turnState(work: ClaimedWork): Promise<'fresh' | 'started' | 'lost'>;
   beginTurn(work: ClaimedWork): Promise<boolean>;
@@ -83,7 +130,8 @@ export async function readSessionMappings(
     return { chat, binding: parsed };
   }));
 }
-export async function createRepository(connections: RedisConnections, policy: AdmissionPolicy, completions: CompletionIndexPort, clock: Clock = systemClock): Promise<RedisRepository> {
+export async function createRepository(connections: RedisConnections, policy: AdmissionPolicy, completions: CompletionIndexPort,
+  clock: Clock = systemClock, options: { initialize?: boolean } = {}): Promise<RedisRepository> {
   const admission = { groups: [...policy.groups], operatorJids: [...policy.operatorJids] };
   const chats = configuredChats(admission);
   const allowed = (chat: CanonicalChatId) => { if (!chats.includes(chat)) throw new ControllerError('policy_denied'); };
@@ -94,7 +142,9 @@ export async function createRepository(connections: RedisConnections, policy: Ad
   const write = (chat: CanonicalChatId, args: readonly string[]) => connections.durable(() => evalScript(chat, args));
   const read = (chat: CanonicalChatId, args: readonly string[]) => connections.serial(() => evalScript(chat, args));
   const first = chats[0]; if (first === undefined) throw new ControllerError('config_invalid');
-  for (const chat of chats) if ((await write(chat, ['init', chat, GROUP]))[0] !== 'ok') throw new ControllerError('store_unavailable');
+  if (options.initialize !== false) {
+    for (const chat of chats) if ((await write(chat, ['init', chat, GROUP]))[0] !== 'ok') throw new ControllerError('store_unavailable');
+  }
   const owner = (v: string) => checked(OpaqueIdSchema, v, 'lease_lost');
   const ms = (v: number) => String(checked(duration, v, 'config_invalid'));
   const argsFor = (work: ClaimedWork): string[] => {
@@ -245,10 +295,14 @@ export async function createRepository(connections: RedisConnections, policy: Ad
       });
     },
     checkpoints: {
-      prepare(work, value: CheckpointRecord) {
+      async prepare(work, value: CheckpointRecord) {
         const r = checked(CheckpointRecordSchema, value, 'checkpoint_invalid');
-        if (r.phase !== 'prepared' || r.checkpoint.canonicalChatId !== work.event.canonical_chat_jid || r.checkpoint.lastCompletedSequence !== work.event.chat_sequence - 1) return Promise.resolve(false);
-        return ownedWrite(work, 'checkpoint-prepare', [JSON.stringify(r)]);
+        if (r.phase !== 'prepared' || !r.recovery || r.checkpoint.canonicalChatId !== work.event.canonical_chat_jid ||
+            r.checkpoint.lastCompletedSequence !== work.event.chat_sequence - 1) return false;
+        const recovery = checked(CheckpointRecoveryBindingV1Schema, r.recovery, 'checkpoint_invalid');
+        if (recovery.eventId !== work.event.event_id || recovery.eventFingerprint !== fingerprintEvent(work.event) ||
+            recovery.streamId !== work.streamId || recovery.session.canonicalChatId !== work.event.canonical_chat_jid) return false;
+        return ownedWrite(work, 'checkpoint-prepare', [JSON.stringify(r), JSON.stringify(binding(recovery.session))]);
       },
       async transition(work, checkpointId, phase, compactionEntryId) {
         const id = checked(OpaqueIdSchema, checkpointId, 'checkpoint_invalid');
@@ -276,6 +330,99 @@ export async function createRepository(connections: RedisConnections, policy: Ad
       const claimed = checked(Type.Integer({ minimum: 0, maximum: 128 }), Number(r[2]), 'store_unavailable');
       const deleted = checked(recoveryDeletedCount, Number(r[3]), 'store_unavailable');
       return { status: 'ok', next, claimed, deleted };
+    },
+    async createCompactionRepairIntent(chat, app, id, leaseMs) {
+      checked(FenceSchema, app, 'lease_lost');
+      const r = await write(chat, ['repair-intent', app.owner, app.epoch, owner(id), ms(leaseMs), GROUP, chat]);
+      if (r[0] === 'ineligible' || r[0] === 'unsafe' || r[0] === 'busy' || r[0] === 'lost') return { status: r[0] };
+      if (r[0] !== 'claimed' || !r[1] || !r[2] || !r[3] || !r[4] || !r[5] || !r[6]) throw new ControllerError('store_unavailable');
+      try {
+        const event = parsePayload(Buffer.from(r[2]), admission);
+        const parsedBinding = binding(checked(SessionBindingSchema, json(r[3]), 'session_failed'));
+        const prepared = checked(CheckpointRecordSchema, json(r[4]), 'checkpoint_invalid');
+        if (event.canonical_chat_jid !== chat || parsedBinding.canonicalChatId !== chat || prepared.phase !== 'prepared' ||
+            prepared.recovery || prepared.checkpoint.canonicalChatId !== chat ||
+            prepared.checkpoint.lastCompletedSequence !== event.chat_sequence - 1) throw new ControllerError('checkpoint_invalid');
+        const work = { streamId: checked(StreamIdSchema, r[1], 'store_unavailable'), event, ownership: checked(OwnershipSchema, {
+          app, chat: { owner: id, epoch: r[5], expiresAtMs: Number(r[6]) }
+        }, 'store_unavailable') };
+        return { status: 'claimed', claim: { work, binding: parsedBinding, checkpoint: prepared } };
+      } catch {
+        try { await write(chat, ['repair-release-fence', app.owner, app.epoch, id, r[5]]); } catch {}
+        throw new ControllerError('checkpoint_invalid');
+      }
+    },
+    async claimCompactionRepair(chat, app, id, leaseMs, legacyIntentDigest) {
+      checked(FenceSchema, app, 'lease_lost');
+      const intent = legacyIntentDigest === undefined ? '' : checked(legacyIntent, legacyIntentDigest, 'config_invalid');
+      const r = await write(chat, ['repair-claim', app.owner, app.epoch, owner(id), ms(leaseMs), GROUP, chat, intent]);
+      if (r[0] === 'ineligible' || r[0] === 'intent_required' || r[0] === 'unsafe' || r[0] === 'busy' || r[0] === 'lost') return { status: r[0] };
+      if (r[0] !== 'claimed' || !r[1] || !r[2] || !r[3] || !r[4] || !r[5] || !r[6]) throw new ControllerError('store_unavailable');
+      try {
+        const event = parsePayload(Buffer.from(r[2]), admission);
+        if (event.canonical_chat_jid !== chat) throw new ControllerError('store_unavailable');
+        const parsedBinding = binding(checked(SessionBindingSchema, json(r[3]), 'session_failed'));
+        if (parsedBinding.canonicalChatId !== chat) throw new ControllerError('session_failed');
+        const checkpoint = checked(CheckpointRecordSchema, json(r[4]), 'checkpoint_invalid');
+        if (checkpoint.phase !== 'prepared' || checkpoint.checkpoint.canonicalChatId !== chat ||
+            checkpoint.checkpoint.lastCompletedSequence !== event.chat_sequence - 1) throw new ControllerError('checkpoint_invalid');
+        const work = { streamId: r[1], event, ownership: checked(OwnershipSchema, {
+          app, chat: { owner: id, epoch: r[5], expiresAtMs: Number(r[6]) }
+        }, 'store_unavailable') };
+        if (checkpoint.recovery) {
+          const recovery = checked(CheckpointRecoveryBindingV1Schema, checkpoint.recovery, 'checkpoint_invalid');
+          if (recovery.eventId !== event.event_id || recovery.eventFingerprint !== fingerprintEvent(event) ||
+              recovery.streamId !== work.streamId || !isDeepStrictEqual(recovery.session, parsedBinding)) {
+            throw new ControllerError('checkpoint_invalid');
+          }
+        } else if (!intent) {
+          throw new ControllerError('checkpoint_invalid');
+        }
+        const claim: CompactionRepairClaim = {
+          work, binding: parsedBinding, checkpoint,
+          ...(checkpoint.recovery ? {} : { legacyIntentDigest: intent })
+        };
+        // The one-shot manifest is stored on this exact repair fence. Its
+        // closed tuple+file-generation digest is checked only after strict
+        // filesystem proof, immediately before abort.
+        return { status: 'claimed', claim };
+      } catch {
+        // Lua already granted a repair fence. Even malformed/substituted reply
+        // evidence must not strand ownership while the prepared pause remains.
+        try { await write(chat, ['repair-release-fence', app.owner, app.epoch, id, r[5]]); } catch {}
+        throw new ControllerError('checkpoint_invalid');
+      }
+    },
+    async releaseCompactionRepair(claim) {
+      const { work, binding: expectedBinding, checkpoint: prepared } = claim;
+      checked(SessionBindingSchema, expectedBinding, 'session_failed');
+      checked(CheckpointRecordSchema, prepared, 'checkpoint_invalid');
+      if (prepared.phase !== 'prepared') return false;
+      return (await write(work.event.canonical_chat_jid, ['repair-release', ...argsFor(work),
+        JSON.stringify(binding(expectedBinding))]))[0] === 'ok';
+    },
+    async abortCompactionRepair(claim, fileGeneration) {
+      const { work, binding: expectedBinding, checkpoint: prepared } = claim;
+      checked(SessionBindingSchema, expectedBinding, 'session_failed');
+      checked(CheckpointRecordSchema, prepared, 'checkpoint_invalid');
+      const provedGeneration = checked(SessionFileGenerationSchema, fileGeneration, 'restore_failed');
+      if (prepared.phase !== 'prepared' || expectedBinding.canonicalChatId !== work.event.canonical_chat_jid) return false;
+      if (prepared.recovery && (prepared.recovery.eventId !== work.event.event_id ||
+          prepared.recovery.eventFingerprint !== fingerprintEvent(work.event) ||
+          prepared.recovery.streamId !== work.streamId || !isDeepStrictEqual(prepared.recovery.session, expectedBinding) ||
+          !isDeepStrictEqual(prepared.recovery.generation, provedGeneration))) return false;
+      const intent = claim.legacyIntentDigest === undefined ? '' : checked(legacyIntent, claim.legacyIntentDigest, 'config_invalid');
+      if (!prepared.recovery && (!intent || !samePrivateDigest(legacyRepairDigest(work.event, work.streamId,
+          expectedBinding, prepared, provedGeneration), intent))) return false;
+      return connections.durable(async () => {
+        const [raw] = await evalScript(work.event.canonical_chat_jid, ['checkpoint-latest']);
+        if (!raw) return false;
+        const current = checked(CheckpointRecordSchema, json(raw), 'checkpoint_invalid');
+        if (current.phase !== 'prepared' || !isDeepStrictEqual(current, prepared)) return false;
+        const next = checked(CheckpointRecordSchema, { ...current, phase: 'aborted' }, 'checkpoint_invalid');
+        return (await evalScript(work.event.canonical_chat_jid, ['checkpoint-abort', ...argsFor(work),
+          JSON.stringify(binding(expectedBinding)), current.checkpointId, raw, JSON.stringify(next), intent, GROUP]))[0] === 'ok';
+      });
     },
     async checkWork(work) {
       const r = await write(work.event.canonical_chat_jid, ['check-work', ...argsFor(work)]);

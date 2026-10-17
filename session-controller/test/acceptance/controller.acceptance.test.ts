@@ -11,7 +11,7 @@ import { Duplex } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createClient } from 'redis';
 import { validateConfig, type ControllerConfig } from '../../src/config.js';
-import { ControllerError, canonicalChatId, eventId, fingerprintEvent, type CanonicalChatId, type CheckpointV1, type CompletionIndexPort, type CompletionProof, type ClaimedWork, type DiagnosticPort, type MutationAttempt, type NotificationV2, type SessionBinding, type UsageSnapshot, type WaitPort } from '../../src/domain.js';
+import { ControllerError, canonicalChatId, eventId, fingerprintEvent, type CanonicalChatId, type CheckpointRecord, type CheckpointV1, type CompletionIndexPort, type CompletionProof, type ClaimedWork, type DiagnosticPort, type MutationAttempt, type NotificationV2, type SessionBinding, type UsageSnapshot, type WaitPort } from '../../src/domain.js';
 import { waitForBridge } from '../../src/main.js';
 import { createDiagnostics } from '../../src/diagnostics.js';
 import { createWebhookServer, type WebhookServer } from '../../src/intake/server.js';
@@ -24,6 +24,7 @@ import { createRecovery } from '../../src/scheduler/recovery.js';
 import { createUsagePolicy } from '../../src/compaction/usage-policy.js';
 import { checkpointIdentity, containsSensitive, renderCheckpointSummary, validateCheckpoint } from '../../src/compaction/checkpoint.js';
 import { createCompactor } from '../../src/compaction/compactor.js';
+import { captureStableSessionFileGeneration } from '../../src/compaction/orphan-recovery.js';
 import { createCompletionIndex, type CompletionIndex, type MappingPort } from '../../src/pi/completion-index.js';
 import { createSessionHost, type SessionHost } from '../../src/pi/session-host.js';
 import { createToolJournal, MUTATION_TYPE, type JournalAttachment } from '../../src/pi/tool-journal-extension.js';
@@ -332,6 +333,10 @@ async function verifyOwnedIdentityFailures():Promise<void>{
  }finally{await forwarder?.stop();if(!forwarder||forwarder.settled)await privateRedis.cleanup();}
 }
 function checkpoint(chat:CanonicalChatId):CheckpointV1{return{version:1,canonicalChatId:chat,lastCompletedSequence:0,policyVersion:'p1',templateVersion:'t1',createdAt:'2033-05-18T03:33:22Z',goals:[],decisions:[],constraints:[],verifiedFacts:[],pendingWork:[],approvalBoundaries:[],nextSteps:[],confirmedToolOutcomes:[]};}
+async function boundPrepared(root:string,work:ClaimedWork,binding:SessionBinding,value:CheckpointV1,id:string):Promise<Extract<CheckpointRecord,{phase:'prepared'}>>{
+ const generation=await captureStableSessionFileGeneration(root,binding);
+ return{checkpointId:id,phase:'prepared',checkpoint:value,recovery:{version:1,eventId:work.event.event_id,eventFingerprint:fingerprintEvent(work.event),streamId:work.streamId,session:binding,generation}};
+}
 async function verifyFenceEffects():Promise<void>{
  for(const effect of['renew','begin','confirm','uncertain','pause','checkpoint-prepare','checkpoint-transition','complete-delete'] as const)for(const owner of['current','stale-app','stale-chat'] as const){
   const f=await productionFixture();let session:Awaited<ReturnType<SessionHost['open']>>|undefined;
@@ -340,7 +345,7 @@ async function verifyFenceEffects():Promise<void>{
    await f.host.attach(session,context);expect(await f.repository.beginTurn(w)).toBe(true);
    const attempt:MutationAttempt={version:1,attemptId:'c'.repeat(32),eventId:w.event.event_id,canonicalChatId:group,toolCallId:'FENCE_CALL',tool:'send_message',destination:other,startedAt:'2033-05-18T03:33:22Z',ownership:w.ownership,status:'attempting'};
    if(effect==='confirm'||effect==='uncertain')expect(await f.repository.nativeJournal.begin(w,attempt)).toBe(true);
-   const prepared={checkpointId:'d'.repeat(32),phase:'prepared' as const,checkpoint:checkpoint(group)};
+   const prepared=await boundPrepared(f.root,w,session.binding,checkpoint(group),'d'.repeat(32));
    if(effect==='checkpoint-transition')expect(await f.repository.checkpoints.prepare(w,prepared)).toBe(true);
    let proof:CompletionProof|undefined;
    if(effect==='complete-delete'){await session.prompt(w.event,'SYNTHETIC');proof=await session.appendCompletion({version:1,eventId:w.event.event_id,eventFingerprint:fingerprintEvent(w.event),canonicalChatId:group,chatSequence:1,completion:'turn',completedAt:'2033-05-18T03:33:22Z',confirmedSends:[]});expect(await f.index.findEvent(group,w.event.event_id)).toEqual(proof);}
@@ -455,7 +460,8 @@ it('C6 covers usage/checkpoint matrix and malformed external compaction pauses o
   f.controls.compact=async(m,context,checkpoint)=>{
    const id='d'.repeat(32),entry='COMPACT_ENTRY',entries=m.getEntries() as unknown as Record<string,unknown>[],parentId=entries.at(-1)?.['id'] as string|undefined;
    exactCheckpointId=id;originalCreatedAt=checkpoint.createdAt;exactSummary=renderCheckpointSummary(checkpoint,id,checkpointIdentity(checkpoint),f.cfg.compaction.checkpointMaxBytes);
-   expect(await f.repository.checkpoints.prepare(context.work(),{checkpointId:id,phase:'prepared',checkpoint})).toBe(true);
+   const currentBinding=await f.mapped();if(!currentBinding)throw new Error('missing_compaction_binding');
+   expect(await f.repository.checkpoints.prepare(context.work(),await boundPrepared(f.root,context.work(),currentBinding,checkpoint,id))).toBe(true);
    const row={type:'compaction',id:entry,parentId:parentId??null,timestamp:'2033-05-18T03:33:23Z',summary:exactSummary,firstKeptEntryId:parentId??entry,tokensBefore:8200,fromHook:true,details:{version:1,checkpointId:id,checkpoint}};entries.push(row);appendFileSync(m.getSessionFile()!,JSON.stringify(row)+'\n');usageValue={tokens:null,contextWindow:10000,percent:null};
    return{entryId:entry,checkpointId:id,checkpoint,compacted:()=>f.repository.checkpoints.transition(context.work(),id,'compacted',entry).then(ok=>{if(!ok)throw Error();}),restored:()=>f.repository.checkpoints.transition(context.work(),id,'restored',entry).then(ok=>{if(!ok)throw Error();})};
   };
@@ -466,7 +472,7 @@ it('C6 covers usage/checkpoint matrix and malformed external compaction pauses o
   const manager=f.controls.managers.get(mapped!.sessionId);expect(manager).toBeDefined();const claims=(manager!.getBranch() as readonly Record<string,unknown>[]).filter(entry=>{const details=entry['details'];return entry['type']==='compaction'&&details!==null&&typeof details==='object'&&!Array.isArray(details)&&(details as Record<string,unknown>)['checkpointId']===exactCheckpointId;});expect(claims).toHaveLength(1);
   const persisted=claims[0]!,details=persisted['details'];expect(persisted['fromHook']).toBe(true);expect(details!==null&&typeof details==='object'&&!Array.isArray(details)).toBe(true);const envelope=details as Record<string,unknown>;expect(envelope['version']).toBe(1);expect(envelope['checkpointId']).toBe(exactCheckpointId);expect((envelope['checkpoint'] as Record<string,unknown>)['createdAt']).toBe(originalCreatedAt);expect(persisted['summary']).toBe(exactSummary);
   const bc=await f.repository.claimNext(other,good.ownership.app,'9'.repeat(32),120000,1000);if(bc.status!=='claimed')throw Error();usageValue={tokens:8200,contextWindow:10000,percent:82};let malformedPrepared=false;
-  f.controls.compact=async(m,context,checkpoint)=>{const bad={...checkpoint,canonicalChatId:group},id='e'.repeat(32),entry='BAD',entries=m.getEntries() as unknown as Record<string,unknown>[],parentId=entries.at(-1)?.['id'] as string|undefined;malformedPrepared=await f.repository.checkpoints.prepare(context.work(),{checkpointId:id,phase:'prepared',checkpoint});if(!malformedPrepared)throw new Error('valid_prepare_failed');const row={type:'compaction',id:entry,parentId:parentId??null,timestamp:'2033-05-18T03:33:23Z',summary:renderCheckpointSummary(bad,id,checkpointIdentity(bad),f.cfg.compaction.checkpointMaxBytes),firstKeptEntryId:parentId??entry,tokensBefore:8200,fromHook:true,details:{version:1,checkpointId:id,checkpoint:bad}};entries.push(row);appendFileSync(m.getSessionFile()!,JSON.stringify(row)+'\n');return{entryId:entry,checkpointId:id,checkpoint:bad,compacted:()=>f.repository.checkpoints.transition(context.work(),id,'compacted',entry).then(()=>{}),restored:()=>f.repository.checkpoints.transition(context.work(),id,'restored',entry).then(()=>{})};};
+  f.controls.compact=async(m,context,checkpoint)=>{const bad={...checkpoint,canonicalChatId:group},id='e'.repeat(32),entry='BAD',entries=m.getEntries() as unknown as Record<string,unknown>[],parentId=entries.at(-1)?.['id'] as string|undefined;const currentBinding=await f.mapped(other);if(!currentBinding)throw new Error('missing_compaction_binding');malformedPrepared=await f.repository.checkpoints.prepare(context.work(),await boundPrepared(f.root,context.work(),currentBinding,checkpoint,id));if(!malformedPrepared)throw new Error('valid_prepare_failed');const row={type:'compaction',id:entry,parentId:parentId??null,timestamp:'2033-05-18T03:33:23Z',summary:renderCheckpointSummary(bad,id,checkpointIdentity(bad),f.cfg.compaction.checkpointMaxBytes),firstKeptEntryId:parentId??entry,tokensBefore:8200,fromHook:true,details:{version:1,checkpointId:id,checkpoint:bad}};entries.push(row);appendFileSync(m.getSessionFile()!,JSON.stringify(row)+'\n');return{entryId:entry,checkpointId:id,checkpoint:bad,compacted:()=>f.repository.checkpoints.transition(context.work(),id,'compacted',entry).then(()=>{}),restored:()=>f.repository.checkpoints.transition(context.work(),id,'restored',entry).then(()=>{})};};
   await run(f,bc.work,{prepare:comp.prepare,afterPrompt:comp.afterPrompt});expect(malformedPrepared).toBe(true);expect((await f.repository.checkpoints.latest(other))?.checkpoint.canonicalChatId).toBe(other);expect((await f.repository.readChat(other)).pause).toBe('compaction_failed');expect((await f.repository.readChat(other)).lastCompletedSequence).toBe(0);expect(await f.admin.xLen(keys(other).stream)).toBe(1);expect((await f.repository.readChat(group)).pause).toBeUndefined();expect((await f.repository.readChat(group)).lastCompletedSequence).toBe(2);
  }finally{await f.cleanup();}
 });

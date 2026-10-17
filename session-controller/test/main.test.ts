@@ -1018,13 +1018,19 @@ describe('main lifecycle composition', () => {
     const cli = {
       lifecycle: async () => { dispatchEffects.push('lifecycle'); return 7; },
       inventory: async () => { dispatchEffects.push('inventory'); return 0; },
+      recovery: async () => { dispatchEffects.push('recovery'); return 0; },
+      recoveryIntent: async () => { dispatchEffects.push('recovery-intent'); return 0; },
       invalid: () => { dispatchEffects.push('{"status":"command_invalid"}'); }
     };
     expect(await runCli([], cli)).toBe(7);
     expect(dispatchEffects.splice(0)).toEqual(['lifecycle']);
     expect(await runCli(['--check-pi-inventory'], cli)).toBe(0);
     expect(dispatchEffects.splice(0)).toEqual(['inventory']);
-    for (const args of [['--unknown'], ['--check-pi-inventory', 'extra'], ['', '--check-pi-inventory']]) {
+    expect(await runCli(['--recover-compaction-failures'], cli)).toBe(0);
+    expect(dispatchEffects.splice(0)).toEqual(['recovery']);
+    expect(await runCli(['--create-compaction-recovery-manifest'], cli)).toBe(0);
+    expect(dispatchEffects.splice(0)).toEqual(['recovery-intent']);
+    for (const args of [['--unknown'], ['--check-pi-inventory', 'extra'], ['--recover-compaction-failures', 'extra'], ['', '--check-pi-inventory']]) {
       expect(await runCli(args, cli)).toBe(2);
       expect(dispatchEffects.splice(0)).toEqual(['{"status":"command_invalid"}']);
     }
@@ -1250,6 +1256,286 @@ describe('main lifecycle composition', () => {
     expect(lifecycleCode).toBe(1);
     expect(cleanupSignals.count()).toBe(0);
     expect(lines.map(line => (JSON.parse(line) as { class: string }).class)).toContain('session_failed');
+  });
+
+  it('runs compaction recovery as an isolated value-free operator mode and fails closed on active ownership', async () => {
+    const { recoverCompactionFailures } = await mainModule();
+    const effects: string[] = [], lines: string[] = [];
+    const fence = { owner: 'a'.repeat(32), epoch: '1', expiresAtMs: 2000000000000 };
+    const claim = { work: { ownership: { app: fence, chat: fence } }, checkpoint: { recovery: { version: 1 } } } as never;
+    const statuses: Array<{ status: 'claimed'; claim: never } | { status: 'ineligible' }> = [
+      { status: 'claimed', claim }, { status: 'ineligible' }, { status: 'claimed', claim }
+    ];
+    let checks = 0;
+    const repository = {
+      chats: ['100@g.us', '200@g.us', '300@lid'],
+      async acquireApp() { effects.push('acquire-app'); return fence; },
+      async renewApp() { effects.push('renew-app'); return fence; },
+      async releaseApp() { effects.push('release-app'); return true; },
+      async claimCompactionRepair() { effects.push('claim'); return statuses.shift(); },
+      async releaseCompactionRepair() { effects.push('release-repair'); return true; },
+      async renew() { effects.push('renew-repair'); return { app: fence, chat: fence }; },
+      async checkWork() { effects.push('check'); return ++checks > 1; },
+      async abortCompactionRepair() { effects.push('abort'); return true; },
+      async close() { effects.push('close'); }
+    };
+    const code = await recoverCompactionFailures({
+      load: () => ({ scheduler: { leaseMs: 30000, renewMs: 5000 } }) as never,
+      connect: async () => { effects.push('connect'); return { close: async () => { effects.push('connection-close'); } } as never; },
+      repository: async () => repository as never,
+      prove: async () => { effects.push('file-proof'); return { device: '1', inode: '1', size: '1', mtimeNs: '1', ctimeNs: '1' }; },
+      id: () => 'b'.repeat(32),
+      status: value => { lines.push(JSON.stringify(value)); }
+    });
+    expect(code).toBe(1);
+    expect(effects).toEqual(['connect', 'acquire-app', 'renew-app', 'claim', 'file-proof', 'file-proof', 'check', 'release-repair', 'renew-app', 'claim', 'renew-app', 'claim', 'file-proof', 'file-proof', 'check', 'abort', 'release-app', 'close']);
+    expect(lines).toEqual(['{"status":"compaction_recovery_failed","scanned":3,"repaired":1,"skipped":1,"failed":1}']);
+    expect(lines.join('')).not.toContain('100@g.us');
+    const activeEffects: string[] = [], activeStatus: string[] = [];
+    expect(await recoverCompactionFailures({
+      load: () => ({ scheduler: { leaseMs: 30000, renewMs: 5000 } }) as never,
+      connect: async () => ({ close: async () => { activeEffects.push('connection-close'); } }) as never,
+      repository: async () => ({ chats: ['100@g.us'], acquireApp: async () => undefined,
+        renewApp: async () => undefined, releaseApp: async () => true,
+        claimCompactionRepair: async () => { activeEffects.push('forbidden-claim'); return { status: 'lost' }; },
+        releaseCompactionRepair: async () => false, renew: async () => undefined,
+        checkWork: async () => false, abortCompactionRepair: async () => false,
+        close: async () => { activeEffects.push('close'); } }) as never,
+      status: value => { activeStatus.push(JSON.stringify(value)); }
+    })).toBe(1);
+    expect(activeEffects).toEqual(['close']);
+    expect(activeStatus).toEqual(['{"status":"compaction_recovery_failed","scanned":0,"repaired":0,"skipped":0,"failed":1}']);
+  });
+
+  it('creates a legacy manifest under the exact repair fence with two file proofs and explicit release', async () => {
+    const { createCompactionRecoveryManifest, recoverCompactionFailures } = await mainModule();
+    const fence = { owner: 'a'.repeat(32), epoch: '1', expiresAtMs: 2000000000000 };
+    const event = { schema_version: 2, event_type: 'whatsapp.message.received', event_id: '1'.repeat(32),
+      message_id: 'SYNTHETIC', event_timestamp: '2033-05-18T03:33:20Z', received_at: '2033-05-18T03:33:21Z',
+      chat_sequence: 1, sender_jid: '300@lid', is_from_me: false, chat_kind: 'group',
+      chat_jid: '100@g.us', canonical_chat_jid: '100@g.us' } as const;
+    const binding = { canonicalChatId: '100@g.us', sessionId: 'SYNTHETIC', sessionFile: '/tmp/synthetic.jsonl' };
+    const claim = { work: { streamId: '1-0', event, ownership: { app: fence, chat: fence } }, binding,
+      checkpoint: { checkpointId: 'd'.repeat(32), phase: 'prepared', checkpoint: { version: 1,
+        canonicalChatId: '100@g.us', lastCompletedSequence: 0, policyVersion: '1', templateVersion: '1',
+        createdAt: '2033-05-18T03:33:22Z', goals: [], decisions: [], constraints: [], verifiedFacts: [],
+        pendingWork: [], approvalBoundaries: [], nextSteps: [], confirmedToolOutcomes: [] } } } as never;
+    const effects: string[] = []; let proofs = 0, manifestDigest = '';
+    const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      expect(await createCompactionRecoveryManifest({
+        load: () => ({ manifestPath: '/tmp/manifest', scheduler: { leaseMs: 30000, renewMs: 5000 } }) as never,
+        connect: async () => ({ close: async () => {} }) as never,
+        repository: async () => ({ chats: ['100@g.us'], acquireApp: async () => fence,
+          renewApp: async () => fence, releaseApp: async () => true,
+          createCompactionRepairIntent: async () => { effects.push('claim-fence'); return { status: 'claimed', claim }; },
+          releaseCompactionRepair: async () => { effects.push('release-fence'); return true; },
+          claimCompactionRepair: async () => ({ status: 'ineligible' }), abortCompactionRepair: async () => false,
+          renew: async () => ({ app: fence, chat: fence }), checkWork: async () => true, close: async () => {}
+        }) as never,
+        prove: async () => { proofs++; effects.push('proof'); return { device: '1', inode: '1', size: '1', mtimeNs: '1', ctimeNs: '1' }; },
+        stageManifest: async (path, digest) => {
+          expect(digest).toMatch(/^sha256:v1:[0-9a-f]{64}$/); manifestDigest = digest; effects.push('stage');
+          return { targetPath: path, stagedPath: '/tmp/pending', device: 1n, inode: 1n, size: 1n, mtimeNs: 1n, ctimeNs: 1n };
+        },
+        publishManifest: async () => { effects.push('publish'); },
+        discardManifest: async () => { effects.push('discard'); }
+      })).toBe(0);
+    } finally { output.mockRestore(); }
+    expect(proofs).toBe(2);
+    expect(effects).toEqual(['claim-fence', 'proof', 'proof', 'stage', 'release-fence', 'publish']);
+
+    let aborts = 0, releases = 0;
+    const recoveryClaim = { ...(claim as unknown as Record<string, unknown>), legacyIntentDigest: manifestDigest } as never;
+    expect(await recoverCompactionFailures({
+      load: () => ({ manifestPath: '/tmp/manifest', scheduler: { leaseMs: 30000, renewMs: 5000 } }) as never,
+      connect: async () => ({ close: async () => {} }) as never,
+      repository: async () => ({ chats: ['100@g.us'], acquireApp: async () => fence,
+        renewApp: async () => fence, releaseApp: async () => true,
+        claimCompactionRepair: async () => ({ status: 'claimed', claim: recoveryClaim }),
+        releaseCompactionRepair: async () => { releases++; return true; },
+        abortCompactionRepair: async () => { aborts++; return true; }, renew: async () => ({ app: fence, chat: fence }),
+        checkWork: async () => true, close: async () => {}
+      }) as never,
+      consumeManifest: async () => manifestDigest,
+      prove: async () => ({ device: '1', inode: '1', size: '2', mtimeNs: '1', ctimeNs: '2' }),
+      status: () => {}
+    })).toBe(1);
+    expect({ aborts, releases }).toEqual({ aborts: 0, releases: 1 });
+  });
+
+  it('drains a pending serialized app/chat renewal before terminal check and lease deletion', async () => {
+    const { recoverCompactionFailures } = await mainModule();
+    const fence = { owner: 'a'.repeat(32), epoch: '1', expiresAtMs: 2000000000000 };
+    const claim = { work: { ownership: { app: fence, chat: fence } }, checkpoint: { recovery: { version: 1 } } } as never;
+    const pendingRenewal = deferred(), releaseRenewal = deferred();
+    const effects: string[] = [];
+    let tail: Promise<unknown> = Promise.resolve(), appRenewals = 0, leaseDeleted = false, crossedDeletion = false;
+    const serial = <T>(effect: string, operation: () => Promise<T>): Promise<T> => {
+      const result = tail.then(async () => { effects.push(effect); return operation(); });
+      tail = result.catch(() => undefined); return result;
+    };
+    const recovery = recoverCompactionFailures({
+      load: () => ({ scheduler: { leaseMs: 30000, renewMs: 1 } }) as never,
+      connect: async () => ({ close: async () => {} }) as never,
+      repository: async () => ({ chats: ['100@g.us'], acquireApp: async () => fence,
+        renewApp: async () => {
+          appRenewals++;
+          return serial(appRenewals === 1 ? 'scan-app-renew' : 'heartbeat-app-renew', async () => {
+            if (appRenewals > 1) { pendingRenewal.release(); await releaseRenewal.promise; }
+            if (leaseDeleted) crossedDeletion = true;
+            return fence;
+          });
+        },
+        releaseApp: async () => true,
+        claimCompactionRepair: async () => ({ status: 'claimed', claim }),
+        renew: async () => serial('heartbeat-chat-renew', async () => {
+          if (leaseDeleted) crossedDeletion = true;
+          return { app: fence, chat: fence };
+        }),
+        checkWork: async () => serial('check', async () => true),
+        abortCompactionRepair: async () => serial('abort', async () => { leaseDeleted = true; return true; }),
+        releaseCompactionRepair: async () => serial('release-repair', async () => true), close: async () => {}
+      }) as never,
+      prove: async () => {
+        await pendingRenewal.promise;
+        return { device: '1', inode: '1', size: '1', mtimeNs: '1', ctimeNs: '1' };
+      },
+      status: () => {}
+    });
+    await pendingRenewal.promise;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(effects).not.toContain('check'); expect(effects).not.toContain('abort');
+    releaseRenewal.release();
+    expect(await recovery).toBe(0);
+    expect(crossedDeletion).toBe(false);
+    expect(effects.indexOf('heartbeat-chat-renew')).toBeLessThan(effects.indexOf('check'));
+    expect(effects.indexOf('check')).toBeLessThan(effects.indexOf('abort'));
+  });
+
+  it('does not run final recovery mutation after a heartbeat failure', async () => {
+    const { recoverCompactionFailures } = await mainModule();
+    const fence = { owner: 'a'.repeat(32), epoch: '1', expiresAtMs: 2000000000000 };
+    const claim = { work: { ownership: { app: fence, chat: fence } }, checkpoint: { recovery: { version: 1 } } } as never;
+    const heartbeatFailed = deferred();
+    let appRenewals = 0, checks = 0, aborts = 0, releases = 0;
+    expect(await recoverCompactionFailures({
+      load: () => ({ scheduler: { leaseMs: 30000, renewMs: 1 } }) as never,
+      connect: async () => ({ close: async () => {} }) as never,
+      repository: async () => ({ chats: ['100@g.us'], acquireApp: async () => fence,
+        renewApp: async () => {
+          appRenewals++;
+          if (appRenewals === 1) return fence;
+          heartbeatFailed.release(); return undefined;
+        },
+        releaseApp: async () => true,
+        claimCompactionRepair: async () => ({ status: 'claimed', claim }),
+        renew: async () => ({ app: fence, chat: fence }),
+        checkWork: async () => { checks++; return true; },
+        abortCompactionRepair: async () => { aborts++; return true; },
+        releaseCompactionRepair: async () => { releases++; return true; }, close: async () => {}
+      }) as never,
+      prove: async () => {
+        await heartbeatFailed.promise;
+        return { device: '1', inode: '1', size: '1', mtimeNs: '1', ctimeNs: '1' };
+      },
+      status: () => {}
+    })).toBe(1);
+    expect({ checks, aborts, releases }).toEqual({ checks: 0, aborts: 0, releases: 1 });
+  });
+
+  it('drains manifest heartbeat before release and discards unpublished intent when release fails', async () => {
+    const { createCompactionRecoveryManifest } = await mainModule();
+    const fence = { owner: 'a'.repeat(32), epoch: '1', expiresAtMs: 2000000000000 };
+    const event = { schema_version: 2, event_type: 'whatsapp.message.received', event_id: '1'.repeat(32),
+      message_id: 'SYNTHETIC', event_timestamp: '2033-05-18T03:33:20Z', received_at: '2033-05-18T03:33:21Z',
+      chat_sequence: 1, sender_jid: '300@lid', is_from_me: false, chat_kind: 'group',
+      chat_jid: '100@g.us', canonical_chat_jid: '100@g.us' } as const;
+    const binding = { canonicalChatId: '100@g.us', sessionId: 'SYNTHETIC', sessionFile: '/tmp/synthetic.jsonl' };
+    const claim = { work: { streamId: '1-0', event, ownership: { app: fence, chat: fence } }, binding,
+      checkpoint: { checkpointId: 'd'.repeat(32), phase: 'prepared', checkpoint: { version: 1,
+        canonicalChatId: '100@g.us', lastCompletedSequence: 0, policyVersion: '1', templateVersion: '1',
+        createdAt: '2033-05-18T03:33:22Z', goals: [], decisions: [], constraints: [], verifiedFacts: [],
+        pendingWork: [], approvalBoundaries: [], nextSteps: [], confirmedToolOutcomes: [] } } } as never;
+    const pendingRenewal = deferred(), releaseRenewal = deferred();
+    const effects: string[] = [];
+    let tail: Promise<unknown> = Promise.resolve(), appRenewals = 0, leaseDeleted = false, crossedDeletion = false;
+    const serial = <T>(effect: string, operation: () => Promise<T>): Promise<T> => {
+      const result = tail.then(async () => { effects.push(effect); return operation(); });
+      tail = result.catch(() => undefined); return result;
+    };
+    const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const creation = createCompactionRecoveryManifest({
+        load: () => ({ manifestPath: '/tmp/manifest', scheduler: { leaseMs: 30000, renewMs: 1 } }) as never,
+        connect: async () => ({ close: async () => {} }) as never,
+        repository: async () => ({ chats: ['100@g.us'], acquireApp: async () => fence,
+          renewApp: async () => {
+            appRenewals++;
+            return serial(appRenewals === 1 ? 'scan-app-renew' : 'heartbeat-app-renew', async () => {
+              if (appRenewals > 1) { pendingRenewal.release(); await releaseRenewal.promise; }
+              if (leaseDeleted) crossedDeletion = true;
+              return fence;
+            });
+          },
+          releaseApp: async () => true,
+          createCompactionRepairIntent: async () => ({ status: 'claimed', claim }),
+          renew: async () => serial('heartbeat-chat-renew', async () => {
+            if (leaseDeleted) crossedDeletion = true;
+            return { app: fence, chat: fence };
+          }),
+          releaseCompactionRepair: async () => serial('release-repair', async () => { leaseDeleted = true; return false; }),
+          claimCompactionRepair: async () => ({ status: 'ineligible' }), abortCompactionRepair: async () => false,
+          checkWork: async () => false, close: async () => {}
+        }) as never,
+        prove: async () => ({ device: '1', inode: '1', size: '1', mtimeNs: '1', ctimeNs: '1' }),
+        stageManifest: async path => {
+          effects.push('stage'); await pendingRenewal.promise;
+          return { targetPath: path, stagedPath: '/tmp/pending', device: 1n, inode: 1n, size: 1n, mtimeNs: 1n, ctimeNs: 1n };
+        },
+        publishManifest: async () => { effects.push('publish'); },
+        discardManifest: async () => { effects.push('discard'); }
+      });
+      await pendingRenewal.promise;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(effects).not.toContain('release-repair');
+      releaseRenewal.release();
+      expect(await creation).toBe(1);
+    } finally { output.mockRestore(); }
+    expect(crossedDeletion).toBe(false);
+    expect(effects.indexOf('heartbeat-chat-renew')).toBeLessThan(effects.indexOf('release-repair'));
+    expect(effects).toContain('discard'); expect(effects).not.toContain('publish');
+    expect(effects.filter(effect => effect === 'release-repair')).toHaveLength(1);
+  });
+
+  it('renews app/chat ownership during file proof and releases repair on generation mismatch', async () => {
+    const { recoverCompactionFailures } = await mainModule();
+    const fence = { owner: 'a'.repeat(32), epoch: '1', expiresAtMs: 2000000000000 };
+    const claim = { work: { ownership: { app: fence, chat: fence } }, checkpoint: { recovery: { version: 1 } } } as never;
+    let appRenewals = 0, chatRenewals = 0, releases = 0, aborts = 0, proofs = 0;
+    const statuses: string[] = [];
+    const code = await recoverCompactionFailures({
+      load: () => ({ scheduler: { leaseMs: 30000, renewMs: 10 } }) as never,
+      connect: async () => ({ close: async () => {} }) as never,
+      repository: async () => ({
+        chats: ['100@g.us'], acquireApp: async () => fence,
+        renewApp: async () => { appRenewals++; return fence; }, releaseApp: async () => true,
+        claimCompactionRepair: async () => ({ status: 'claimed', claim }),
+        renew: async () => { chatRenewals++; return { app: fence, chat: fence }; },
+        checkWork: async () => true,
+        abortCompactionRepair: async () => { aborts++; return true; },
+        releaseCompactionRepair: async () => { releases++; return true; }, close: async () => {}
+      }) as never,
+      prove: async () => {
+        await new Promise(resolve => setTimeout(resolve, 25)); proofs++;
+        return { device: '1', inode: '1', size: String(proofs), mtimeNs: '1', ctimeNs: '1' };
+      },
+      status: value => { statuses.push(JSON.stringify(value)); }
+    });
+    expect(code).toBe(1);
+    expect(appRenewals).toBeGreaterThan(1); expect(chatRenewals).toBeGreaterThan(0);
+    expect({ releases, aborts, proofs }).toEqual({ releases: 1, aborts: 0, proofs: 2 });
+    expect(statuses).toEqual(['{"status":"compaction_recovery_failed","scanned":1,"repaired":0,"skipped":0,"failed":1}']);
   });
 
   it('reads mappings only through the independent mapping command port', async () => {
