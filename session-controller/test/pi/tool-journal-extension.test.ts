@@ -2,7 +2,7 @@ import { once } from 'node:events';
 import { describe, it, expect, vi } from 'vitest';
 import type { ExtensionAPI, ExtensionContext, CustomToolCallEvent, ToolResultEvent, ToolInfo } from '@earendil-works/pi-coding-agent';
 import { canonicalChatId, eventId, fingerprintEvent, ControllerError, type ClaimedWork, type MutationState, type MutationAttempt, type SessionBinding, type PiSessionPort, type CompletionMarker } from '../../src/domain.js';
-import { createToolJournal, confirmedMessage, mutationDestination, type JournalRecord } from '../../src/pi/tool-journal-extension.js';
+import { createToolJournal, confirmedMessage, mutationDestination, permitsParticipantAttribution, type JournalRecord } from '../../src/pi/tool-journal-extension.js';
 import { ADAPTER_WHATSAPP_SERVER, MCP_ADAPTER_SOURCE_PATH, WHATSAPP_SERVER } from '../../src/pi/mcp-loader.js';
 import { runChatWorker, type TurnContext, type WorkerOptions, type WorkerRepository } from '../../src/scheduler/chat-worker.js';
 import { createRepository } from '../../src/redis/repository.js';
@@ -36,7 +36,8 @@ function errorResult(e = call()): ToolResultEvent {
     content: callToolResult.content, details: { error: 'tool_error', server: ADAPTER_WHATSAPP_SERVER, mcpResult: callToolResult }, isError: true,
     structuredContent: callToolResult };
 }
-async function fixture() {
+async function fixture(currentWork: ClaimedWork = work) {
+  const activeContext: TurnContext = currentWork === work ? context : { work: () => currentWork, current: async () => {} };
   const states = new Map<string, MutationState>(), records: JournalRecord[] = [], effects: string[] = [];
   const handlers: Record<string, (e: any, ctx: any) => Promise<any>> = {};
   let serial = 0, own: 'confirmed' | 'uncertain' | 'none' = 'none';
@@ -56,8 +57,8 @@ async function fixture() {
   await journal.extension(pi);
   const ctx = { sessionManager: { getSessionId: () => binding.sessionId }, abort: vi.fn() } as unknown as ExtensionContext;
   const record = vi.fn(async (r: JournalRecord) => { effects.push(r.state.status + ':fsync'); records.push(structuredClone(r)); });
-  journal.bind({ session: binding, record }); await handlers['session_start']!({ type: 'session_start' }, ctx); await journal.attach(binding, context);
-  return { journal, ctx, nativeJournal, ownMutation, states, records, effects, record, info, handlers,
+  journal.bind({ session: binding, record }); await handlers['session_start']!({ type: 'session_start' }, ctx); await journal.attach(binding, activeContext);
+  return { journal, ctx, context: activeContext, nativeJournal, ownMutation, states, records, effects, record, info, handlers,
     setOwn: (v: typeof own) => { own = v; }, invokeCall: (e = call()) => handlers['tool_call']!(e, ctx), invokeResult: (e = result()) => handlers['tool_result']!(e, ctx) };
 }
 describe('native-shaped durable mutation hooks', () => {
@@ -263,6 +264,118 @@ describe('native-shaped durable mutation hooks', () => {
     expect(late.ownMutation).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('participant attribution pre-call policy', () => {
+  type TextTool = 'send_message' | 'send_group_message' | 'send_auto_message';
+  const textInput = (tool: TextTool, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    ...(tool === 'send_message' ? { to: other } : { jid: other }), text: 'SYNTHETIC_BODY', ...extra
+  });
+  const expectDenied = async (tool: TextTool, input: Record<string, unknown>, currentWork: ClaimedWork = work) => {
+    const f = await fixture(currentWork), e = call(tool, 'SYNTHETIC_DENIED', input), external = vi.fn(async () => {});
+    f.info.name = e.toolName;
+    let outcome: Awaited<ReturnType<typeof f.invokeCall>>;
+    await f.journal.run(binding, async () => {
+      outcome = await f.invokeCall(e);
+      if (!outcome?.block) await external();
+    });
+    expect(outcome!).toEqual({ block: true, terminate: false, reason: 'policy_denied' });
+    expect(external).not.toHaveBeenCalled();
+    expect(f.nativeJournal.begin).not.toHaveBeenCalled();
+    expect(f.nativeJournal.uncertain).not.toHaveBeenCalled();
+    expect(f.record).not.toHaveBeenCalled();
+    expect(f.effects).toEqual([]);
+    expect(f.ctx.abort).not.toHaveBeenCalled();
+    return f;
+  };
+
+  it.each([
+    ['send_message', { quoted_message_id: 'SYNTHETIC_QUOTE', quoted_participant: '300@lid' }],
+    ['send_group_message', { quoted_message_id: 'SYNTHETIC_QUOTE', quoted_participant: '300@lid' }],
+    ['send_auto_message', { quoted_message_id: 'SYNTHETIC_QUOTE', quoted_participant: '300@lid' }],
+    ['send_group_message', { quoted_message_id: 'SYNTHETIC_QUOTE' }],
+    ['send_group_message', { quoted_participant: '300@lid' }]
+  ] as const)('rejects full or partial quote attribution for %s before journaling or execution', async (tool, quote) => {
+    await expectDenied(tool, textInput(tool, quote));
+  });
+
+  it.each([
+    ['unrelated participant', '400@lid'],
+    ['unverified namespace alias with the same user component', '300@s.whatsapp.net'],
+    ['device-suffixed form of the triggering participant', '300:7@lid']
+  ])('rejects an %s mention before journaling or execution', async (_name, mention) => {
+    await expectDenied('send_group_message', textInput('send_group_message', { mentions: [mention] }));
+  });
+
+  it.each([
+    ['malformed identity', ['SYNTHETIC_INVALID_IDENTITY']],
+    ['malformed mentions shape', '300@lid'],
+    ['duplicate identity', ['300@lid', '300@lid']]
+  ])('rejects %s', async (_name, mentions) => {
+    await expectDenied('send_group_message', textInput('send_group_message', { mentions }));
+  });
+
+  it('rejects multiple verified aliases of the same principal as a duplicate mention', async () => {
+    const aliasesWork: ClaimedWork = { ...work, event: { ...work.event, sender_alt_jid: '300@s.whatsapp.net' } };
+    await expectDenied('send_group_message', textInput('send_group_message',
+      { mentions: [aliasesWork.event.sender_jid, aliasesWork.event.sender_alt_jid] }), aliasesWork);
+  });
+
+  it('normalizes a documented device suffix only on the trusted event sender alias', () => {
+    const deviceSenderWork: ClaimedWork = { ...work, event: { ...work.event, sender_jid: '300:7@s.whatsapp.net' } };
+    const mention = '300@s.whatsapp.net';
+    expect(permitsParticipantAttribution('send_group_message',
+      textInput('send_group_message', { mentions: [mention] }), { work: () => deviceSenderWork, current: async () => {} })).toBe(true);
+    expect(mention).toBe('300@s.whatsapp.net');
+  });
+
+  it.each([
+    ['primary alias', work, '300@lid'],
+    ['alternate alias', { ...work, event: { ...work.event, sender_alt_jid: '300@s.whatsapp.net' } }, '300@s.whatsapp.net']
+  ] as const)('allows one exact triggering-participant %s without rewriting it', async (_name, currentWork, mention) => {
+    const f = await fixture(currentWork), e = call('send_group_message', 'SYNTHETIC_ALLOWED', textInput('send_group_message', { mentions: [mention] }));
+    f.info.name = e.toolName;
+    await f.journal.run(binding, async () => {
+      expect(await f.invokeCall(e)).toBeUndefined();
+      expect((e.input['mentions'] as string[])[0]).toBe(mention);
+      await f.invokeResult(result(e));
+    });
+    expect(f.nativeJournal.begin).toHaveBeenCalledTimes(1);
+    expect(f.nativeJournal.confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives an own-account group event no third-party attribution authority but permits its event sender alias', async () => {
+    const ownWork: ClaimedWork = { ...work, event: { ...work.event, is_from_me: true } };
+    await expectDenied('send_group_message', textInput('send_group_message', { mentions: ['400@lid'] }), ownWork);
+
+    const f = await fixture(ownWork), e = call('send_group_message', 'SYNTHETIC_OWN_ALLOWED',
+      textInput('send_group_message', { mentions: [ownWork.event.sender_jid] }));
+    f.info.name = e.toolName;
+    await f.journal.run(binding, async () => { expect(await f.invokeCall(e)).toBeUndefined(); await f.invokeResult(result(e)); });
+    expect(f.nativeJournal.begin).toHaveBeenCalledTimes(1);
+    expect(f.nativeJournal.confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it('continues the same prompt after policy denial and successfully executes a plain retry', async () => {
+    const f = await fixture();
+    const denied = call('send_group_message', 'SYNTHETIC_DENIED', textInput('send_group_message', { quoted_message_id: 'SYNTHETIC_QUOTE' }));
+    const retry = call('send_group_message', 'SYNTHETIC_RETRY', textInput('send_group_message'));
+    f.info.name = denied.toolName;
+    const external = vi.fn(async (event: CustomToolCallEvent) => { await f.invokeResult(result(event)); });
+    await f.journal.run(binding, async () => {
+      expect(await f.invokeCall(denied)).toEqual({ block: true, terminate: false, reason: 'policy_denied' });
+      expect(f.nativeJournal.begin).not.toHaveBeenCalled();
+      expect(await f.invokeCall(retry)).toBeUndefined();
+      await external(retry);
+    });
+    expect(external).toHaveBeenCalledTimes(1);
+    expect(f.nativeJournal.begin).toHaveBeenCalledTimes(1);
+    expect(f.nativeJournal.confirm).toHaveBeenCalledTimes(1);
+    expect(f.nativeJournal.uncertain).not.toHaveBeenCalled();
+    expect(f.ctx.abort).not.toHaveBeenCalled();
+    expect(await f.journal.confirmed(f.context)).toEqual([{ destination: other, messageId: 'SYNTHETIC_SENT' }]);
+  });
+});
+
 describe('locked seven tools and native response envelope', () => {
   it.each([
     ['send_message', { to: '+9 99' }, '999@s.whatsapp.net'], ['send_group_message', { jid: other }, other],
