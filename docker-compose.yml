@@ -93,6 +93,7 @@ services:
       BRIDGE_ADDR: "0.0.0.0:8080"
       BRIDGE_DATA_DIR: "/data"
       BRIDGE_MANAGED: "true"
+      BRIDGE_LOG_STATUS_REQUESTS: "${BRIDGE_LOG_STATUS_REQUESTS:-true}"
       DATABASE_URL: "postgres://whatsapp:${POSTGRES_PASSWORD_URI:-whatsapp}@postgres:5432/whatsapp?sslmode=disable"
       EMBEDDER_URL: "http://embedder:8000"
       ANALYZER_URL: "http://transcriber:8500"

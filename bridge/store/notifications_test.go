@@ -65,6 +65,16 @@ func messageArgs(m *MessageRow) []driver.Value {
 func expectInserted(mock sqlmock.Sqlmock, m *MessageRow) {
 	mock.ExpectQuery(insertMessageSQL).WithArgs(messageArgs(m)...).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(m.ID))
 }
+func expectUpdated(mock sqlmock.Sqlmock, m *MessageRow, bridgeOrigin bool) {
+	mock.ExpectQuery(insertMessageSQL).WithArgs(messageArgs(m)...).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectExec(updateMessageSQL).WithArgs(messageArgs(m)...).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(selectMessageBridgeOriginSQL).WithArgs(m.ID, m.ChatJID).
+		WillReturnRows(sqlmock.NewRows([]string{"is_bridge_origin"}).AddRow(bridgeOrigin))
+}
+func expectNotificationExists(mock sqlmock.Sqlmock, m *MessageRow, exists bool) {
+	mock.ExpectQuery(notificationExistsForMessageSQL).WithArgs(m.ChatJID, m.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(exists))
+}
 func testNotificationRequest(m *MessageRow) *NotificationRequest {
 	return &NotificationRequest{
 		ReceivedAt:       m.Timestamp,
@@ -139,9 +149,16 @@ func TestSaveMessageOutcomes(t *testing.T) {
 							e.WillReturnResult(sqlmock.NewErrorResult(failure))
 						default:
 							e.WillReturnResult(sqlmock.NewResult(0, 1))
+							mock.ExpectQuery(selectMessageBridgeOriginSQL).WithArgs(m.ID, m.ChatJID).
+								WillReturnRows(sqlmock.NewRows([]string{"is_bridge_origin"}).AddRow(false))
+							expectNotificationExists(mock, m, true)
 						}
 					default:
 						expectInserted(mock, m)
+						if m.IsFromMe {
+							mock.ExpectQuery(consumeOutboundOriginSQL).WithArgs(m.ID, m.ChatJID).
+								WillReturnRows(sqlmock.NewRows([]string{"message_id"}))
+						}
 						if req != nil {
 							if tt.mode == "sequence_error" {
 								mock.ExpectQuery(allocateNotificationSequenceSQL).WithArgs(req.CanonicalChatJID).WillReturnError(failure)
@@ -195,8 +212,8 @@ func TestConcurrentDuplicatesUseInsertionIdentity(t *testing.T) {
 	expectEvent(mock, m, req, 1).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectBegin()
-	mock.ExpectQuery(insertMessageSQL).WithArgs(messageArgs(m)...).WillReturnRows(sqlmock.NewRows([]string{"id"}))
-	mock.ExpectExec(updateMessageSQL).WithArgs(messageArgs(m)...).WillReturnResult(sqlmock.NewResult(0, 1))
+	expectUpdated(mock, m, false)
+	expectNotificationExists(mock, m, true)
 	mock.ExpectCommit()
 	results := make(chan MessageWriteResult, 2)
 	var wg sync.WaitGroup
@@ -529,6 +546,8 @@ func TestDisabledMaintenance(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec(maintainNotificationsSQL).WithArgs(false, 10, []string{}, 250).WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec(pruneNotificationsSQL).WithArgs((7 * 24 * time.Hour).Milliseconds(), 250).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(pruneObservedOutboundOriginsSQL).WithArgs(ObservedOutboundOriginRetention.Milliseconds(), 250).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(pruneUnobservedOutboundOriginsSQL).WithArgs(UnobservedOutboundOriginRetention.Milliseconds(), 250).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	if s.MaintainNotifications(context.Background(), now, false, nil, 10, 7*24*time.Hour, 250) != nil {
 		t.Fatal("maintenance failed")
@@ -724,7 +743,7 @@ func TestNotificationSQLUsesPostgreSQLClock(t *testing.T) {
 
 func TestMaintenanceFailureInjection(t *testing.T) {
 	retention := 7 * 24 * time.Hour
-	for _, mode := range []string{"maintenance", "prune", "commit"} {
+	for _, mode := range []string{"maintenance", "prune", "observed_origins", "unobserved_origins", "commit"} {
 		t.Run(mode, func(t *testing.T) {
 			s, mock := mockStore(t)
 			failure := errors.New("TEST_RAW_MAINTENANCE_ERROR_MUST_NOT_ESCAPE")
@@ -741,7 +760,21 @@ func TestMaintenanceFailureInjection(t *testing.T) {
 					mock.ExpectRollback()
 				} else {
 					prune.WillReturnResult(sqlmock.NewResult(0, 1))
-					mock.ExpectCommit().WillReturnError(failure)
+					observed := mock.ExpectExec(pruneObservedOutboundOriginsSQL).WithArgs(ObservedOutboundOriginRetention.Milliseconds(), 250)
+					if mode == "observed_origins" {
+						observed.WillReturnError(failure)
+						mock.ExpectRollback()
+					} else {
+						observed.WillReturnResult(sqlmock.NewResult(0, 1))
+						unobserved := mock.ExpectExec(pruneUnobservedOutboundOriginsSQL).WithArgs(UnobservedOutboundOriginRetention.Milliseconds(), 250)
+						if mode == "unobserved_origins" {
+							unobserved.WillReturnError(failure)
+							mock.ExpectRollback()
+						} else {
+							unobserved.WillReturnResult(sqlmock.NewResult(0, 1))
+							mock.ExpectCommit().WillReturnError(failure)
+						}
+					}
 				}
 			}
 			err := s.MaintainNotifications(context.Background(), testMessage().Timestamp, true, []string{"100@g.us"}, 10, retention, 250)

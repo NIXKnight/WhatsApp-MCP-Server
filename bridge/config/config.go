@@ -54,6 +54,9 @@ type Config struct {
 	DatabaseURL string
 	// LogLevel controls slog output verbosity (debug, info, warn, error).
 	LogLevel slog.Level
+	// LogStatusRequests controls access logging for successful GET /api/status
+	// requests (env BRIDGE_LOG_STATUS_REQUESTS, default true).
+	LogStatusRequests bool
 	// EmbedderURL is the base URL of the L3 embedder service used for
 	// query-time vector embeddings (default: http://embedder:8000).
 	EmbedderURL string
@@ -87,6 +90,10 @@ type Config struct {
 // to emit.
 func Load() (*Config, error) {
 	managed, err := parseManaged(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	logStatusRequests, err := parseLogStatusRequests(os.Getenv)
 	if err != nil {
 		return nil, err
 	}
@@ -126,6 +133,7 @@ func Load() (*Config, error) {
 		DataDir:                  absDataDir,
 		DatabaseURL:              databaseURL,
 		LogLevel:                 logLevel,
+		LogStatusRequests:        logStatusRequests,
 		EmbedderURL:              embedderURL,
 		EmbedderTimeout:          defaultEmbedderTimeout,
 		AnalyzerURL:              analyzerURL,
@@ -149,6 +157,17 @@ func parseManaged(getenv func(string) string) (bool, error) {
 		return false, nil
 	default:
 		return false, errors.New("BRIDGE_MANAGED_invalid")
+	}
+}
+
+func parseLogStatusRequests(getenv func(string) string) (bool, error) {
+	switch getenv("BRIDGE_LOG_STATUS_REQUESTS") {
+	case "", "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New("BRIDGE_LOG_STATUS_REQUESTS_invalid")
 	}
 }
 

@@ -241,9 +241,10 @@ func (s *Store) FinishNotification(ctx context.Context, n Notification, outcome 
 	return changed, nil
 }
 
-// MaintainNotifications performs bounded expiry, recovery and terminal pruning.
-// PostgreSQL's execution clock drives every maintenance cutoff and transition.
-// It makes no network requests and requires no authentication configuration.
+// MaintainNotifications performs bounded notification maintenance and outbound
+// origin pruning. PostgreSQL's execution clock drives every cutoff and
+// transition. It makes no network requests and runs even when delivery is
+// disabled, so uncertain-send markers do not depend on controller enablement.
 func (s *Store) MaintainNotifications(ctx context.Context, _ time.Time, enabled bool, allowed []string, maxAttempts int, retention time.Duration, limit int) error {
 	retentionMilliseconds := retention.Milliseconds()
 	if limit < 1 || limit > 1000 || retentionMilliseconds < 1 {
@@ -255,7 +256,13 @@ func (s *Store) MaintainNotifications(ctx context.Context, _ time.Time, enabled 
 		if _, err := tx.ExecContext(ctx, maintainNotificationsSQL, enabled, maxAttempts, allowed, limit); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, pruneNotificationsSQL, retentionMilliseconds, limit)
+		if _, err := tx.ExecContext(ctx, pruneNotificationsSQL, retentionMilliseconds, limit); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, pruneObservedOutboundOriginsSQL, ObservedOutboundOriginRetention.Milliseconds(), limit); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, pruneUnobservedOutboundOriginsSQL, UnobservedOutboundOriginRetention.Milliseconds(), limit)
 		return err
 	})
 	if err != nil {

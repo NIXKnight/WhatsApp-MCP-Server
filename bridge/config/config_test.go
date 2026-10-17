@@ -46,6 +46,42 @@ func TestParseManagedStrict(t *testing.T) {
 	}
 }
 
+func TestParseLogStatusRequestsStrict(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+		err   bool
+	}{
+		{name: "unset", want: true},
+		{name: "empty", value: "", want: true},
+		{name: "true", value: "true", want: true},
+		{name: "false", value: "false"},
+		{name: "upper", value: "TRUE", err: true},
+		{name: "one", value: "1", err: true},
+		{name: "leading whitespace", value: " false", err: true},
+		{name: "trailing whitespace", value: "true ", err: true},
+		{name: "marker", value: "TEST_PRIVATE_LOG_OPTION", err: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseLogStatusRequests(func(string) string { return tt.value })
+			if tt.err {
+				if err == nil || err.Error() != "BRIDGE_LOG_STATUS_REQUESTS_invalid" {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if strings.Contains(err.Error(), tt.value) {
+					t.Fatal("logging option value leaked")
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("parseLogStatusRequests() = %v, %v; want %v, nil", got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestOptionalParsersRetainDefaultsAndFixedWarnings(t *testing.T) {
 	tests := []struct {
 		name string
@@ -113,6 +149,7 @@ func TestLoadManagedAndWarningsIsOutputFree(t *testing.T) {
 	t.Setenv("BRIDGE_MANAGED", "true")
 	t.Setenv("BRIDGE_ADDR", "0.0.0.0:8080")
 	t.Setenv("BRIDGE_NOTIFY_ENABLED", "false")
+	t.Setenv("BRIDGE_LOG_STATUS_REQUESTS", "false")
 	t.Setenv("MEDIA_RETRY_ENABLED", "treu")
 	t.Setenv("MEDIA_RETRY_INTERVAL", "")
 	t.Setenv("MEDIA_MAX_DOWNLOAD_ATTEMPTS", "")
@@ -122,8 +159,8 @@ func TestLoadManagedAndWarningsIsOutputFree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Managed || !cfg.MediaRetryEnabled {
-		t.Fatal("managed mode or existing media retry fallback was not retained")
+	if !cfg.Managed || cfg.LogStatusRequests || !cfg.MediaRetryEnabled {
+		t.Fatal("managed mode, HTTP logging option, or existing media retry fallback was not retained")
 	}
 	want := []string{"bridge_config_invalid_bool_MEDIA_RETRY_ENABLED"}
 	if !reflect.DeepEqual(cfg.Warnings, want) {
@@ -134,5 +171,19 @@ func TestLoadManagedAndWarningsIsOutputFree(t *testing.T) {
 	}
 	if got := NonLoopbackWarning("127.0.0.1:8080"); got != "" {
 		t.Fatalf("loopback address produced warning %q", got)
+	}
+}
+
+func TestLoadRejectsInvalidLogStatusRequests(t *testing.T) {
+	const invalid = "TEST_PRIVATE_INVALID_LOG_OPTION"
+	t.Setenv("BRIDGE_MANAGED", "false")
+	t.Setenv("BRIDGE_LOG_STATUS_REQUESTS", invalid)
+
+	_, err := Load()
+	if err == nil || err.Error() != "BRIDGE_LOG_STATUS_REQUESTS_invalid" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), invalid) {
+		t.Fatal("logging option value leaked")
 	}
 }

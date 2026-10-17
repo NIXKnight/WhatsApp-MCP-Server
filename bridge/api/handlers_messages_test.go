@@ -40,7 +40,7 @@ func testAPILogger() *slog.Logger {
 func testAPIHandler(messageStore *store.Store) http.Handler {
 	logger := testAPILogger()
 	handler := NewHandler(nil, messageStore, nil, nil, 3, logger)
-	return NewServer("127.0.0.1:0", handler, logger).srv.Handler
+	return NewServer("127.0.0.1:0", handler, logger, true).srv.Handler
 }
 
 func performRequest(handler http.Handler, target string) *httptest.ResponseRecorder {
@@ -74,6 +74,7 @@ func TestMessageRoutesRegisteredWithoutCollision(t *testing.T) {
 		"127.0.0.1:0",
 		NewHandler(nil, nil, nil, nil, 3, logger),
 		logger,
+		true,
 	)
 	router, ok := server.srv.Handler.(chi.Routes)
 	if !ok {
