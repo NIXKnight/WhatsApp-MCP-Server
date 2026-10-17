@@ -12,13 +12,16 @@ import (
 
 // MessageRow is the database representation of a message.
 type MessageRow struct {
-	ID                string
-	ChatJID           string
-	Sender            string
-	SenderName        string
-	Content           string
-	Timestamp         time.Time
-	IsFromMe          bool
+	ID         string
+	ChatJID    string
+	Sender     string
+	SenderName string
+	Content    string
+	Timestamp  time.Time
+	IsFromMe   bool
+	// IsBridgeOrigin is durable exact-match evidence for an own message sent by
+	// this bridge. Once true, updates never clear it.
+	IsBridgeOrigin    bool
 	MediaType         string
 	Filename          string
 	URL               string
@@ -64,7 +67,7 @@ type CompactMessage struct {
 // is aliased m; columns are qualified so a LEFT JOIN onto messages_media (mm)
 // cannot raise ambiguous-column errors for names shared by both tables
 // (chat_jid, media_type, filename, url, file_length, etc.).
-const msgSelectCols = `m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp, m.is_from_me, ` +
+const msgSelectCols = `m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp, m.is_from_me, m.is_bridge_origin, ` +
 	`m.media_type, m.filename, m.url, m.media_key, m.file_sha256, m.file_enc_sha256, ` +
 	`m.file_length, m.push_name, m.quoted_message_id, m.quoted_participant`
 
@@ -85,7 +88,8 @@ type MessageWriteResult string
 const (
 	// MessageInserted means a new supported message row committed.
 	MessageInserted MessageWriteResult = "inserted"
-	// MessageUpdated means an existing row was updated without notification.
+	// MessageUpdated means an existing row was updated. An eligible live event
+	// may also create its first notification when history inserted the row first.
 	MessageUpdated MessageWriteResult = "updated"
 	// MessageSkipped means unsupported content was ignored without SQL.
 	MessageSkipped MessageWriteResult = "skipped"
@@ -111,14 +115,23 @@ const insertMessageSQL = `INSERT INTO messages
 			 ON CONFLICT(id, chat_jid) DO NOTHING RETURNING id`
 const updateMessageSQL = `UPDATE messages SET sender = $3, sender_name = $4, content = $5, timestamp = $6, is_from_me = $7, media_type = $8, filename = $9, url = $10, media_key = $11, file_sha256 = $12, file_enc_sha256 = $13, file_length = $14, push_name = $15, quoted_message_id = $16, quoted_participant = $17 WHERE id = $1 AND chat_jid = $2`
 
+const selectMessageBridgeOriginSQL = `SELECT is_bridge_origin FROM messages WHERE id = $1 AND chat_jid = $2`
+const markMessageBridgeOriginSQL = `UPDATE messages SET is_bridge_origin = TRUE WHERE id = $1 AND chat_jid = $2`
+const notificationExistsForMessageSQL = `SELECT EXISTS (
+ SELECT 1 FROM notification_outbox
+ WHERE event_type = 'whatsapp.message.received' AND chat_jid = $1 AND message_id = $2
+)`
+
 // UpsertMessage preserves the legacy non-notifying history/import path.
 func (s *Store) UpsertMessage(m *MessageRow) error {
 	_, err := s.SaveMessage(context.Background(), m, nil)
 	return err
 }
 
-// SaveMessage atomically saves a message and, for an eligible first insertion
-// only, allocates its canonical-chat sequence and creates its v2 notification.
+// SaveMessage atomically saves a message and creates at most one v2
+// notification for an eligible live event. A live event may notify after a
+// non-notifying history import inserted the row; the message-row lock and
+// outbox uniqueness prevent concurrent duplicates from allocating a sequence.
 // Results are usable only on successful commit. Cancellation or a commit failure
 // may have an unknown outcome; the outbox is authoritative.
 func (s *Store) SaveMessage(ctx context.Context, msg *MessageRow, request *NotificationRequest) (MessageWriteResult, error) {
@@ -135,9 +148,6 @@ func (s *Store) SaveMessage(ctx context.Context, msg *MessageRow, request *Notif
 	eligible := request != nil
 	if eligible {
 		candidate = *request
-		if !validV2NotificationRequest(m, candidate) {
-			return "", errors.New("notification_metadata_invalid")
-		}
 	}
 	var result MessageWriteResult
 	err := s.submitContext(ctx, func(tx *sql.Tx) error {
@@ -147,6 +157,8 @@ func (s *Store) SaveMessage(ctx context.Context, msg *MessageRow, request *Notif
 			m.PushName, m.QuotedMessageID, m.QuotedParticipant}
 		var id string
 		err := tx.QueryRowContext(ctx, insertMessageSQL, args...).Scan(&id)
+		inserted := err == nil
+		bridgeOrigin := false
 		if errors.Is(err, sql.ErrNoRows) {
 			updated, err := tx.ExecContext(ctx, updateMessageSQL, args...)
 			if err != nil {
@@ -159,35 +171,85 @@ func (s *Store) SaveMessage(ctx context.Context, msg *MessageRow, request *Notif
 			if count != 1 {
 				return errors.New("message_update_missing")
 			}
+			// UPDATE holds the message-row lock until commit. Reading the durable
+			// classification now serializes duplicate notification decisions even
+			// when multiple bridge processes share the database.
+			if err := tx.QueryRowContext(ctx, selectMessageBridgeOriginSQL, m.ID, m.ChatJID).Scan(&bridgeOrigin); err != nil {
+				return err
+			}
 			result = MessageUpdated
-			return nil
-		}
-		if err != nil {
+		} else if err != nil {
 			return err
+		} else {
+			result = MessageInserted
 		}
-		if eligible {
-			eventID, err := newNotificationID()
+
+		// History and live paths both consume exact own-message evidence. When a
+		// marker matches, its observation and the durable message classification
+		// commit atomically. Updates never clear an existing classification.
+		if m.IsFromMe && !bridgeOrigin {
+			matched, err := consumeOutboundOrigin(ctx, tx, m.ID, m.ChatJID)
 			if err != nil {
 				return err
 			}
-			var sequence int64
-			if err := tx.QueryRowContext(ctx, allocateNotificationSequenceSQL, candidate.CanonicalChatJID).Scan(&sequence); err != nil {
-				return err
-			}
-			receivedAt := candidate.ReceivedAt.UTC().Truncate(time.Microsecond)
-			var senderAlt any
-			if candidate.SenderAltJID != "" {
-				senderAlt = candidate.SenderAltJID
-			}
-			if _, err := tx.ExecContext(ctx, insertNotificationSQL,
-				eventID, m.ChatJID, candidate.CanonicalChatJID, m.ID,
-				m.Timestamp.UTC().Truncate(time.Microsecond), receivedAt,
-				receivedAt.Add(candidate.MaxAge), sequence, candidate.SenderJID,
-				senderAlt, candidate.ChatKind, candidate.IsFromMe); err != nil {
-				return err
+			if matched {
+				marked, err := tx.ExecContext(ctx, markMessageBridgeOriginSQL, m.ID, m.ChatJID)
+				if err != nil {
+					return err
+				}
+				count, err := marked.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if count != 1 {
+					return errors.New("message_origin_mark_missing")
+				}
+				bridgeOrigin = true
 			}
 		}
-		result = MessageInserted
+		if !eligible || bridgeOrigin {
+			return nil
+		}
+
+		// A conflict means history or an earlier live event inserted this row.
+		// Check the outbox while retaining the row lock before allocating a
+		// sequence, so an existing notification consumes no second sequence.
+		if !inserted {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, notificationExistsForMessageSQL, m.ChatJID, m.ID).Scan(&exists); err != nil {
+				return err
+			}
+			if exists {
+				return nil
+			}
+		}
+
+		// Validation is intentionally after origin classification and duplicate
+		// detection. A bridge echo never emits a notification, and an already
+		// notified duplicate has no new metadata to admit.
+		if !validV2NotificationRequest(m, candidate) {
+			return errors.New("notification_metadata_invalid")
+		}
+		eventID, err := newNotificationID()
+		if err != nil {
+			return err
+		}
+		var sequence int64
+		if err := tx.QueryRowContext(ctx, allocateNotificationSequenceSQL, candidate.CanonicalChatJID).Scan(&sequence); err != nil {
+			return err
+		}
+		receivedAt := candidate.ReceivedAt.UTC().Truncate(time.Microsecond)
+		var senderAlt any
+		if candidate.SenderAltJID != "" {
+			senderAlt = candidate.SenderAltJID
+		}
+		if _, err := tx.ExecContext(ctx, insertNotificationSQL,
+			eventID, m.ChatJID, candidate.CanonicalChatJID, m.ID,
+			m.Timestamp.UTC().Truncate(time.Microsecond), receivedAt,
+			receivedAt.Add(candidate.MaxAge), sequence, candidate.SenderJID,
+			senderAlt, candidate.ChatKind, candidate.IsFromMe); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {

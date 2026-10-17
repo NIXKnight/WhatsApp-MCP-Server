@@ -58,7 +58,7 @@ func (h *Handler) SendMessage(w http.ResponseWriter, r *http.Request) {
 	ephemeral := h.getEphemeralExpiry(r.Context(), jid)
 	msg := buildTextMessage(req.Text, req.QuotedMessageID, req.QuotedParticipant, req.Mentions, ephemeral)
 
-	resp, err := h.client.WA.SendMessage(r.Context(), jid, msg)
+	resp, err := h.client.SendBridgeMessage(r.Context(), jid, msg)
 	if err != nil {
 		h.log.Error("send message", "jid", toJID, "err", err)
 		writeError(w, http.StatusInternalServerError, "send failed", "SEND_ERROR")
@@ -151,7 +151,7 @@ func (h *Handler) SendMedia(w http.ResponseWriter, r *http.Request) {
 		injectEphemeralExpiry(result.Message, ephemeral)
 	}
 
-	resp, err := h.client.WA.SendMessage(r.Context(), jid, result.Message)
+	resp, err := h.client.SendBridgeMessage(r.Context(), jid, result.Message)
 	if err != nil {
 		h.log.Error("send media message", "jid", toJID, "err", err)
 		writeError(w, http.StatusInternalServerError, "send failed", "SEND_ERROR")

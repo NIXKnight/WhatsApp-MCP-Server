@@ -20,12 +20,12 @@ type Server struct {
 
 // NewServer constructs and configures the HTTP server with all routes and
 // middleware. It does not start listening.
-func NewServer(addr string, h *Handler, log *slog.Logger) *Server {
+func NewServer(addr string, h *Handler, log *slog.Logger, logStatusRequests bool) *Server {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
-	r.Use(newSlogMiddleware(log))
+	r.Use(newSlogMiddleware(log, logStatusRequests))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
@@ -133,12 +133,15 @@ func writeError(w http.ResponseWriter, status int, msg, code string) {
 
 // ---- Logging middleware -------------------------------------------------
 
-func newSlogMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
+func newSlogMiddleware(log *slog.Logger, logStatusRequests bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 			next.ServeHTTP(ww, r)
+			if !logStatusRequests && r.Method == http.MethodGet && r.URL.Path == "/api/status" && ww.Status() >= 200 && ww.Status() < 400 {
+				return
+			}
 			log.Info("http",
 				"method", r.Method,
 				"path", r.URL.Path,

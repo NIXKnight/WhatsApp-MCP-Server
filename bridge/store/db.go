@@ -198,7 +198,7 @@ func runMigrations(databaseURL string) error {
 }
 
 // scanMessages scans a *sql.Rows produced by the standard message SELECT
-// column list into MessageRow values. The expected column order is the 17 base
+// column list into MessageRow values. The expected column order is the 18 base
 // message columns, then the snippet column, then the two messages_media
 // transcription columns (transcription, transcribed_at) supplied by the LEFT
 // JOIN in the message queries.
@@ -211,7 +211,7 @@ func scanMessages(rows *sql.Rows) ([]MessageRow, error) {
 		var transcribedAt sql.NullTime
 		err := rows.Scan(
 			&m.ID, &m.ChatJID, &m.Sender, &m.SenderName, &m.Content,
-			&ts, &m.IsFromMe, &m.MediaType, &m.Filename, &m.URL,
+			&ts, &m.IsFromMe, &m.IsBridgeOrigin, &m.MediaType, &m.Filename, &m.URL,
 			&m.MediaKey, &m.FileSHA256, &m.FileEncSHA256, &fileLength,
 			&m.PushName, &m.QuotedMessageID, &m.QuotedParticipant, &m.Snippet,
 			&m.Transcription, &transcribedAt,

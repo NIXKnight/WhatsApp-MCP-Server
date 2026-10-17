@@ -7,9 +7,10 @@
 //
 // Configuration via environment variables:
 //
-//	BRIDGE_ADDR      — HTTP bind address (default: 127.0.0.1:8080)
-//	BRIDGE_DATA_DIR  — data directory for SQLite and media (default: ./data)
-//	BRIDGE_LOG_LEVEL — log verbosity: debug|info|warn|error (default: info)
+//	BRIDGE_ADDR                — HTTP bind address (default: 127.0.0.1:8080)
+//	BRIDGE_DATA_DIR            — data directory for media (default: ./data)
+//	BRIDGE_LOG_LEVEL           — log verbosity: debug|info|warn|error (default: info)
+//	BRIDGE_LOG_STATUS_REQUESTS — log successful GET /api/status requests (default: true)
 package main
 
 import (
@@ -209,7 +210,7 @@ func run() int {
 	embedder := embed.New(cfg.EmbedderURL, cfg.EmbedderTimeout)
 	mediaAnalyzer := analyzer.New(cfg.AnalyzerURL, cfg.AnalyzerTimeout)
 	h := api.NewHandler(waClient, st, embedder, mediaAnalyzer, cfg.MediaMaxDownloadAttempts, log.With("component", "api"))
-	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"))
+	srv := api.NewServer(cfg.Addr, h, log.With("component", "http"), cfg.LogStatusRequests)
 	resources.stopHTTP = srv.Shutdown
 
 	srvErrCh := make(chan error, 1)

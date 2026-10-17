@@ -15,6 +15,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/NIXKnight/WhatsApp-MCP-Server/bridge/connection"
@@ -48,12 +49,15 @@ const maxKeepaliveFailures = 3
 // Client wraps a whatsmeow.Client with the application's message store and
 // connection state machine.
 type Client struct {
-	WA      *whatsmeow.Client
-	Store   *store.Store
-	conn    *connection.Connection
-	log     *slog.Logger
-	dataDir string
-	managed bool
+	WA              *whatsmeow.Client
+	Store           *store.Store
+	origins         outboundOriginStore
+	outbound        outboundMessenger
+	resolveOutbound func(context.Context, types.JID) (types.JID, error)
+	conn            *connection.Connection
+	log             *slog.Logger
+	dataDir         string
+	managed         bool
 	// The handler registration is removed on terminal shutdown, draining ingress.
 	eventHandlerID uint32
 	stopOnce       sync.Once
@@ -72,6 +76,7 @@ func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Lo
 	// discard-only dependency logging from the first operation onward.
 	c := &Client{
 		Store:     st,
+		origins:   st,
 		log:       log,
 		dataDir:   dataDir,
 		keepAlive: connection.NewKeepaliveTracker(maxKeepaliveFailures),
@@ -109,6 +114,8 @@ func NewClient(databaseURL string, dataDir string, st *store.Store, log *slog.Lo
 	// non-deterministic. Our loop already handles KeepAliveTimeout events.
 	wa.EnableAutoReconnect = false
 	c.WA = wa
+	c.outbound = wa
+	c.resolveOutbound = c.resolveOutboundChat
 	c.conn = connection.NewConnection(wa, log, c.managed)
 	c.eventHandlerID = wa.AddEventHandler(c.handleEvent)
 
