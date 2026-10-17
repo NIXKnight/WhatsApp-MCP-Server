@@ -200,19 +200,41 @@ export function createToolJournal(ports: Pick<RedisRepository, 'nativeJournal' |
     async run(binding, prompt) {
       const l = get(binding); if (!l.context || l.running || l.poisoned) throw fail();
       l.running = true;
+      let promptFailure: unknown, promptFailed = false, classifiedPromptFailure = false;
       try {
         await gate(l);
-        const prior = await repository.journal.list(l.context.work().event.canonical_chat_jid);
-        if (prior.some(a => a.eventId === l.context!.work().event.event_id)) throw fail();
-        await prompt(); await l.tail; await gate(l);
-        if (l.calls.size) {
+        const event = l.context.work().event;
+        const prior = await repository.journal.list(event.canonical_chat_jid);
+        // Any durable record for this event predates this run and blocks replay,
+        // including a confirmed send whose prompt later failed.
+        if (prior.some(a => a.eventId === event.event_id)) throw fail();
+        try { await prompt(); } catch (error) { promptFailed = true; promptFailure = error; }
+        await l.tail;
+        const after = await repository.journal.list(event.canonical_chat_jid);
+        const current = after.filter(a => a.eventId === event.event_id);
+        const active = l.calls.size > 0 || current.some(a => a.status === 'attempting' || a.status === 'uncertain');
+        if (active) {
+          // A call may have reached the external service. Convert one live
+          // attempt when still fenced; all remaining attempting evidence is
+          // already conservatively unresolved and prevents replay.
           for (const a of l.calls.values()) { await uncertain(l, a); break; }
           throw fail();
         }
-        const after = await repository.journal.list(l.context.work().event.canonical_chat_jid);
-        if (after.some(a => a.eventId !== l.context!.work().event.event_id || a.status !== 'confirmed')) throw fail();
-      } catch { l.poisoned = true; throw fail(); }
-      finally { await l.tail; l.running = false; }
+        if (promptFailed) {
+          classifiedPromptFailure = true;
+          // A confirmed send is retained, but failure after that side effect is
+          // a session failure rather than an unknown mutation outcome.
+          if (current.some(a => a.status === 'confirmed')) throw new ControllerError('session_failed');
+          if (promptFailure instanceof ControllerError) throw promptFailure;
+          throw new ControllerError('session_failed');
+        }
+        await gate(l);
+        if (after.some(a => a.eventId !== event.event_id || a.status !== 'confirmed')) throw fail();
+      } catch (error) {
+        l.poisoned = true;
+        if (classifiedPromptFailure && error instanceof ControllerError) throw error;
+        throw fail();
+      } finally { await l.tail; l.running = false; }
     },
     async confirmed(context) {
       await context.current();

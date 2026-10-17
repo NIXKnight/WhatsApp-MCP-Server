@@ -93,6 +93,42 @@ describe('native-shaped durable mutation hooks', () => {
     await expect(f.journal.run(binding, async () => { expect((await f.invokeCall()).block).toBe(true); })).rejects.toThrow('mutation_uncertain');
     expect(f.nativeJournal.begin).not.toHaveBeenCalled();
   });
+  it('blocks replay when a journal record for the event exists before run starts', async () => {
+    const f = await fixture(), prompt = vi.fn(async () => {});
+    f.states.set('f'.repeat(32), { version: 1, attemptId: 'f'.repeat(32), eventId: work.event.event_id,
+      canonicalChatId: chat, toolCallId: 'SYNTHETIC_PRIOR', tool: 'send_message', destination: other,
+      startedAt: '2033-05-18T03:33:20Z', ownership: work.ownership, status: 'confirmed',
+      messageId: 'SYNTHETIC_PRIOR_SENT', finishedAt: '2033-05-18T03:33:22Z' });
+    await expect(f.journal.run(binding, prompt)).rejects.toMatchObject({ code: 'mutation_uncertain' });
+    expect(prompt).not.toHaveBeenCalled(); expect(f.nativeJournal.begin).not.toHaveBeenCalled();
+  });
+  it('preserves controller prompt failures without mutation and maps other prompt failures to session_failed', async () => {
+    const controller = await fixture();
+    await expect(controller.journal.run(binding, async () => { throw new ControllerError('usage_unknown'); }))
+      .rejects.toMatchObject({ code: 'usage_unknown' });
+    expect(controller.nativeJournal.begin).not.toHaveBeenCalled();
+
+    const external = await fixture();
+    await expect(external.journal.run(binding, async () => { throw new Error('SYNTHETIC_PROVIDER_FAILURE'); }))
+      .rejects.toMatchObject({ code: 'session_failed' });
+    expect(external.nativeJournal.begin).not.toHaveBeenCalled();
+  });
+  it('classifies a prompt exception with an active attempt as mutation_uncertain without retry', async () => {
+    const f = await fixture(), prompt = vi.fn(async () => { await f.invokeCall(); throw new Error('SYNTHETIC_PROVIDER_FAILURE'); });
+    await expect(f.journal.run(binding, prompt)).rejects.toMatchObject({ code: 'mutation_uncertain' });
+    expect([...f.states.values()][0]?.status).toBe('uncertain'); expect(f.nativeJournal.begin).toHaveBeenCalledTimes(1);
+    const retry = vi.fn(async () => {}); await expect(f.journal.run(binding, retry)).rejects.toMatchObject({ code: 'mutation_uncertain' });
+    expect(prompt).toHaveBeenCalledTimes(1); expect(retry).not.toHaveBeenCalled(); expect(f.nativeJournal.begin).toHaveBeenCalledTimes(1);
+  });
+  it('retains a confirmed mutation but classifies a later prompt exception as session_failed', async () => {
+    const f = await fixture(), prompt = vi.fn(async () => { const e = call(); await f.invokeCall(e); await f.invokeResult(result(e));
+      throw new Error('SYNTHETIC_PROVIDER_FAILURE'); });
+    await expect(f.journal.run(binding, prompt)).rejects.toMatchObject({ code: 'session_failed' });
+    expect([...f.states.values()][0]?.status).toBe('confirmed'); expect(f.nativeJournal.confirm).toHaveBeenCalledTimes(1);
+    expect(f.records.at(-1)?.state.status).toBe('confirmed');
+    const retry = vi.fn(async () => {}); await expect(f.journal.run(binding, retry)).rejects.toMatchObject({ code: 'mutation_uncertain' });
+    expect(prompt).toHaveBeenCalledTimes(1); expect(retry).not.toHaveBeenCalled(); expect(f.nativeJournal.begin).toHaveBeenCalledTimes(1);
+  });
   it('does not invoke execution when the durable begin barrier fails', async () => {
     const f = await fixture(); f.nativeJournal.begin.mockRejectedValueOnce(new Error('SYNTHETIC_FAILURE'));
     await expect(f.journal.run(binding, async () => { expect((await f.invokeCall()).block).toBe(true); })).rejects.toThrow('mutation_uncertain');

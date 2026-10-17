@@ -111,10 +111,13 @@ describe('ownership-safe worker, injected Pi only', () => {
     const before = renewals; tick.resolve(); await until(() => renewals > before); hold.resolve(); await running;
     expect(renewals).toBeGreaterThan(before);
   });
-  it('uncertain prompt result is never marked or retried', async () => {
-    const f = fixture(); f.options.turns.run = async (_s, _c, prompt) => { await prompt(); throw new Error('synthetic_failure'); };
+  it.each([
+    ['session_failed', 'session_failed'], ['mutation_uncertain', 'mutation_uncertain']
+  ] as const)('honors journal-classified %s prompt failure without marking or retrying', async (code, pause) => {
+    const f = fixture(); f.options.turns.run = async (_s, _c, prompt) => { await prompt(); throw new ControllerError(code); };
     await runChatWorker(f.repository, work(), f.options);
-    expect(f.effects.filter(x => x === 'prompt')).toHaveLength(1); expect(f.effects).not.toContain('marker'); expect(f.effects).toContain('pause:mutation_uncertain');
+    expect(f.effects.filter(x => x === 'prompt')).toHaveLength(1); expect(f.effects).not.toContain('marker');
+    expect(f.effects).not.toContain('complete'); expect(f.effects).toContain(`pause:${pause}`);
   });
 });
 describe('non-authoritative diagnostics', () => {
