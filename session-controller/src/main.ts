@@ -485,7 +485,7 @@ export interface InventoryPreflightDependencies {
   validate(path: string): Promise<void>;
   createTemporary(): Promise<InventoryResourceRoots>;
   removeTemporary(roots: InventoryResourceRoots): Promise<void>;
-  enterHome(home: string): () => void;
+  enterEnvironment(roots: InventoryResourceRoots): () => void;
   createRuntime(config: ControllerConfig): Promise<Parameters<typeof loadNativeSdk>[2]>;
   loadSdk: typeof loadNativeSdk;
   status(value: 'pi_inventory_ready' | 'pi_inventory_failed'): void;
@@ -512,6 +512,7 @@ const productionInventoryPreflight: InventoryPreflightDependencies = {
         mkdir(roots.cwd, { recursive: true, mode: 0o700 }),
         mkdir(roots.agentDir, { recursive: true, mode: 0o700 }),
         mkdir(join(roots.home, '.agents'), { recursive: true, mode: 0o700 }),
+        mkdir(join(roots.root, 'packages'), { recursive: true, mode: 0o700 }),
         mkdir(roots.sessionDir, { recursive: true, mode: 0o700 })
       ]);
       return roots;
@@ -524,17 +525,33 @@ const productionInventoryPreflight: InventoryPreflightDependencies = {
     const { rm } = await import('node:fs/promises');
     await rm(roots.root, { recursive: true, force: true });
   },
-  enterHome(home) {
-    const hadHome = Object.prototype.hasOwnProperty.call(process.env, 'HOME');
-    const previous = process.env.HOME;
-    process.env.HOME = home;
+  enterEnvironment(roots) {
+    const replacements = {
+      HOME: roots.home,
+      PI_CODING_AGENT_DIR: roots.agentDir,
+      PI_PACKAGE_DIR: join(roots.root, 'packages')
+    } as const;
+    const previous = Object.keys(replacements).map(key => ({
+      key: key as keyof typeof replacements,
+      present: Object.prototype.hasOwnProperty.call(process.env, key),
+      value: process.env[key]
+    }));
     let restored = false;
-    return () => {
+    const restore = (): void => {
       if (restored) return;
       restored = true;
-      if (hadHome) process.env.HOME = previous!;
-      else delete process.env.HOME;
+      for (const snapshot of previous) {
+        if (snapshot.present) process.env[snapshot.key] = snapshot.value!;
+        else delete process.env[snapshot.key];
+      }
     };
+    try {
+      for (const [key, value] of Object.entries(replacements)) process.env[key] = value;
+    } catch (error) {
+      restore();
+      throw error;
+    }
+    return restore;
   },
   async createRuntime(config) {
     const { ModelRuntime } = await import('@earendil-works/pi-coding-agent');
@@ -553,6 +570,13 @@ const productionInventoryPreflight: InventoryPreflightDependencies = {
 };
 
 let inventoryPreflightActive = false;
+function silenceInventoryConsole(): () => void {
+  const methods = ['debug', 'info', 'log', 'warn', 'error'] as const;
+  const original = Object.fromEntries(methods.map(method => [method, console[method]])) as
+    Record<(typeof methods)[number], typeof console.log>;
+  for (const method of methods) console[method] = (() => {}) as typeof console.log;
+  return () => { for (const method of methods) console[method] = original[method] as never; };
+}
 /** Explicit operator preflight only. It never prompts or constructs service lifecycle resources. */
 export async function checkPiInventory(
   overrides: Partial<InventoryPreflightDependencies> = {}
@@ -563,8 +587,11 @@ export async function checkPiInventory(
     return 1;
   }
   inventoryPreflightActive = true;
+  // The adapter has fixed informational console logging. This CLI path is
+  // process-exclusive and returns only its closed status contract.
+  const restoreConsole = silenceInventoryConsole();
   let roots: InventoryResourceRoots | undefined;
-  let restoreHome: (() => void) | undefined;
+  let restoreEnvironment: (() => void) | undefined;
   let session: SdkSession | undefined;
   let failed = false;
   try {
@@ -576,13 +603,13 @@ export async function checkPiInventory(
         dependencies.validate(config.pi.preCompactionPath),
         dependencies.validate(config.pi.compactionSummaryPath)
       ]);
-      // Auth/model files and selected provider/model deliberately remain the
-      // validated operator configuration supplied to this explicit preflight.
-      const runtime = await dependencies.createRuntime(config);
       roots = await dependencies.createTemporary();
-      // This process-global override is safe only because exact CLI dispatch
+      // These process-global overrides are safe only because exact CLI dispatch
       // selects this exclusive preflight before normal concurrent work exists.
-      restoreHome = dependencies.enterHome(roots.home);
+      // Auth/model files and selected provider/model deliberately remain the
+      // explicit validated operator paths supplied to runtime creation.
+      restoreEnvironment = dependencies.enterEnvironment(roots);
+      const runtime = await dependencies.createRuntime(config);
       const sdk = await dependencies.loadSdk(config, policy, runtime, [], {
         kind: 'inventory-preflight', root: roots.root,
         cwd: roots.cwd, agentDir: roots.agentDir
@@ -598,8 +625,8 @@ export async function checkPiInventory(
       if (session) {
         try { await session.dispose(); } catch { failed = true; }
       }
-      if (restoreHome) {
-        try { restoreHome(); } catch { failed = true; }
+      if (restoreEnvironment) {
+        try { restoreEnvironment(); } catch { failed = true; }
       }
       if (roots) {
         try { await dependencies.removeTemporary(roots); } catch { failed = true; }
@@ -609,6 +636,7 @@ export async function checkPiInventory(
     dependencies.status(status);
     return failed ? 1 : 0;
   } finally {
+    restoreConsole();
     inventoryPreflightActive = false;
   }
 }

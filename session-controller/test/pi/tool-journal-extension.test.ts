@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import type { ExtensionAPI, ExtensionContext, CustomToolCallEvent, ToolResultEvent, ToolInfo } from '@earendil-works/pi-coding-agent';
 import { canonicalChatId, eventId, fingerprintEvent, ControllerError, type ClaimedWork, type MutationState, type MutationAttempt, type SessionBinding, type PiSessionPort, type CompletionMarker } from '../../src/domain.js';
 import { createToolJournal, confirmedMessage, mutationDestination, type JournalRecord } from '../../src/pi/tool-journal-extension.js';
-import { WHATSAPP_SERVER } from '../../src/pi/mcp-loader.js';
+import { ADAPTER_WHATSAPP_SERVER, MCP_ADAPTER_SOURCE_PATH, WHATSAPP_SERVER } from '../../src/pi/mcp-loader.js';
 import { runChatWorker, type TurnContext, type WorkerOptions, type WorkerRepository } from '../../src/scheduler/chat-worker.js';
 import { createRepository } from '../../src/redis/repository.js';
 import type { RedisConnections } from '../../src/redis/client.js';
@@ -19,22 +19,21 @@ function gate() { let resolve!: () => void; const promise = new Promise<void>(r 
 function call(tool = 'send_message', id = 'SYNTHETIC_CALL', input: Record<string, unknown> = { to: other, text: 'SYNTHETIC_BODY' }): CustomToolCallEvent {
   return { type: 'tool_call', toolName: `mcp__${WHATSAPP_SERVER}__${tool}`, toolCallId: id, input, parentToolCallId: 'SYNTHETIC_CODEMODE' };
 }
-/** Generated from FastMCP 3.2 Tool.convert_result for annotated `-> str`
- * (base.py:291-320), followed by Pi 1.1.0 convertMcpResult, which strips only
- * `_meta` and stores the remaining CallToolResult as structuredContent. */
+/** Generated from FastMCP 3.2 Tool.convert_result for annotated `-> str`.
+ * The adapter preserves this small raw CallToolResult in bounded details. */
 function result(e = call(), payload: unknown = { success: true, message_id: 'SYNTHETIC_SENT' }): ToolResultEvent {
   const raw = JSON.stringify(payload); if (raw === undefined) throw new Error('synthetic_fixture_invalid');
   const fastMcp = { content: [{ type: 'text' as const, text: raw }], structuredContent: { result: raw },
     _meta: { fastmcp: { wrap_result: true } } };
   const { _meta: _removedByPi, ...piEnvelope } = fastMcp;
   return { type: 'tool_result', toolName: e.toolName, toolCallId: e.toolCallId, parentToolCallId: e.parentToolCallId!, input: e.input,
-    content: fastMcp.content, details: { server: WHATSAPP_SERVER, tool: e.toolName.split('__').at(-1) }, isError: false,
+    content: fastMcp.content, details: { server: ADAPTER_WHATSAPP_SERVER, tool: e.toolName.split('__').at(-1), mcpResult: fastMcp }, isError: false,
     structuredContent: piEnvelope };
 }
 function errorResult(e = call()): ToolResultEvent {
   const callToolResult = { content: [{ type: 'text' as const, text: 'SYNTHETIC_FIXED_ERROR' }], isError: true };
   return { type: 'tool_result', toolName: e.toolName, toolCallId: e.toolCallId, parentToolCallId: e.parentToolCallId!, input: e.input,
-    content: callToolResult.content, details: { server: WHATSAPP_SERVER, tool: e.toolName.split('__').at(-1) }, isError: true,
+    content: callToolResult.content, details: { error: 'tool_error', server: ADAPTER_WHATSAPP_SERVER, mcpResult: callToolResult }, isError: true,
     structuredContent: callToolResult };
 }
 async function fixture() {
@@ -51,8 +50,8 @@ async function fixture() {
   };
   const ownMutation = vi.fn(async (): Promise<typeof own> => own);
   const journal = createToolJournal({ nativeJournal, ownMutation }, { clock: { now: () => 2000000000000 }, id: () => (++serial).toString(16).padStart(32, '0') });
-  const info: ToolInfo = { name: call().toolName, description: '', parameters: { type: 'object' }, exposure: 'direct', namespace: { name: `mcp__${WHATSAPP_SERVER}` },
-    sourceInfo: { path: '<inline:mcp>', source: 'inline', scope: 'temporary', origin: 'top-level' } };
+  const info: ToolInfo = { name: call().toolName, description: '', parameters: { type: 'object' }, exposure: 'direct',
+    sourceInfo: { path: MCP_ADAPTER_SOURCE_PATH, source: 'inline', scope: 'temporary', origin: 'top-level' } };
   const pi = { on: (type: string, handler: any) => { handlers[type] = handler; return () => {}; }, getAllTools: () => [info] } as unknown as ExtensionAPI;
   await journal.extension(pi);
   const ctx = { sessionManager: { getSessionId: () => binding.sessionId }, abort: vi.fn() } as unknown as ExtensionContext;
@@ -186,20 +185,23 @@ describe('locked seven tools and native response envelope', () => {
     { success: true, message_id: 1 }, { success: true, message_id: 'SYNTHETIC_SENT', extra: true },
     { id: 'SYNTHETIC_SENT', timestamp: '2033-05-18T03:33:22Z' }, { success: true, message_id: { nested: 'SYNTHETIC_SENT' } }
   ])('does not infer explicit success from invalid locked response %j', payload => { expect(confirmedMessage(result(call(), payload), 'send_message')).toBeUndefined(); });
-  it('accepts only the exact production FastMCP string wrapper and rejects direct/multiple/nonJSON/mixed/oversized forms', () => {
+  it('accepts only the bounded adapter raw result and rejects direct/multiple/nonJSON/mixed/guarded/oversized forms', () => {
+    const raw = (event: ToolResultEvent) => (event.details as any).mcpResult;
     const valid = result(); expect(confirmedMessage(valid, 'send_message')).toBe('SYNTHETIC_SENT');
-    const direct = result(); direct.structuredContent = { content: direct.content, structuredContent: { success: true, message_id: 'SYNTHETIC_SENT' } } as any;
+    const direct = result(); raw(direct).structuredContent = { success: true, message_id: 'SYNTHETIC_SENT' };
     expect(confirmedMessage(direct, 'send_message')).toBeUndefined();
-    const multiple = result(); const envelope = multiple.structuredContent as { content: unknown[] };
-    envelope.content.push({ type: 'text', text: JSON.stringify({ success: true, message_id: 'SYNTHETIC_SENT' }) });
+    const multiple = result(); raw(multiple).content.push({ type: 'text', text: JSON.stringify({ success: true, message_id: 'SYNTHETIC_SENT' }) });
     expect(confirmedMessage(multiple, 'send_message')).toBeUndefined();
-    const nonJson = result(); (nonJson.structuredContent as any).structuredContent.result = 'SYNTHETIC_NONJSON';
-    (nonJson.structuredContent as any).content[0].text = 'SYNTHETIC_NONJSON'; expect(confirmedMessage(nonJson, 'send_message')).toBeUndefined();
-    const mixed = result(); (mixed.structuredContent as any).content[0].text = JSON.stringify({ success: true, message_id: 'SYNTHETIC_OTHER' });
+    const nonJson = result(); raw(nonJson).structuredContent.result = 'SYNTHETIC_NONJSON';
+    raw(nonJson).content[0].text = 'SYNTHETIC_NONJSON'; (nonJson.content[0] as any).text = 'SYNTHETIC_NONJSON';
+    expect(confirmedMessage(nonJson, 'send_message')).toBeUndefined();
+    const mixed = result(); (mixed.content[0] as any).text = JSON.stringify({ success: true, message_id: 'SYNTHETIC_OTHER' });
     expect(confirmedMessage(mixed, 'send_message')).toBeUndefined();
+    const guarded = result(); (guarded.details as any).outputGuard = { truncated: true };
+    expect(confirmedMessage(guarded, 'send_message')).toBeUndefined();
     const oversized = result(call(), { success: true, message_id: 'x'.repeat(4096) }); expect(confirmedMessage(oversized, 'send_message')).toBeUndefined();
     const failed = errorResult(); expect(confirmedMessage(failed, 'send_message')).toBeUndefined();
-    const absent = result(); delete absent.structuredContent; expect(confirmedMessage(absent, 'send_message')).toBeUndefined();
+    const absent = result(); delete (absent.details as any).mcpResult; expect(confirmedMessage(absent, 'send_message')).toBeUndefined();
   });
 });
 
@@ -400,7 +402,9 @@ describe('session host journal attachment', () => {
         const raw: Raw = {
           get isIdle() { return idle; },
           bindExtensions: async () => { await f.handlers['session_start']!({ type: 'session_start' }, f.ctx); },
-          getAllTools: () => [f.info], setAutoCompactionEnabled: () => {},
+          getAllTools: () => [f.info], getActiveToolNames: () => [f.info.name],
+          getCallableToolNames: () => [f.info.name], getToolDefinition: () => undefined,
+          extensionRunner: {} as never, setAutoCompactionEnabled: () => {},
           subscribe: cb => { listeners.add(cb); return () => { listeners.delete(cb); }; },
           prompt: async () => {
             idle = false; const e = call(); expect(await f.invokeCall(e)).toBeUndefined(); await f.invokeResult(result(e)); idle = true;

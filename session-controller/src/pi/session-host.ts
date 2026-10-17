@@ -266,7 +266,7 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
                 try { await operation; } catch { failed = true; }
                 try { await runtime.waitForIdle(); } catch { failed = true; }
                 disposed = true;
-                try { runtime.dispose(); } catch { failed = true; }
+                try { await runtime.dispose(); } catch { failed = true; }
                 try { await options.journal?.dispose(port.binding); } catch { failed = true; }
                 if (failed) throw new ControllerError('session_failed');
               } finally {
@@ -287,7 +287,7 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
         });
         active.set(chat, port); return port;
       } catch (error) {
-        try { raw?.dispose(); }
+        try { await raw?.dispose(); }
         catch { /* Failed-open cleanup cannot replace the primary fixed error class. */ }
         if (journalBinding && options.journal) { try { await options.journal.dispose(journalBinding); } catch { /* fixed outer error */ } }
         if (error instanceof ControllerError) throw error;

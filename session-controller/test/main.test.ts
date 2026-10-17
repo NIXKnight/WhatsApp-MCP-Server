@@ -10,7 +10,12 @@ import { connectRedis } from '../src/redis/client.js';
 import { readSessionMappings } from '../src/redis/repository.js';
 import { createCoordinator, type CoordinatorRepository } from '../src/scheduler/coordinator.js';
 import { createJournalTurns } from '../src/scheduler/chat-worker.js';
-import { loadNativeSdk, REQUIRED_WHATSAPP_TOOLS, WHATSAPP_SERVER } from '../src/pi/mcp-loader.js';
+import {
+  ADAPTER_WHATSAPP_SERVER, MCP_ADAPTER_EXTENSION, MCP_ADAPTER_SOURCE_PATH,
+  MCP_STATUS_OBSERVER_SOURCE_PATH, createControllerMcpConfig,
+  isConfiguredMcpAdapterPackage, loadNativeSdk, REQUIRED_WHATSAPP_TOOLS,
+  WHATSAPP_SERVER, withoutConfiguredMcpAdapter
+} from '../src/pi/mcp-loader.js';
 import type { SessionHost } from '../src/pi/session-host.js';
 import type {
   LifecycleComposition,
@@ -20,6 +25,33 @@ import type {
 } from '../src/main.js';
 
 const inventoryFsProbe = { active: false, paths: [] as unknown[] };
+const inventoryEnvironmentKeys = ['HOME', 'PI_CODING_AGENT_DIR', 'PI_PACKAGE_DIR'] as const;
+type InventoryEnvironmentKey = (typeof inventoryEnvironmentKeys)[number];
+interface EnvironmentSnapshot {
+  readonly key: InventoryEnvironmentKey;
+  readonly present: boolean;
+  readonly value: string | undefined;
+}
+function snapshotInventoryEnvironment(): readonly EnvironmentSnapshot[] {
+  return inventoryEnvironmentKeys.map(key => ({
+    key,
+    present: Object.prototype.hasOwnProperty.call(process.env, key),
+    value: process.env[key]
+  }));
+}
+function restoreInventoryEnvironment(snapshot: readonly EnvironmentSnapshot[]): void {
+  for (const entry of snapshot) {
+    if (entry.present) process.env[entry.key] = entry.value!;
+    else delete process.env[entry.key];
+  }
+}
+function expectInventoryEnvironment(snapshot: readonly EnvironmentSnapshot[], label?: string): void {
+  for (const entry of snapshot) {
+    expect(Object.prototype.hasOwnProperty.call(process.env, entry.key), `${label ?? ''}:${entry.key}:present`)
+      .toBe(entry.present);
+    if (entry.present) expect(process.env[entry.key], `${label ?? ''}:${entry.key}:value`).toBe(entry.value);
+  }
+}
 
 // Vitest does not fake node:timers/promises. Route the production delay through
 // the fakeable global timer while preserving the abort-aware timer contract.
@@ -256,35 +288,261 @@ describe('main lifecycle composition', () => {
       name => `mcp__${WHATSAPP_SERVER}__${name}`
     );
     expect(new Set(expectedInventory).size).toBe(expectedInventory.length);
-    const namespace = `mcp__${WHATSAPP_SERVER}`;
+    expect(MCP_ADAPTER_SOURCE_PATH).toBe(`<inline:${MCP_ADAPTER_EXTENSION}>`);
+    expect([
+      'npm:pi-mcp-adapter', 'npm:pi-mcp-adapter@5.3.1',
+      '  npm:pi-mcp-adapter@5.3.1\n',
+      { source: 'npm:pi-mcp-adapter', extensions: ['index.ts'] },
+      { source: '\t npm:pi-mcp-adapter \r\n', extensions: ['index.ts'] }
+    ].every(value => isConfiguredMcpAdapterPackage(value))).toBe(true);
+    expect([
+      './pi-mcp-adapter', 'npm:pi-mcp-adapter-extra',
+      'npm:alias@npm:pi-mcp-adapter', 'git:https://example.test/pi-mcp-adapter'
+    ].some(value => isConfiguredMcpAdapterPackage(value))).toBe(false);
+    const configuredPackages = [
+      'npm:pi-subagents', 'npm:pi-mcp-adapter',
+      { source: 'npm:hindsight', extensions: ['extension.ts'] },
+      { source: '  npm:pi-mcp-adapter@5.3.1\n', extensions: ['index.ts'] },
+      './operator-plugin'
+    ];
+    expect(withoutConfiguredMcpAdapter(configuredPackages)).toEqual([
+      'npm:pi-subagents',
+      { source: 'npm:hindsight', extensions: ['extension.ts'] },
+      './operator-plugin'
+    ]);
     const validTools = expectedInventory.map(name => ({
-      name, description: '', parameters: { type: 'object' }, exposure: 'direct',
-      namespace: { name: namespace },
-      sourceInfo: { path: '<inline:mcp>', source: 'inline', scope: 'temporary', origin: 'top-level' }
+      name, description: '', parameters: { type: 'object' }, exposure: 'direct' as const,
+      sourceInfo: { path: MCP_ADAPTER_SOURCE_PATH, source: 'inline', scope: 'temporary', origin: 'top-level' }
     }));
-    const native = await loadNativeSdk({} as never, {} as never, {} as never);
-    const readySession = (tools: readonly unknown[], getAllTools: () => readonly unknown[] = () => tools) =>
-      ({ getAllTools }) as never;
-    const invalidInventories = [
-      { kind: 'missing', tools: validTools.slice(1) },
-      { kind: 'duplicate', tools: [...validTools, { ...validTools[0]! }] },
+    const loaderConfig = {
+      bridge: { baseUrl: 'http://127.0.0.1:8080' },
+      pi: { cwd: '/synthetic/workspace' },
+      mcp: { command: '/synthetic/mcp', args: [], cwd: '/synthetic' }
+    } as never;
+    const originalOutputGuard = process.env['MCP_OUTPUT_GUARD'];
+    const originalDirectTools = process.env['MCP_DIRECT_TOOLS'];
+    const importSdk = vi.fn(async () => ({} as never));
+    const importAdapter = vi.fn(async () => ({} as never));
+    try {
+      process.env['MCP_OUTPUT_GUARD'] = '0';
+      await expect(loadNativeSdk(loaderConfig, {} as never, {} as never, [], { kind: 'full' }, importSdk, importAdapter))
+        .rejects.toMatchObject({ code: 'config_invalid' });
+      expect(importSdk).not.toHaveBeenCalled();
+      expect(importAdapter).not.toHaveBeenCalled();
+      delete process.env['MCP_OUTPUT_GUARD'];
+      process.env['MCP_DIRECT_TOOLS'] = '__none__';
+      await expect(loadNativeSdk(loaderConfig, {} as never, {} as never, [], { kind: 'full' }, importSdk, importAdapter))
+        .rejects.toMatchObject({ code: 'config_invalid' });
+      expect(importSdk).not.toHaveBeenCalled();
+      expect(importAdapter).not.toHaveBeenCalled();
+    } finally {
+      if (originalOutputGuard === undefined) delete process.env['MCP_OUTPUT_GUARD'];
+      else process.env['MCP_OUTPUT_GUARD'] = originalOutputGuard;
+      if (originalDirectTools === undefined) delete process.env['MCP_DIRECT_TOOLS'];
+      else process.env['MCP_DIRECT_TOOLS'] = originalDirectTools;
+    }
+
+    type InventoryTool = {
+      name: string;
+      description: string;
+      parameters: { type: string };
+      exposure: 'direct' | 'codemode' | 'hidden';
+      sourceInfo: { path: string; source: string; scope: string; origin: string };
+    };
+    interface InventoryState {
+      tools: InventoryTool[];
+      activeNames: string[];
+      callableNames: string[];
+      reads: { tools: number; active: number; callable: number };
+    }
+    interface SyntheticExtensionApi {
+      readonly events: {
+        on(name: string, listener: (value: unknown) => void): void;
+        emit(name: string, value: unknown): void;
+      };
+      on(name: string, listener: (...args: readonly unknown[]) => unknown): void;
+    }
+    type SyntheticExtensionFactory = (api: SyntheticExtensionApi) => void | Promise<void>;
+    interface SyntheticLoaderOptions {
+      readonly extensionFactories?: readonly { readonly factory: SyntheticExtensionFactory }[];
+    }
+    class SyntheticResourceLoader {
+      readonly factories: readonly SyntheticExtensionFactory[];
+      constructor(options: SyntheticLoaderOptions) {
+        this.factories = options.extensionFactories?.map(extension => extension.factory) ?? [];
+      }
+      async reload(): Promise<void> {}
+      getExtensions() { return { extensions: [], errors: [] }; }
+    }
+    const createdStates: InventoryState[] = [];
+    const publishedStatuses: unknown[] = [];
+    const syntheticSdk = {
+      SessionManager: {
+        create: () => ({}),
+        open: () => ({})
+      },
+      SettingsManager: {
+        create: () => ({
+          getPackages: () => [],
+          applyOverrides: () => {}
+        })
+      },
+      DefaultResourceLoader: SyntheticResourceLoader,
+      createCodemodeExtension: () => (() => {}),
+      createToolSearchExtension: () => (() => {}),
+      async createAgentSession(options: { resourceLoader: SyntheticResourceLoader }) {
+        const listeners = new Map<string, Set<(value: unknown) => void>>();
+        const api: SyntheticExtensionApi = {
+          events: {
+            on(name, listener) {
+              const registered = listeners.get(name) ?? new Set<(value: unknown) => void>();
+              registered.add(listener);
+              listeners.set(name, registered);
+            },
+            emit(name, value) {
+              for (const listener of listeners.get(name) ?? []) listener(value);
+            }
+          },
+          on: () => {}
+        };
+        for (const factory of options.resourceLoader.factories) await factory(api);
+        const state: InventoryState = {
+          tools: validTools.map(tool => ({ ...tool, parameters: { ...tool.parameters }, sourceInfo: { ...tool.sourceInfo } })),
+          activeNames: [...expectedInventory],
+          callableNames: [...expectedInventory],
+          reads: { tools: 0, active: 0, callable: 0 }
+        };
+        createdStates.push(state);
+        return { session: {
+          isIdle: true,
+          extensionRunner: { async emit() {} },
+          async prompt() {},
+          subscribe: () => () => {},
+          async waitForIdle() {},
+          getContextUsage: () => undefined,
+          async compact() { throw new Error('SYNTHETIC_UNUSED'); },
+          async bindExtensions() {},
+          setAutoCompactionEnabled() {},
+          getAllTools() { state.reads.tools++; return state.tools; },
+          getActiveToolNames() { state.reads.active++; return state.activeNames; },
+          getCallableToolNames() { state.reads.callable++; return state.callableNames; },
+          getToolDefinition: () => undefined,
+          async dispose() {}
+        } };
+      }
+    };
+    const native = await loadNativeSdk(
+      loaderConfig, { system: '' } as never, {} as never, [], { kind: 'full' },
+      async () => syntheticSdk as never,
+      async () => ({
+        createMcpAdapter: () => ((pi: SyntheticExtensionApi) => {
+          const snapshot = {
+            version: 1,
+            servers: [{
+              name: ADAPTER_WHATSAPP_SERVER, status: 'connected', listenState: 'active',
+              toolCount: 21, directToolCount: 21, disabled: false, catalogStale: false
+            }]
+          };
+          publishedStatuses.push(snapshot);
+          pi.events.emit('pi-mcp-adapter/status/v1', snapshot);
+        }) as never
+      })
+    );
+    const connectValidInventory = async (): Promise<{ session: Awaited<ReturnType<typeof native.connect>>; state: InventoryState }> => {
+      const stateCount = createdStates.length;
+      const statusCount = publishedStatuses.length;
+      const session = await native.connect(native.create('/synthetic/workspace', '/synthetic/sessions'), async () => {});
+      expect(createdStates, 'connected-state').toHaveLength(stateCount + 1);
+      expect(publishedStatuses, 'connected-status').toHaveLength(statusCount + 1);
+      expect(publishedStatuses.at(-1)).toEqual({
+        version: 1,
+        servers: [{
+          name: ADAPTER_WHATSAPP_SERVER, status: 'connected', listenState: 'active',
+          toolCount: 21, directToolCount: 21, disabled: false, catalogStale: false
+        }]
+      });
+      return { session, state: createdStates.at(-1)! };
+    };
+    const genericTool = (name: string, exposure: InventoryTool['exposure']): InventoryTool => ({
+      ...validTools[0]!, name, exposure, sourceInfo: { ...validTools[0]!.sourceInfo }
+    });
+    const invalidInventories: readonly {
+      readonly kind: string;
+      readonly mutate: (state: InventoryState) => void;
+    }[] = [
+      { kind: 'missing', mutate: state => { state.tools = state.tools.slice(1); } },
+      { kind: 'duplicate', mutate: state => { state.tools.push({ ...state.tools[0]!, sourceInfo: { ...state.tools[0]!.sourceInfo } }); } },
       {
         kind: 'extra',
-        tools: [...validTools, {
-          ...validTools[0]!,
-          name: `mcp__${WHATSAPP_SERVER}__synthetic_extra`
-        }]
+        mutate: state => {
+          const name = `mcp__${WHATSAPP_SERVER}__synthetic_extra`;
+          state.tools.push(genericTool(name, 'direct'));
+          state.activeNames.push(name);
+          state.callableNames.push(name);
+        }
       },
-      { kind: 'wrong-namespace', tools: validTools.map((tool, index) => index === 0 ? { ...tool, namespace: { name: 'mcp__shadow' } } : tool) },
-      { kind: 'wrong-path', tools: validTools.map((tool, index) => index === 0 ? { ...tool, sourceInfo: { ...tool.sourceInfo, path: '<inline:shadow>' } } : tool) },
-      { kind: 'wrong-source', tools: validTools.map((tool, index) => index === 0 ? { ...tool, sourceInfo: { ...tool.sourceInfo, source: 'extension' } } : tool) }
-    ] as const;
+      {
+        kind: 'wrong-path',
+        mutate: state => {
+          state.tools[0] = { ...state.tools[0]!, sourceInfo: { ...state.tools[0]!.sourceInfo, path: '<inline:shadow>' } };
+        }
+      },
+      {
+        kind: 'wrong-source',
+        mutate: state => {
+          state.tools[0] = { ...state.tools[0]!, sourceInfo: { ...state.tools[0]!.sourceInfo, source: 'extension' } };
+        }
+      },
+      {
+        kind: 'hidden-required',
+        mutate: state => { state.tools[0] = { ...state.tools[0]!, exposure: 'hidden' }; }
+      },
+      { kind: 'inactive-required', mutate: state => { state.activeNames = state.activeNames.slice(1); } },
+      {
+        kind: 'active-generic',
+        mutate: state => {
+          state.tools.push(genericTool('mcp', 'direct'));
+          state.activeNames.push('mcp');
+          state.callableNames.push('mcp');
+        }
+      },
+      {
+        kind: 'callable-script',
+        mutate: state => {
+          state.tools.push(genericTool('mcpScript', 'codemode'));
+          state.callableNames.push('mcpScript');
+        }
+      },
+      {
+        kind: 'active-namespace-proxy',
+        mutate: state => {
+          const name = `mcp__${ADAPTER_WHATSAPP_SERVER}`;
+          state.tools.push(genericTool(name, 'direct'));
+          state.activeNames.push(name);
+          state.callableNames.push(name);
+        }
+      }
+    ];
+
+    const validInventory = await connectValidInventory();
+    const validCurrent = vi.fn(async () => {});
+    await expect(native.ready(validInventory.session, validCurrent)).resolves.toBeUndefined();
+    expect(validCurrent).toHaveBeenCalledTimes(1);
+    expect(validInventory.state.reads).toEqual({ tools: 1, active: 1, callable: 1 });
+    await validInventory.session.dispose();
+
     vi.useFakeTimers();
     try {
-      for (const { kind, tools } of invalidInventories) {
-        const getAllTools = vi.fn(() => tools);
+      for (const { kind, mutate } of invalidInventories) {
+        const { session: readySession, state } = await connectValidInventory();
+        const baselineCurrent = vi.fn(async () => {});
+        await expect(native.ready(readySession, baselineCurrent), `${kind}:connected-baseline`).resolves.toBeUndefined();
+        expect(baselineCurrent, `${kind}:connected-baseline`).toHaveBeenCalledTimes(1);
+        expect(state.reads, `${kind}:connected-baseline`).toEqual({ tools: 1, active: 1, callable: 1 });
+        mutate(state);
+        state.reads = { tools: 0, active: 0, callable: 0 };
         const current = vi.fn(async () => {});
-        const readiness = native.ready(readySession(tools, getAllTools), current);
+        const readiness = native.ready(readySession, current);
         const rejected = expect(readiness, kind).rejects.toMatchObject({ code: 'session_failed' });
         await Promise.resolve(); // schedule the first production delay
         for (let delay = 0; delay < 100; delay++) {
@@ -293,8 +551,9 @@ describe('main lifecycle composition', () => {
         }
         await rejected;
         expect(current, kind).toHaveBeenCalledTimes(100);
-        expect(getAllTools, kind).toHaveBeenCalledTimes(100);
+        expect(state.reads, kind).toEqual({ tools: 100, active: 100, callable: 100 });
         expect(vi.getTimerCount(), kind).toBe(0);
+        await readySession.dispose();
       }
     } finally { vi.useRealTimers(); }
 
@@ -306,6 +565,7 @@ describe('main lifecycle composition', () => {
     const hostileCwd = join(hostileRoot, 'configured-cwd');
     const hostileAgentDir = join(hostileRoot, 'configured-agent');
     const hostileHome = join(hostileRoot, 'configured-home');
+    const hostilePackageDir = join(hostileRoot, 'configured-packages');
     const ownedRoots = {
       root: ownedRoot,
       cwd: join(ownedRoot, 'cwd'),
@@ -314,7 +574,8 @@ describe('main lifecycle composition', () => {
       sessionDir: join(ownedRoot, 'sessions')
     };
     for (const directory of [
-      ownedRoots.cwd, ownedRoots.agentDir, join(ownedRoots.home, '.agents'), ownedRoots.sessionDir
+      ownedRoots.cwd, ownedRoots.agentDir, join(ownedRoots.home, '.agents'),
+      join(ownedRoots.root, 'packages'), ownedRoots.sessionDir
     ]) await mkdir(directory, { recursive: true, mode: 0o700 });
     const hostileFiles = [
       join(hostileCwd, '.pi', 'extensions', 'hostile.ts'),
@@ -336,13 +597,15 @@ describe('main lifecycle composition', () => {
       join(hostileAgentDir, 'APPEND_SYSTEM.md'),
       join(hostileAgentDir, 'mcp.json'),
       join(hostileAgentDir, 'settings.json'),
-      join(hostileHome, '.agents', 'skills', 'hostile', 'SKILL.md')
+      join(hostileHome, '.agents', 'skills', 'hostile', 'SKILL.md'),
+      join(hostilePackageDir, 'hostile-package', 'package.json')
     ];
     for (const path of hostileFiles) {
       await mkdir(dirname(path), { recursive: true, mode: 0o700 });
       await writeFile(path, 'HOSTILE_RESOURCE_MUST_NOT_BE_READ\n', { mode: 0o600 });
     }
     const preflightConfig = {
+      bridge: { baseUrl: 'http://127.0.0.1:8080' },
       pi: {
         systemPromptPath: join(hostileRoot, 'operator-system.md'),
         preCompactionPath: join(hostileRoot, 'operator-pre.md'),
@@ -395,6 +658,8 @@ describe('main lifecycle composition', () => {
     });
     const suppliedRuntime = { getModel: getSelectedModel } as never;
     const installedEffects: string[] = [];
+    const nativeDispose = vi.fn(async () => { installedEffects.push('dispose'); });
+    let nativeSession: Record<string, unknown> | undefined;
     const inventoryPi = {
       ...installedPi,
       SessionManager: {
@@ -404,14 +669,7 @@ describe('main lifecycle composition', () => {
         },
         open() { throw new Error('INVENTORY_OPEN_MUST_NOT_RUN'); }
       },
-      createMcpExtension(options?: {
-        loadConfig?: () => { servers: unknown[]; errors: string[]; autoEnableCodemode?: boolean };
-        logPath?: string;
-      }) {
-        expect(options?.logPath).toBe(join(ownedRoot, 'mcp.log'));
-        expect(options?.loadConfig?.()).toEqual({ servers: [], errors: [], autoEnableCodemode: false });
-        return (() => { installedEffects.push('owned-mcp-factory'); }) as never;
-      },
+      createMcpExtension() { throw new Error('BUILTIN_MCP_MUST_NOT_LOAD'); },
       async createAgentSession(options: Parameters<typeof installedPi.createAgentSession>[0]) {
         expect(options?.cwd).toBe(ownedRoots.cwd);
         expect(options?.agentDir).toBe(ownedRoots.agentDir);
@@ -421,9 +679,9 @@ describe('main lifecycle composition', () => {
         expect(options?.noTools).toBe('builtin');
         const loader = options?.resourceLoader;
         expect(loader).toBeDefined();
-        expect(loader!.getExtensions().extensions.map(extension => extension.path).sort()).toEqual([
-          '<inline:mcp>', `<inline:${WHATSAPP_SERVER}>`
-        ].sort());
+        expect(loader!.getExtensions().extensions.map(extension => extension.path)).toEqual([
+          MCP_STATUS_OBSERVER_SOURCE_PATH, MCP_ADAPTER_SOURCE_PATH
+        ]);
         expect(loader!.getExtensions().errors).toEqual([]);
         expect(loader!.getSkills()).toEqual({ skills: [], diagnostics: [] });
         expect(loader!.getPrompts()).toEqual({ prompts: [], diagnostics: [] });
@@ -431,26 +689,37 @@ describe('main lifecycle composition', () => {
         expect(loader!.getAgentsFiles()).toEqual({ agentsFiles: [] });
         expect(loader!.getSystemPrompt()).toBeUndefined();
         expect(loader!.getAppendSystemPrompt()).toEqual([]);
-        expect(loader!.getExtensions().runtime.mcpServers.list()).toEqual([{
-          name: WHATSAPP_SERVER,
-          config: {
-            type: 'stdio', command: '/synthetic/owned-mcp', args: ['--owned'],
-            cwd: '/synthetic/mcp-cwd', exposure: 'direct'
-          },
-          extensionPath: `<inline:${WHATSAPP_SERVER}>`
-        }]);
-        return { session: {
+        expect(loader!.getExtensions().runtime.mcpServers.list()).toEqual([]);
+        nativeSession = {
+          isIdle: true,
           getAllTools: () => validTools,
+          getActiveToolNames: () => expectedInventory,
+          getCallableToolNames: () => expectedInventory,
+          getToolDefinition: () => undefined,
+          extensionRunner: { async emit(event: { type: string; reason: string }) {
+            expect(event).toEqual({ type: 'session_shutdown', reason: 'quit' });
+            installedEffects.push('shutdown');
+          } },
           setAutoCompactionEnabled(enabled: boolean) { installedEffects.push(`auto:${String(enabled)}`); },
           async bindExtensions() { installedEffects.push('bind'); },
-          async dispose() { installedEffects.push('dispose'); }
-        } as never };
+          async prompt() {},
+          subscribe() { return () => {}; },
+          async waitForIdle() {},
+          getContextUsage: () => undefined,
+          async compact() { throw new Error('SYNTHETIC_UNUSED'); },
+          dispose: nativeDispose
+        };
+        return { session: nativeSession as never };
       }
-    } as never;
+    } as unknown as typeof installedPi;
     const installedStatuses: string[] = [];
-    const hadInitialHome = Object.prototype.hasOwnProperty.call(process.env, 'HOME');
-    const initialHome = process.env.HOME;
+    const initialEnvironment = snapshotInventoryEnvironment();
     process.env.HOME = hostileHome;
+    process.env.PI_CODING_AGENT_DIR = hostileAgentDir;
+    process.env.PI_PACKAGE_DIR = hostilePackageDir;
+    const hostileEnvironment = snapshotInventoryEnvironment();
+    const originalConsoleLog = console.log;
+    const stdout = vi.spyOn(process.stdout, 'write');
     const stderr = vi.spyOn(process.stderr, 'write');
     inventoryFsProbe.paths.splice(0);
     inventoryFsProbe.active = true;
@@ -461,6 +730,9 @@ describe('main lifecycle composition', () => {
         validate: async () => {},
         createRuntime: async config => {
           expect(config.pi.agentDir).toBe(hostileAgentDir);
+          expect(process.env.HOME).toBe(ownedRoots.home);
+          expect(process.env.PI_CODING_AGENT_DIR).toBe(ownedRoots.agentDir);
+          expect(process.env.PI_PACKAGE_DIR).toBe(join(ownedRoots.root, 'packages'));
           return suppliedRuntime;
         },
         createTemporary: async () => ownedRoots,
@@ -471,18 +743,47 @@ describe('main lifecycle composition', () => {
           runtime: Parameters<typeof loadNativeSdk>[2],
           extra: Parameters<typeof loadNativeSdk>[3],
           mode: Parameters<typeof loadNativeSdk>[4]
-        ) => loadNativeSdk(config, policy, runtime, extra, mode, async () => inventoryPi)) as never,
+        ) => loadNativeSdk(config, policy, runtime, extra, mode, async () => inventoryPi, async () => ({
+          createMcpAdapter(options) {
+            console.log('SENSITIVE_ADAPTER_STARTUP_MUST_NOT_BE_FORWARDED');
+            const adapterConfig = options?.config;
+            expect(adapterConfig).toEqual(createControllerMcpConfig(preflightConfig));
+            expect(adapterConfig).toBeDefined();
+            expect(adapterConfig!.mcpServers[ADAPTER_WHATSAPP_SERVER]).toMatchObject({
+              env: {
+                MCP_TRANSPORT: 'stdio', BRIDGE_URL: 'http://127.0.0.1:8080',
+                WORKSPACE_DIR: hostileCwd, LOG_LEVEL: 'INFO'
+              },
+              literalEnv: true,
+              inheritEnv: false
+            });
+            return ((pi: { events: { emit(channel: string, value: unknown): void } }) => {
+              installedEffects.push('owned-mcp-factory');
+              pi.events.emit('pi-mcp-adapter/status/v1', {
+                version: 1,
+                servers: [{
+                  name: ADAPTER_WHATSAPP_SERVER, status: 'connected', listenState: 'active',
+                  toolCount: 21, directToolCount: 21, disabled: false
+                }],
+                totalTools: 21, totalResources: 0, connectedCount: 1, disabledCount: 0
+              });
+            }) as never;
+          }
+        }))) as never,
         status: value => { installedStatuses.push(value); }
       });
       expect(installedCode).toBe(0);
       expect(installedStatuses).toEqual(['pi_inventory_ready']);
-      expect(process.env.HOME).toBe(hostileHome);
+      expect(console.log).toBe(originalConsoleLog);
+      expect(stdout.mock.calls.flat().join('')).not.toContain('SENSITIVE_ADAPTER_STARTUP_MUST_NOT_BE_FORWARDED');
+      expectInventoryEnvironment(hostileEnvironment, 'inventory-success');
       expect(getSelectedModel).toHaveBeenCalledTimes(1);
       expect(installedEffects).toEqual([
         `manager:${ownedRoots.cwd}:${ownedRoots.sessionDir}`, 'owned-mcp-factory',
-        'auto:false', 'bind', 'dispose'
+        'auto:false', 'bind', 'shutdown', 'dispose'
       ]);
-      expect(stderr).not.toHaveBeenCalled();
+      expect(nativeSession?.['dispose']).toBe(nativeDispose);
+      expect(nativeDispose).toHaveBeenCalledTimes(1);
       const probedPaths = inventoryFsProbe.paths.flatMap(value => {
         if (typeof value === 'string' && isAbsolute(value)) return [resolve(value)];
         if (Buffer.isBuffer(value)) return [resolve(value.toString())];
@@ -491,15 +792,54 @@ describe('main lifecycle composition', () => {
       });
       expect(probedPaths.length).toBeGreaterThan(0);
       expect(probedPaths.every(path => path === ownedRoot || path.startsWith(`${ownedRoot}${sep}`))).toBe(true);
-      expect(probedPaths.some(path => [hostileCwd, hostileAgentDir, hostileHome]
+      expect(probedPaths.some(path => [hostileCwd, hostileAgentDir, hostileHome, hostilePackageDir]
         .some(hostile => path === hostile || path.startsWith(`${hostile}${sep}`)))).toBe(false);
+      inventoryFsProbe.active = false;
+
+      const failingShutdown = vi.fn(async () => { throw new Error('SYNTHETIC_SHUTDOWN_FAILURE'); });
+      const failingNativeDispose = vi.fn(async () => {});
+      const failingPi = {
+        ...inventoryPi,
+        async createAgentSession() {
+          return { session: {
+            isIdle: true,
+            getAllTools: () => validTools,
+            getActiveToolNames: () => expectedInventory,
+            getCallableToolNames: () => expectedInventory,
+            getToolDefinition: () => undefined,
+            extensionRunner: { emit: failingShutdown },
+            setAutoCompactionEnabled() {}, bindExtensions: async () => {},
+            prompt: async () => {}, subscribe: () => () => {}, waitForIdle: async () => {},
+            getContextUsage: () => undefined,
+            compact: async () => { throw new Error('SYNTHETIC_UNUSED'); },
+            dispose: failingNativeDispose
+          } as never };
+        }
+      } as never;
+      const failingSdk = await loadNativeSdk(
+        preflightConfig, {} as never, suppliedRuntime, [],
+        { kind: 'inventory-preflight', root: ownedRoot, cwd: ownedRoots.cwd, agentDir: ownedRoots.agentDir },
+        async () => failingPi,
+        async () => ({ createMcpAdapter: () => (() => {}) }) as never
+      );
+      const failingSession = await failingSdk.connect(
+        failingSdk.create(ownedRoots.cwd, ownedRoots.sessionDir), async () => {}
+      );
+      const firstDisposal = failingSession.dispose();
+      const secondDisposal = failingSession.dispose();
+      expect(secondDisposal).toBe(firstDisposal);
+      await expect(firstDisposal).rejects.toThrow('SYNTHETIC_SHUTDOWN_FAILURE');
+      await expect(secondDisposal).rejects.toThrow('SYNTHETIC_SHUTDOWN_FAILURE');
+      expect(failingShutdown).toHaveBeenCalledTimes(1);
+      expect(failingNativeDispose).toHaveBeenCalledTimes(1);
+      expect(stderr).not.toHaveBeenCalled();
     } finally {
       inventoryFsProbe.active = false;
       Object.assign(mutableFs, originalFs);
       syncBuiltinESMExports();
+      stdout.mockRestore();
       stderr.mockRestore();
-      if (hadInitialHome) process.env.HOME = initialHome!;
-      else delete process.env.HOME;
+      restoreInventoryEnvironment(initialEnvironment);
       await rm(hostileRoot, { recursive: true, force: true });
       await rm(ownedRoot, { recursive: true, force: true });
     }
@@ -509,7 +849,7 @@ describe('main lifecycle composition', () => {
     let preflightRoots: {
       root: string; cwd: string; agentDir: string; home: string; sessionDir: string;
     } | undefined;
-    const homeBeforeSuccess = process.env.HOME;
+    const environmentBeforeSuccess = snapshotInventoryEnvironment();
     const prohibited = {
       lifecycle: vi.fn(async () => 77),
       prompt: vi.fn(async () => {}),
@@ -533,25 +873,12 @@ describe('main lifecycle composition', () => {
       load() { preflightEffects.push('load'); return preflightConfig; },
       async loadPolicy() { preflightEffects.push('policy'); return {} as never; },
       async validate(path) { preflightEffects.push(`validate:${path}`); },
-      async createRuntime() { preflightEffects.push('runtime'); return {} as never; },
-      async createTemporary() {
-        preflightEffects.push('temporary');
-        const root = await mkdtemp(join(tmpdir(), 'phase9-inventory-'));
-        preflightRoots = {
-          root, cwd: join(root, 'cwd'), agentDir: join(root, 'agent'),
-          home: join(root, 'home'), sessionDir: join(root, 'sessions')
-        };
-        await Promise.all([
-          mkdir(preflightRoots.cwd, { recursive: true }),
-          mkdir(preflightRoots.agentDir, { recursive: true }),
-          mkdir(join(preflightRoots.home, '.agents'), { recursive: true }),
-          mkdir(preflightRoots.sessionDir, { recursive: true })
-        ]);
-        return preflightRoots;
-      },
-      async removeTemporary(roots) {
-        preflightEffects.push('remove');
-        await rm(roots.root, { recursive: true, force: true });
+      async createRuntime(config) {
+        preflightEffects.push('runtime');
+        expect(config.pi.agentDir).toBe(hostileAgentDir);
+        expect(process.env.PI_PACKAGE_DIR).toBeDefined();
+        await expect(stat(process.env.PI_PACKAGE_DIR!)).resolves.toMatchObject({ mode: expect.any(Number) });
+        return {} as never;
       },
       loadSdk: (async (
         _config: Parameters<typeof loadNativeSdk>[0],
@@ -562,10 +889,23 @@ describe('main lifecycle composition', () => {
       ) => {
         preflightEffects.push('sdk');
         expect(extra).toEqual([]);
-        expect(mode).toEqual({
-          kind: 'inventory-preflight', root: preflightRoots?.root,
-          cwd: preflightRoots?.cwd, agentDir: preflightRoots?.agentDir
-        });
+        if (!mode || mode.kind !== 'inventory-preflight') throw new Error('SYNTHETIC_WRONG_MODE');
+        preflightRoots = {
+          root: mode.root,
+          cwd: mode.cwd,
+          agentDir: mode.agentDir,
+          home: join(mode.root, 'home'),
+          sessionDir: join(mode.root, 'sessions')
+        };
+        expect(process.env.HOME).toBe(preflightRoots.home);
+        expect(process.env.PI_CODING_AGENT_DIR).toBe(preflightRoots.agentDir);
+        expect(process.env.PI_PACKAGE_DIR).toBe(join(preflightRoots.root, 'packages'));
+        for (const directory of [
+          preflightRoots.root, preflightRoots.cwd, preflightRoots.agentDir, preflightRoots.home,
+          join(preflightRoots.home, '.agents'), process.env.PI_PACKAGE_DIR!, preflightRoots.sessionDir
+        ]) {
+          expect((await stat(directory)).mode & 0o777, directory).toBe(0o700);
+        }
         return preflightSdk;
       }) as never,
       status(value) { preflightEffects.push(`status:${value}`); preflightStatuses.push(value); }
@@ -573,18 +913,42 @@ describe('main lifecycle composition', () => {
     expect(preflightCode).toBe(0);
     expect(preflightRoots).toBeDefined();
     await expect(stat(preflightRoots!.root)).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(process.env.HOME).toBe(homeBeforeSuccess);
+    expectInventoryEnvironment(environmentBeforeSuccess, 'production-temporary-success');
     expect(preflightStatuses).toEqual(['pi_inventory_ready']);
     expect(preflightEffects).toEqual([
       'load', 'policy',
       `validate:${join(hostileRoot, 'operator-system.md')}`,
       `validate:${join(hostileRoot, 'operator-pre.md')}`,
       `validate:${join(hostileRoot, 'operator-summary.md')}`,
-      'runtime', 'temporary', 'sdk',
+      'runtime', 'sdk',
       `create:${preflightRoots!.cwd}:${preflightRoots!.sessionDir}`,
-      'connect', 'auto:false', 'bind', 'ready', 'dispose', 'remove', 'status:pi_inventory_ready'
+      'connect', 'auto:false', 'bind', 'ready', 'dispose', 'status:pi_inventory_ready'
     ]);
     expect(Object.values(prohibited).every(spy => spy.mock.calls.length === 0)).toBe(true);
+
+    const environmentBeforeTemporaryFailure = snapshotInventoryEnvironment();
+    let failedTemporaryRoot: string | undefined;
+    const failureStatuses: string[] = [];
+    const forbiddenFailureLoad = vi.fn();
+    const temporaryFailureCode = await checkPiInventory({
+      load: () => preflightConfig,
+      loadPolicy: async () => ({} as never),
+      validate: async () => {},
+      createRuntime: async config => {
+        expect(config.pi.agentDir).toBe(hostileAgentDir);
+        expect(process.env.PI_PACKAGE_DIR).toBeDefined();
+        failedTemporaryRoot = dirname(process.env.PI_PACKAGE_DIR!);
+        throw new Error('SENSITIVE_RUNTIME_FAILURE');
+      },
+      loadSdk: forbiddenFailureLoad as never,
+      status: value => { failureStatuses.push(value); }
+    });
+    expect(temporaryFailureCode).toBe(1);
+    expect(failedTemporaryRoot).toBeDefined();
+    await expect(stat(failedTemporaryRoot!)).rejects.toMatchObject({ code: 'ENOENT' });
+    expectInventoryEnvironment(environmentBeforeTemporaryFailure, 'production-temporary-failure');
+    expect(failureStatuses).toEqual(['pi_inventory_failed']);
+    expect(forbiddenFailureLoad).not.toHaveBeenCalled();
 
     const dispatchEffects: string[] = [];
     const cli = {
@@ -625,16 +989,23 @@ describe('main lifecycle composition', () => {
           if (fails('ready')) throw new Error('SENSITIVE_READY_FAILURE');
         }
       } as never;
-      const hadRowHome = Object.prototype.hasOwnProperty.call(process.env, 'HOME');
-      const previousRowHome = process.env.HOME;
-      const expectedHomePresent = failure !== 'connect';
-      if (expectedHomePresent) process.env.HOME = `/synthetic/hostile-home/${failure}`;
-      else delete process.env.HOME;
+      const environmentBeforeRow = snapshotInventoryEnvironment();
+      const expectedEnvironmentPresent = failure !== 'connect';
+      for (const key of inventoryEnvironmentKeys) {
+        if (expectedEnvironmentPresent) process.env[key] = `/synthetic/hostile-environment/${failure}/${key}`;
+        else delete process.env[key];
+      }
+      const expectedEnvironmentAfterRow = snapshotInventoryEnvironment();
       const code = await checkPiInventory({
         load: () => preflightConfig,
         loadPolicy: async () => ({} as never),
         validate: async () => {},
-        createRuntime: async () => ({} as never),
+        createRuntime: async () => {
+          expect(process.env.HOME, failure).toBe('/synthetic/owned-temp/home');
+          expect(process.env.PI_CODING_AGENT_DIR, failure).toBe('/synthetic/owned-temp/agent');
+          expect(process.env.PI_PACKAGE_DIR, failure).toBe('/synthetic/owned-temp/packages');
+          return {} as never;
+        },
         createTemporary: async () => {
           rowEffects.push('temporary');
           return {
@@ -651,10 +1022,8 @@ describe('main lifecycle composition', () => {
         status(value) { rowEffects.push(`status:${value}`); rowStatuses.push(value); }
       });
       expect(code, failure).toBe(1);
-      expect(Object.prototype.hasOwnProperty.call(process.env, 'HOME'), failure).toBe(expectedHomePresent);
-      if (expectedHomePresent) expect(process.env.HOME, failure).toBe(`/synthetic/hostile-home/${failure}`);
-      if (hadRowHome) process.env.HOME = previousRowHome!;
-      else delete process.env.HOME;
+      expectInventoryEnvironment(expectedEnvironmentAfterRow, `inventory-failure:${failure}`);
+      restoreInventoryEnvironment(environmentBeforeRow);
       expect(rowStatuses, failure).toEqual(['pi_inventory_failed']);
       expect(rowEffects.at(-1), failure).toBe('status:pi_inventory_failed');
       expect(rowEffects, failure).toContain('remove');
@@ -733,7 +1102,6 @@ describe('main lifecycle composition', () => {
     }
 
     let inventoryReady = false;
-    const currentGate = vi.fn(async () => {});
     const concrete: SessionHost = {
       findEvent: async () => undefined,
       classifyOwn: async () => 'manual',
@@ -755,8 +1123,7 @@ describe('main lifecycle composition', () => {
       expect(wiring.extensions[1]).toBe(checkpointExtension);
       expect(expectedInventory).toHaveLength(21);
       expect(inventoryReady).toBe(false);
-      await native.ready(readySession(validTools), currentGate);
-      expect(currentGate).toHaveBeenCalledTimes(1);
+      expect(validTools.map(tool => tool.name)).toEqual(expectedInventory);
       inventoryReady = true;
       effects.push('pi+checkpoint+mcp:inventory-ready');
       return concrete;
@@ -1176,7 +1543,56 @@ describe('main lifecycle composition', () => {
     for (const marker of sensitive) expect(lines.join('')).not.toContain(marker);
   });
 
+  async function verifyNodeRuntimePolicy(): Promise<void> {
+    const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+    const packageJson = JSON.parse(await readFile(join(repositoryRoot, 'session-controller/package.json'), 'utf8')) as {
+      engines: { node: string }; volta: { node: string };
+    };
+    const packageLock = JSON.parse(await readFile(join(repositoryRoot, 'session-controller/package-lock.json'), 'utf8')) as {
+      packages: { '': { engines: { node: string } } };
+    };
+    expect(packageJson.engines.node).toBe('22.19.0 || 24.12.0');
+    expect(packageJson.volta.node).toBe('24.12.0');
+    expect(packageLock.packages[''].engines.node).toBe('22.19.0 || 24.12.0');
+
+    const installer = await readFile(join(repositoryRoot, 'scripts/install-session-controller.sh'), 'utf8');
+    const setup = await readFile(join(repositoryRoot, 'scripts/setup-systemd.sh'), 'utf8');
+    for (const source of [installer, setup]) {
+      expect(source).toContain('"v22.19.0" || "${node_version}" == "v24.12.0"');
+    }
+    expect(installer).toContain('NPM_CLI="$(resolve_executable npm)"');
+    expect(installer.match(/"\$\{NODE_BIN\}" "\$\{NPM_CLI\}"/g)).toHaveLength(4);
+
+    const root = await mkdtemp(join(tmpdir(), 'phase10-systemd-node-'));
+    const bin = join(root, 'bin');
+    const home = join(root, 'home');
+    const runtime = join(root, 'runtime');
+    await Promise.all([mkdir(bin), mkdir(home), mkdir(runtime)]);
+    const executable = async (name: string, body: string): Promise<string> => {
+      const path = join(bin, name);
+      await writeFile(path, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o700 });
+      return path;
+    };
+    const node = await executable('node', "printf '%s\\n' 'v24.12.0'");
+    await executable('redis-server', "printf '%s\\n' 'Redis server v=7.2.6'");
+    for (const name of ['redis-cli', 'rsync', 'systemctl', 'systemd-analyze']) {
+      await executable(name, 'exit 0');
+    }
+    try {
+      await execFileAsync('/usr/bin/bash', [join(repositoryRoot, 'scripts/setup-systemd.sh'), 'session-controller'], {
+        cwd: repositoryRoot,
+        env: { HOME: home, XDG_RUNTIME_DIR: runtime, PATH: `${bin}:/usr/bin:/bin` },
+        timeout: 10000
+      });
+      const unit = await readFile(join(home, '.config/systemd/user/whatsapp-session-controller.service'), 'utf8');
+      expect(unit).toContain(`ExecStart=${node} %h/.local/share/whatsapp-session-controller/current/dist/src/main.js`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
   it('imports main in an isolated child without config, Redis, listener, Pi, auth, or MCP effects', async () => {
+    await verifyNodeRuntimePolicy();
     const root = await mkdtemp(join(tmpdir(), 'phase9-main-import-'));
     const probe = join(root, 'import.test.mjs');
     const mainUrl = new URL('../src/main.ts', import.meta.url).href;

@@ -3,8 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.19.0 <23" },
-  "volta": { "node": "22.19.0" },
+  "engines": {
+    "node": "22.19.0 || 24.12.0"
+  },
+  "volta": {
+    "node": "24.12.0"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -13,6 +17,8 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.1.0",
+    "jiti": "2.7.0",
+    "pi-mcp-adapter": "5.3.1",
     "redis": "5.8.2",
     "typebox": "1.3.27"
   },

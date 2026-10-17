@@ -31,7 +31,8 @@ REDIS_CLI_BIN="$(resolve_executable redis-cli)"
 RSYNC_BIN="$(resolve_executable rsync)"
 SYSTEMCTL_BIN="$(resolve_executable systemctl)"
 SYSTEMD_ANALYZE_BIN="$(resolve_executable systemd-analyze)"
-[[ "$("${NODE_BIN}" --version)" == "v22.19.0" ]] || { error 'Node v22.19.0 is required'; exit 1; }
+node_version="$("${NODE_BIN}" --version)"
+[[ "${node_version}" == "v22.19.0" || "${node_version}" == "v24.12.0" ]] || { error 'Exact Node v22.19.0 or v24.12.0 is required'; exit 1; }
 redis_version="$("${REDIS_SERVER_BIN}" --version | sed -nE 's/.*v=([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
 version_at_least_7_2 "${redis_version}" || { error 'Redis >=7.2 is required'; exit 1; }
 "${REDIS_CLI_BIN}" --version >/dev/null
