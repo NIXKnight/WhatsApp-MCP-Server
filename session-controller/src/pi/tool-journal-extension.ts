@@ -68,6 +68,33 @@ const reportPromptFailure = (error: unknown): void => {
   try { console.error(JSON.stringify({ level: 'ERROR', component: 'journal', event: 'prompt_failed', stage: 'wrapped_prompt', category: promptFailureCategory(error) })); } catch {}
 };
 const object = (v: unknown): Record<string, unknown> | undefined => v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
+const attributionTools: ReadonlySet<Tool> = new Set(['send_message', 'send_group_message', 'send_auto_message']);
+const canonicalParticipantIdentity = /^(\d+)@(s\.whatsapp\.net|lid|bot|hosted|hosted\.lid)$/u;
+const trustedParticipantAlias = /^(\d+)(?::\d+)?@(s\.whatsapp\.net|lid|bot|hosted|hosted\.lid)$/u;
+function participantIdentity(value: unknown, pattern: RegExp): string | undefined {
+  if (typeof value !== 'string' || Buffer.byteLength(value) > 128) return undefined;
+  const match = pattern.exec(value);
+  return match ? `${match[1]}@${match[2]}` : undefined;
+}
+/** Compare protocol identities only. A model-supplied mention must already be
+ * canonical and non-device. Only trusted event aliases may have WhatsMeow's
+ * documented numeric device component removed for comparison. */
+export function permitsParticipantAttribution(tool: Tool, input: Record<string, unknown>, context: TurnContext): boolean {
+  if (!attributionTools.has(tool)) return true;
+  const emptyQuoteField = (value: unknown) => value === undefined || value === null || value === '';
+  if (!emptyQuoteField(input['quoted_message_id']) || !emptyQuoteField(input['quoted_participant'])) return false;
+  const mentions = input['mentions'];
+  if (mentions === undefined || mentions === null) return true;
+  if (!Array.isArray(mentions) || mentions.length > 1) return false;
+  if (mentions.length === 0) return true;
+  const mention = participantIdentity(mentions[0], canonicalParticipantIdentity);
+  if (!mention) return false;
+  const event = context.work().event;
+  const aliases = new Set([event.sender_jid, event.sender_alt_jid]
+    .map(alias => participantIdentity(alias, trustedParticipantAlias))
+    .filter((alias): alias is string => alias !== undefined));
+  return aliases.has(mention);
+}
 const responseKeys: Record<Tool, readonly ['message_id', 'success']> = {
   send_message: ['message_id', 'success'], send_group_message: ['message_id', 'success'], send_auto_message: ['message_id', 'success'],
   send_media: ['message_id', 'success'], send_reaction: ['message_id', 'success'], edit_message: ['message_id', 'success'], revoke_message: ['message_id', 'success']
@@ -193,9 +220,12 @@ export function createToolJournal(ports: Pick<RedisRepository, 'nativeJournal' |
       let l: Live | undefined;
       try {
         l = resolve(ctx.sessionManager.getSessionId()); const target = l;
-        await enqueue(target, async () => {
+        const allowed = await enqueue(target, async () => {
           const context = await gate(target); verifySource(event);
           if (target.calls.has(event.toolCallId)) throw fail();
+          // Attribution policy is a pre-call denial: it precedes destination
+          // handling, durable attempt creation, input freezing, and execution.
+          if (!permitsParticipantAttribution(tool, event.input, context)) return false;
           const destination = mutationDestination(tool, event.input);
           const work = context.work();
           const attempt = checked(MutationAttemptSchema, { version: 1, attemptId: id(), eventId: work.event.event_id,
@@ -213,8 +243,9 @@ export function createToolJournal(ports: Pick<RedisRepository, 'nativeJournal' |
           freeze(event.input); Object.defineProperty(event, 'input', { value: event.input, writable: false, configurable: false });
           Object.defineProperty(event, 'toolName', { value: event.toolName, writable: false, configurable: false });
           Object.defineProperty(event, 'toolCallId', { value: event.toolCallId, writable: false, configurable: false });
+          return true;
         });
-        return undefined;
+        return allowed ? undefined : { block: true, terminate: false, reason: 'policy_denied' };
       } catch { if (l) l.poisoned = true; ctx.abort(); return { block: true, terminate: true, reason: 'mutation_uncertain' }; }
     });
     pi.on('tool_result', async (event, ctx) => {
