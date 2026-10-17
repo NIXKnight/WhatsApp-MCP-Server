@@ -54,6 +54,7 @@ async function fixture() {
   const listeners = new Set<(event: AgentSessionEvent) => void>();
   let followup = gate(), prompted = gate();
   let idle = true, aborted = false, omitSettled = false, appendFailure = false, markerWritten = false;
+  let promptFailure: unknown, waitForIdleFailure: unknown;
   let markerHold: ReturnType<typeof gate> | undefined, written: ReturnType<typeof gate> | undefined;
   let disposeHold: ReturnType<typeof gate> | undefined;
   const current = async () => { effects.push('gate'); if (lost) throw new ControllerError('lease_lost'); if (markerWritten) await markerHold?.promise; };
@@ -61,14 +62,19 @@ async function fixture() {
     get isIdle() { return idle; }, setAutoCompactionEnabled: enabled => { expect(enabled).toBe(false); effects.push('auto-off'); },
     bindExtensions: async () => { await current(); effects.push('extensions-bound'); },
     prompt: async (_text, opts) => {
-      await current(); expect(opts?.expandPromptTemplates).toBe(false); effects.push('prompt'); idle = false;
+      await current(); expect(opts?.expandPromptTemplates).toBe(false); effects.push('prompt');
+      if (promptFailure !== undefined) throw promptFailure;
+      idle = false;
       for (const listener of listeners) listener({ type: 'agent_end', messages: [], willRetry: false });
       prompted.resolve(); await followup.promise;
       effects.push('extension-followup'); await current(); idle = true;
       if (!omitSettled) for (const listener of listeners) listener({ type: 'agent_settled', aborted });
     },
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
-    waitForIdle: async () => { if (!idle) await followup.promise; },
+    waitForIdle: async () => {
+      if (!idle) await followup.promise;
+      if (waitForIdleFailure !== undefined) { const failure = waitForIdleFailure; waitForIdleFailure = undefined; throw failure; }
+    },
     dispose: async () => { effects.push('dispose-start'); await disposeHold?.promise; effects.push('disposed'); },
     getContextUsage: () => ({ tokens: 12, contextWindow: 1000, percent: 1.2 }), getAllTools: () => [],
     getActiveToolNames: () => [], getCallableToolNames: () => [], getToolDefinition: () => undefined,
@@ -110,6 +116,7 @@ async function fixture() {
   };
   return { root, rows, host, index, effects, opened, listeners, runtime, sdk, attach,
     prompted: () => prompted.promise, release: () => followup.resolve(), lose: () => { lost = true; }, uncertain: (v: boolean) => { uncertain = v; },
+    failPrompt: (error: unknown) => { promptFailure = error; }, failWaitForIdle: (error: unknown) => { waitForIdleFailure = error; },
     reset: () => { followup = gate(); prompted = gate(); idle = true; }, abort: () => { aborted = true; }, omit: () => { omitSettled = true; },
     compactRelease: () => compactGate.resolve(), compactReset: () => { compactGate = gate(); }, failMarker: () => { appendFailure = true; },
     holdMarker: () => { markerHold = gate(); written = gate(); return { written: written.promise, release: markerHold.resolve }; },
@@ -147,6 +154,36 @@ describe('isolated Pi boundary and durable noncontext evidence (no native runtim
       f.release(); await nextTurn; await disposing;
       await expect(session.prompt(w.event, 'SYNTHETIC')).rejects.toMatchObject({ code: 'session_failed' });
     } finally { await f.cleanup(); }
+  });
+  it('logs one fixed redacted diagnostic when runtime.prompt throws sensitive details', async () => {
+    const f = await fixture(); const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const w = work(), session = await f.host.open(w); await f.attach(w, session);
+      const sensitive = 'provider token=SECRET at /private/session/path';
+      f.failPrompt(new Error(sensitive));
+      await expect(session.prompt(w.event, 'SYNTHETIC')).rejects.toMatchObject({ code: 'session_failed' });
+      const expected = '{"level":"ERROR","component":"session","event":"prompt_failed","stage":"runtime.prompt","category":"unknown"}';
+      expect(log.mock.calls).toEqual([[expected]]);
+      expect(log.mock.calls.flat().join(' ')).not.toContain(sensitive);
+    } finally { log.mockRestore(); await f.cleanup(); }
+  });
+  it('identifies waitForIdle transport failures without adding a second diagnostic line', async () => {
+    const f = await fixture(); const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const w = work(), session = await f.host.open(w); await f.attach(w, session); f.release();
+      f.failWaitForIdle(new TypeError('SENSITIVE_TRANSPORT_DETAIL'));
+      await expect(session.prompt(w.event, 'SYNTHETIC')).rejects.toMatchObject({ code: 'session_failed' });
+      expect(log.mock.calls).toEqual([['{"level":"ERROR","component":"session","event":"prompt_failed","stage":"waitForIdle","category":"transport"}']]);
+    } finally { log.mockRestore(); await f.cleanup(); }
+  });
+  it('logs a fixed ControllerError category and preserves the thrown controller error', async () => {
+    const f = await fixture(); const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const w = work(), session = await f.host.open(w); await f.attach(w, session);
+      const failure = new ControllerError('lease_lost'); f.failPrompt(failure);
+      await expect(session.prompt(w.event, 'SYNTHETIC')).rejects.toBe(failure);
+      expect(log.mock.calls).toEqual([['{"level":"ERROR","component":"session","event":"prompt_failed","stage":"runtime.prompt","category":"lease_lost"}']]);
+    } finally { log.mockRestore(); await f.cleanup(); }
   });
   it('awaits asynchronous native session teardown before reporting controller disposal complete', async () => {
     const f = await fixture();
