@@ -4,9 +4,10 @@ import { open } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  checked, ControllerError, SessionBindingSchema, CompletionMarkerSchema, fingerprintEvent,
-  type ClaimedWork, type PiHostPort, type PiSessionPort, type CompletionProof, type CheckpointRecord, type CheckpointV1
+  checked, ControllerError, ErrorClassSchema, SessionBindingSchema, CompletionMarkerSchema, fingerprintEvent,
+  type ClaimedWork, type PiHostPort, type PiSessionPort, type CompletionProof, type CheckpointRecord, type CheckpointV1, type ErrorClass
 } from '../domain.js';
+import Value from 'typebox/value';
 import type { TurnContext } from '../scheduler/chat-worker.js';
 import { BINDING_TYPE, COMPLETION_TYPE, assertSessionPath, durableDirectory, syncSession, syncDirectory, type CompletionIndex } from './completion-index.js';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
@@ -34,6 +35,26 @@ export interface SessionHostOptions {
 }
 function storedCheckpointDetails(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+type PromptFailureStage = 'journal' | 'runtime.prompt' | 'waitForIdle' | 'settled_validation';
+type PromptFailureCategory = ErrorClass | 'aborted' | 'auth' | 'rate_limit' | 'context_or_request' | 'transport' | 'unknown';
+function promptFailureCategory(error: unknown): PromptFailureCategory {
+  try {
+    if (error instanceof ControllerError) return Value.Check(ErrorClassSchema, error.code) ? error.code : 'unknown';
+    if (error instanceof Error && error.name === 'AbortError') return 'aborted';
+    const status = error !== null && (typeof error === 'object' || typeof error === 'function')
+      ? Reflect.get(error, 'status') : undefined;
+    if (status === 401 || status === 403) return 'auth';
+    if (status === 429) return 'rate_limit';
+    if (status === 400 || status === 413) return 'context_or_request';
+    if (error instanceof TypeError) return 'transport';
+  } catch { /* Untrusted error shapes must not alter prompt failure handling. */ }
+  return 'unknown';
+}
+function emitPromptFailure(stage: PromptFailureStage, error: unknown): void {
+  try {
+    console.error(JSON.stringify({ level: 'ERROR', component: 'session', event: 'prompt_failed', stage, category: promptFailureCategory(error) }));
+  } catch { /* Diagnostics must never replace the original controller behavior. */ }
 }
 export function createSessionHost(options: SessionHostOptions): SessionHost {
   let closed = false, closingHost = false, closeTask: Promise<void> | undefined;
@@ -132,17 +153,23 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
             await requireAttached();
             if (busy || !runtime.isIdle || promptStarted || fingerprintEvent(event) !== fingerprintEvent(work.event)) throw new ControllerError('session_failed');
             promptStarted = true; begin(); let settled = false, aborted = false;
+            let stage: PromptFailureStage = 'runtime.prompt';
             const unsubscribe = runtime.subscribe(e => { if (e.type === 'agent_settled') { settled = true; aborted = e.aborted; } });
             try {
               await current();
               const invoke = async () => {
+                stage = 'runtime.prompt';
                 await runtime.prompt(instructions, { expandPromptTemplates: false });
+                stage = 'waitForIdle';
                 await runtime.waitForIdle();
+                if (options.journal) stage = 'journal';
               };
-              if (options.journal) await options.journal.run(port.binding, invoke); else await invoke();
+              if (options.journal) { stage = 'journal'; await options.journal.run(port.binding, invoke); } else await invoke();
+              stage = 'settled_validation';
               if (!settled || aborted || !runtime.isIdle) throw new ControllerError('session_failed');
               await current(); turnSettled = true;
             } catch (error) {
+              emitPromptFailure(stage, error);
               if (error instanceof ControllerError) throw error;
               throw new ControllerError('session_failed');
             } finally { unsubscribe(); end(); }
