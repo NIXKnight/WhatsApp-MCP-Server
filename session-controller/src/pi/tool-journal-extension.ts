@@ -19,10 +19,20 @@ const promptFailureCategory = (error: unknown): string => {
   if (status === 429) return 'rate_limit';
   if (status === 400 || status === 413) return 'request_rejected';
   if (error instanceof TypeError) return 'transport';
+  const message = error instanceof Error ? error.message.toLowerCase() : '';
+  if (/api.?key|credential|auth|unauthorized|forbidden/.test(message)) return 'authentication';
+  if (/no model|unknown model|model.*(?:missing|unavailable|not found)/.test(message)) return 'model_unavailable';
+  if (/context|token limit|too many tokens|maximum length|request too large/.test(message)) return 'context_limit';
+  if (/tool.*schema|invalid.*tool|function.*schema|tool definition/.test(message)) return 'tool_schema';
+  if (/mcp|stdio|server.*connect|protocol.*error/.test(message)) return 'mcp_runtime';
+  if (/hindsight|memory|reflect|retain/.test(message)) return 'memory_runtime';
+  if (/extension|hook|handler/.test(message)) return 'extension_runtime';
+  if (/approval.*required|approval.*denied|permission/.test(message)) return 'approval_required';
+  if (/fetch|network|socket|econn|timeout|timed out/.test(message)) return 'transport';
   return 'unknown';
 };
 const reportPromptFailure = (error: unknown): void => {
-  try { console.error(JSON.stringify({ level: 'ERROR', component: 'journal', event: 'prompt_failed', category: promptFailureCategory(error) })); } catch {}
+  try { console.error(JSON.stringify({ level: 'ERROR', component: 'journal', event: 'prompt_failed', stage: 'wrapped_prompt', category: promptFailureCategory(error) })); } catch {}
 };
 const object = (v: unknown): Record<string, unknown> | undefined => v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
 const responseKeys: Record<Tool, readonly ['message_id', 'success']> = {
