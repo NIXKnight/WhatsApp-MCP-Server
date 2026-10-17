@@ -20,7 +20,10 @@ const promptFailureCategory = (error: unknown): string => {
   if (status === 400 || status === 413) return 'request_rejected';
   if (error instanceof TypeError) return 'transport';
   const message = error instanceof Error ? error.message.toLowerCase() : '';
-  if (/api.?key|credential|auth|unauthorized|forbidden/.test(message)) return 'authentication';
+  if (/hindsight.*(?:401|403|unauthorized|forbidden)|(?:401|403|unauthorized|forbidden).*hindsight/.test(message)) return 'memory_authentication';
+  if (/mcp.*(?:oauth|needs.auth|unauthorized|forbidden)|(?:oauth|needs.auth|unauthorized|forbidden).*mcp/.test(message)) return 'mcp_authentication';
+  if (/provider.*not configured|api.?key|credential.*provider|(?:401|403|unauthorized|forbidden).*(?:provider|model)/.test(message)) return 'model_authentication';
+  if (/approval|permission|authoriz/.test(message)) return 'approval_required';
   if (/no model|unknown model|model.*(?:missing|unavailable|not found)/.test(message)) return 'model_unavailable';
   if (/context|token limit|too many tokens|maximum length|request too large/.test(message)) return 'context_limit';
   if (/tool.*schema|invalid.*tool|function.*schema|tool definition/.test(message)) return 'tool_schema';
