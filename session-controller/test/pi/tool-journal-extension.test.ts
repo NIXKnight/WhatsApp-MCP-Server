@@ -113,6 +113,64 @@ describe('native-shaped durable mutation hooks', () => {
       .rejects.toMatchObject({ code: 'session_failed' });
     expect(external.nativeJournal.begin).not.toHaveBeenCalled();
   });
+  it.each([
+    {
+      name: 'the AgentSession missing-key preflight',
+      failure: () => new Error('No API key found for synthetic-provider.\n\nSYNTHETIC_HELP'),
+      category: 'model_api_key_missing'
+    },
+    {
+      name: 'the nested pi-ai authHeader resolution failure',
+      failure: () => new Error('API key auth check failed for provider synthetic-provider', {
+        cause: new Error('authHeader requires a resolved API key')
+      }),
+      category: 'model_auth_header_unresolved'
+    },
+    {
+      name: 'a structured upstream 401 rejection',
+      failure: () => Object.assign(new Error('SYNTHETIC_UPSTREAM_REJECTION'), { status: 401 }),
+      category: 'model_credentials_rejected'
+    },
+    {
+      name: 'a nested structured upstream 403 rejection',
+      failure: () => new Error('SYNTHETIC_PROVIDER_WRAPPER', {
+        cause: Object.assign(new Error('SYNTHETIC_UPSTREAM_REJECTION'), { status: 403 })
+      }),
+      category: 'model_credentials_rejected'
+    },
+    {
+      name: 'a flattened upstream unauthorized response',
+      failure: () => new Error('Synthetic upstream response: unauthorized'),
+      category: 'model_credentials_rejected'
+    },
+    {
+      name: 'a flattened upstream forbidden response',
+      failure: () => new Error('Synthetic upstream response: forbidden'),
+      category: 'model_credentials_rejected'
+    }
+  ])('logs $name as the exact fixed auth category without error details', async ({ failure, category }) => {
+    const f = await fixture(); const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const error = failure();
+      await expect(f.journal.run(binding, async () => { throw error; }))
+        .rejects.toMatchObject({ code: 'session_failed' });
+      const expected = JSON.stringify({ level: 'ERROR', component: 'journal', event: 'prompt_failed',
+        stage: 'wrapped_prompt', category });
+      expect(log.mock.calls).toEqual([[expected]]);
+      expect(log.mock.calls.flat().join(' ')).not.toContain(error.message);
+      expect(f.nativeJournal.begin).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  });
+  it('does not infer model authentication from incidental API-key wording', async () => {
+    const f = await fixture(); const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const detail = 'SYNTHETIC API key cache maintenance failed';
+      await expect(f.journal.run(binding, async () => { throw new Error(detail); }))
+        .rejects.toMatchObject({ code: 'session_failed' });
+      expect(log.mock.calls).toEqual([['{"level":"ERROR","component":"journal","event":"prompt_failed","stage":"wrapped_prompt","category":"unknown"}']]);
+      expect(log.mock.calls.flat().join(' ')).not.toContain(detail);
+    } finally { log.mockRestore(); }
+  });
   it('classifies a prompt exception with an active attempt as mutation_uncertain without retry', async () => {
     const f = await fixture(), prompt = vi.fn(async () => { await f.invokeCall(); throw new Error('SYNTHETIC_PROVIDER_FAILURE'); });
     await expect(f.journal.run(binding, prompt)).rejects.toMatchObject({ code: 'mutation_uncertain' });
