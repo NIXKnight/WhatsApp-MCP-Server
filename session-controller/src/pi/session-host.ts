@@ -91,7 +91,7 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
         // The installed public Pi 1.1 SessionManager implements getBranch(); keep
         // that runtime fact local rather than widening the locked SDK adapter.
         const branchManager = manager as SdkManager & { getBranch(): readonly unknown[] };
-        let context: TurnContext | undefined, disposed = false, disposing = false, busy = false, turnSettled = false;
+        let context: TurnContext | undefined, disposed = false, disposing = false, busy = false, promptStarted = false, turnSettled = false;
         let operation: Promise<void> = Promise.resolve(), finished: (() => void) | undefined, disposeTask: Promise<void> | undefined;
         const begin = () => { busy = true; operation = new Promise<void>(resolve => { finished = resolve; }); };
         const end = () => { busy = false; finished?.(); finished = undefined; };
@@ -121,10 +121,17 @@ export function createSessionHost(options: SessionHostOptions): SessionHost {
         const requireAttached = async () => { if (!context || disposing) throw new ControllerError('session_failed'); await current(); if (disposing) throw new ControllerError('session_failed'); };
         const port: HostedSessionPort = {
           binding,
+          isFresh() {
+            if (disposed || busy || !runtime.isIdle || promptStarted) return false;
+            if (typeof branchManager.getBranch !== 'function') return false;
+            const entries = branchManager.getBranch() as readonly SessionEntry[];
+            return !entries.some(entry => entry.type === 'message' || entry.type === 'compaction' ||
+              (entry.type === 'custom' && (entry.customType === COMPLETION_TYPE || entry.customType === MUTATION_TYPE)));
+          },
           async prompt(event, instructions) {
             await requireAttached();
-            if (busy || !runtime.isIdle || fingerprintEvent(event) !== fingerprintEvent(work.event)) throw new ControllerError('session_failed');
-            begin(); let settled = false, aborted = false;
+            if (busy || !runtime.isIdle || promptStarted || fingerprintEvent(event) !== fingerprintEvent(work.event)) throw new ControllerError('session_failed');
+            promptStarted = true; begin(); let settled = false, aborted = false;
             const unsubscribe = runtime.subscribe(e => { if (e.type === 'agent_settled') { settled = true; aborted = e.aborted; } });
             try {
               await current();

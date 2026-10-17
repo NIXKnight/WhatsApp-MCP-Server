@@ -108,27 +108,33 @@ describe('typed armed Pi 1.1 adapter', () => {
   });
 });
 
-interface WorkerFixture { repository: WorkerRepository; options: WorkerOptions; session: PiSessionPort & { history(): Promise<readonly never[]> }; effects: string[]; compactCalls(): number; latest(value: unknown): void; recover(value: CheckpointV1): void }
+interface WorkerFixture {
+  repository: WorkerRepository; options: WorkerOptions; session: PiSessionPort & { history(): Promise<readonly never[]> };
+  effects: string[]; compactCalls(): number; latest(value: unknown): void; recover(value: CheckpointV1): void;
+  setFresh(value: boolean): void; setMapped(value: PiSessionPort['binding']): void; setSequence(value: number): void; setNative(value: readonly unknown[]): void;
+}
 function workerFixture(c = chat, initialUsage: ReturnType<PiSessionPort['usage']> = { tokens: 9000, contextWindow: 10000, percent: 90 },
-  promptUsage: ReturnType<PiSessionPort['usage']> = { tokens: 1000, contextWindow: 10000, percent: 10 }): WorkerFixture {
-  const effects: string[] = []; let paused: string | undefined, usage = initialUsage;
-  let latest: unknown, compacts = 0, began = false; const b = { ...binding, canonicalChatId: c, sessionId: `SESSION_${c}` };
-  const repository: WorkerRepository & { checkpoints: { latest(): Promise<unknown>; transition(_work: ClaimedWork, id: string, phase: 'compacted' | 'restored', entry: string): Promise<boolean> }; nativeJournal: { list(): Promise<readonly never[]> } } = {
+  promptUsage: ReturnType<PiSessionPort['usage']> = { tokens: 1000, contextWindow: 10000, percent: 10 }, initialFresh = true): WorkerFixture {
+  const effects: string[] = []; let paused: string | undefined, usage = initialUsage, fresh = initialFresh;
+  let latest: unknown, compacts = 0, began = false, sequence = 0, native: readonly unknown[] = [];
+  const b: PiSessionPort['binding'] = { ...binding, canonicalChatId: c, sessionId: `SESSION_${c}` }; let mapped: PiSessionPort['binding'] = b;
+  const repository: WorkerRepository & { checkpoints: { latest(): Promise<unknown>; transition(_work: ClaimedWork, id: string, phase: 'compacted' | 'restored', entry: string): Promise<boolean> }; nativeJournal: { list(): Promise<readonly unknown[]> } } = {
     renew: async value => value.ownership, checkWork: async () => true,
-    readChat: async () => ({ canonicalChatId: c, lastCompletedSequence: 0, session: b, ...(paused ? { pause: paused as 'usage_unknown' } : {}) }), bindSession: async () => true,
+    readChat: async () => ({ canonicalChatId: c, lastCompletedSequence: sequence, session: mapped, ...(paused ? { pause: paused as 'usage_unknown' } : {}) }), bindSession: async () => true,
     turnState: async () => began ? 'started' : 'fresh', beginTurn: async () => { effects.push('begin'); began = true; return true; },
     pause: async (_value, reason) => { paused = reason; effects.push(`pause:${reason}`); return true; }, complete: async () => { effects.push('complete'); return true; },
-    checkpoints: { latest: async () => latest, transition: async (_value, id, phase, entry) => { const prior = latest as { checkpointId: string; checkpoint: CheckpointV1 } | undefined; if (!prior || prior.checkpointId !== id) return false; latest = { ...prior, phase, compactionEntryId: entry }; effects.push(`transition:${phase}`); return true; } }, nativeJournal: { list: async () => [] }
+    checkpoints: { latest: async () => latest, transition: async (_value, id, phase, entry) => { const prior = latest as { checkpointId: string; checkpoint: CheckpointV1 } | undefined; if (!prior || prior.checkpointId !== id) return false; latest = { ...prior, phase, compactionEntryId: entry }; effects.push(`transition:${phase}`); return true; } }, nativeJournal: { list: async () => native }
   };
-  const session = { binding: b, usage: () => usage, history: async () => [], compact: async (_instructions: string, seed: CheckpointV1) => { effects.push('compact'); compacts++; latest = { checkpointId: 'c'.repeat(32), phase: 'restored', checkpoint: seed, compactionEntryId: 'SYNTHETIC_COMPACTION' }; usage = { tokens: null, contextWindow: 10000, percent: null }; effects.push('usage:null'); return { entryId: 'SYNTHETIC_COMPACTION', checkpointId: 'c'.repeat(32), checkpoint: seed }; },
+  const session = { binding: b, isFresh: () => fresh, usage: () => usage, history: async () => [], compact: async (_instructions: string, seed: CheckpointV1) => { effects.push('compact'); compacts++; latest = { checkpointId: 'c'.repeat(32), phase: 'restored', checkpoint: seed, compactionEntryId: 'SYNTHETIC_COMPACTION' }; usage = { tokens: null, contextWindow: 10000, percent: null }; effects.push('usage:null'); return { entryId: 'SYNTHETIC_COMPACTION', checkpointId: 'c'.repeat(32), checkpoint: seed }; },
     // Test-only mutation lives inside the prompt implementation and represents
     // usage supplied by the actual settled assistant response; production has
     // no setUsage mechanism and no synthetic prompt.
-    prompt: async () => { effects.push('prompt'); usage = promptUsage; effects.push(promptUsage?.tokens === null ? 'prompt-usage:null' : 'prompt-usage:valid'); },
+    prompt: async () => { effects.push('prompt'); fresh = false; usage = promptUsage; effects.push(promptUsage?.tokens === null ? 'prompt-usage:null' : 'prompt-usage:valid'); },
     appendCompletion: async marker => { effects.push('marker'); return { entryId: 'ENTRY', session: b, marker }; }, dispose: async () => { effects.push('dispose'); } } as PiSessionPort & { history(): Promise<readonly never[]> };
   const compactor = createCompactor({ config, repository: repository as never, incoming: () => ({ event: 0, tools: 0, prompt: 0 }), readTemplate: async () => { effects.push('template'); return 'SYNTHETIC'; } });
   const options: WorkerOptions = { leaseMs: 1000, renewMs: 100000, appCurrent: () => true, instructions: () => 'SYNTHETIC', wait: { wait: async (_ms, signal) => new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true })) }, diagnostics: { emit: value => effects.push(`diagnostic:${value.class}`) }, host: { findEvent: async () => undefined, classifyOwn: async () => 'manual', open: async () => session, close: async () => {} }, turns: { attach: async () => {}, prepare: compactor.prepare, run: async (_s, _ctx, prompt) => prompt(), afterPrompt: compactor.afterPrompt, confirmed: async () => [] } };
-  return { repository, options, session, effects, compactCalls: () => compacts, latest: value => { latest = value; }, recover: value => { Object.assign(session, { reconcileCheckpoint: async () => { effects.push('reconcile'); return { entryId: 'RECOVERED_ENTRY', checkpoint: value }; } }); } };
+  return { repository, options, session, effects, compactCalls: () => compacts, latest: value => { latest = value; }, recover: value => { Object.assign(session, { reconcileCheckpoint: async () => { effects.push('reconcile'); return { entryId: 'RECOVERED_ENTRY', checkpoint: value }; } }); },
+    setFresh: value => { fresh = value; }, setMapped: value => { mapped = value; }, setSequence: value => { sequence = value; }, setNative: value => { native = value; } };
 }
 
 describe('locked Slice 7 journal-turn composition compatibility', () => {
@@ -137,15 +143,15 @@ describe('locked Slice 7 journal-turn composition compatibility', () => {
     const effects: string[] = [];
     const turns: TurnPorts = createJournalTurns(journal, async () => { effects.push('prepare'); });
     await turns.prepare({} as PiSessionPort, turn);
-    await turns.afterPrompt?.({} as PiSessionPort, turn, { usagePendingAfterCompaction: false });
+    await turns.afterPrompt?.({} as PiSessionPort, turn, { usageRequiredAfterPrompt: false });
     expect(effects).toEqual(['prepare']);
   });
   it('runs an injected Slice 8 afterPrompt hook only after prepare and the real prompt', async () => {
     const effects: string[] = [];
     const turns = createJournalTurns(journal,
-      async () => { effects.push('prepare'); return { usagePendingAfterCompaction: true }; },
+      async () => { effects.push('prepare'); return { usageRequiredAfterPrompt: true }; },
       async () => { effects.push('afterPrompt'); });
-    const preparation = await turns.prepare({} as PiSessionPort, turn) ?? { usagePendingAfterCompaction: false };
+    const preparation = await turns.prepare({} as PiSessionPort, turn) ?? { usageRequiredAfterPrompt: false };
     await turns.run({} as PiSessionPort, turn, async () => { effects.push('prompt'); });
     await turns.afterPrompt?.({} as PiSessionPort, turn, preparation);
     expect(effects).toEqual(['prepare', 'prompt', 'afterPrompt']);
@@ -167,9 +173,47 @@ describe('merged worker pre-compaction and post-prompt accounting', () => {
     expect(missing.effects).toEqual(expect.arrayContaining(['compact', 'usage:null', 'begin', 'prompt', 'prompt-usage:null', 'pause:usage_unknown']));
     expect(missing.effects).not.toContain('marker'); expect(missing.effects).not.toContain('complete');
   });
+  it('allows unknown usage only for the exact fresh first turn and requires known usage after its real prompt', async () => {
+    const unknown = { tokens: null, contextWindow: 10000, percent: null } as const;
+    const allowed = workerFixture(chat, unknown); await runChatWorker(allowed.repository, work(), allowed.options);
+    expect(allowed.compactCalls()).toBe(0); expect(allowed.effects).not.toContain('template');
+    expect(allowed.effects).toEqual(expect.arrayContaining(['begin', 'prompt', 'prompt-usage:valid', 'marker', 'complete']));
+
+    const confirmedOnly = workerFixture(chat, unknown);
+    confirmedOnly.setNative([{ status: 'confirmed', attemptId: outcome.attemptId, tool: outcome.tool, destination: outcome.destination, messageId: outcome.messageId }]);
+    await runChatWorker(confirmedOnly.repository, work(), confirmedOnly.options); expect(confirmedOnly.effects).toContain('complete');
+
+    const postPromptUnknown = workerFixture(chat, unknown, unknown); await runChatWorker(postPromptUnknown.repository, work(), postPromptUnknown.options);
+    expect(postPromptUnknown.effects).toEqual(expect.arrayContaining(['begin', 'prompt', 'prompt-usage:null', 'pause:usage_unknown']));
+    expect(postPromptUnknown.effects).not.toContain('marker'); expect(postPromptUnknown.effects).not.toContain('complete');
+  });
+  it('rejects unknown usage for non-fresh or checkpointed sessions before begin/prompt', async () => {
+    const unknown = { tokens: null, contextWindow: 10000, percent: null } as const;
+    const nonFresh = workerFixture(chat, unknown, undefined, false);
+    await runChatWorker(nonFresh.repository, work(), nonFresh.options);
+    expect(nonFresh.effects).toEqual(expect.arrayContaining(['pause:usage_unknown'])); expect(nonFresh.effects).not.toContain('begin'); expect(nonFresh.effects).not.toContain('prompt');
+
+    const checkpointed = workerFixture(chat, unknown); const value = checkpoint();
+    checkpointed.latest({ checkpointId: 'c'.repeat(32), phase: 'restored', checkpoint: value, compactionEntryId: 'RECOVERED_ENTRY' }); checkpointed.recover(value);
+    await runChatWorker(checkpointed.repository, work(), checkpointed.options);
+    expect(checkpointed.effects).toEqual(expect.arrayContaining(['reconcile', 'pause:usage_unknown'])); expect(checkpointed.effects).not.toContain('begin'); expect(checkpointed.effects).not.toContain('prompt');
+  });
+  it('rejects fresh unknown usage when durable mapping, sequence, or native journal proof is invalid', async () => {
+    const unknown = { tokens: null, contextWindow: 10000, percent: null } as const;
+    const mismatches = [
+      () => { const f = workerFixture(chat, unknown); f.setMapped({ ...f.session.binding, sessionFile: '/tmp/OTHER.jsonl' }); return f; },
+      () => { const f = workerFixture(chat, unknown); f.setSequence(1); return f; },
+      () => { const f = workerFixture(chat, unknown); f.setNative([{ status: 'attempting' }]); return f; }
+    ];
+    for (const make of mismatches) {
+      const f = make();
+      await expect.soft(f.options.turns.prepare(f.session, turn)).rejects.toMatchObject({ code: 'checkpoint_invalid' });
+      expect.soft(f.effects).not.toContain('begin'); expect.soft(f.effects).not.toContain('prompt');
+    }
+  });
   it('runs all four isolated pre-prompt failures with exact pauses before begin/prompt', async () => {
     for (const [reason, make] of [
-      ['usage_unknown', () => workerFixture(chat, { tokens: 1, contextWindow: 0, percent: 1 })],
+      ['usage_unknown', () => workerFixture(chat, { tokens: 1, contextWindow: 0, percent: 1 }, undefined, false)],
       ['checkpoint_invalid', () => { const f = workerFixture(); Object.assign(f.session, { history: async () => { throw new ControllerError('checkpoint_invalid'); } }); return f; }],
       ['compaction_failed', () => { const f = workerFixture(); Object.assign(f.session, { compact: async () => { throw new ControllerError('compaction_failed'); } }); return f; }],
       ['restore_failed', () => { const f = workerFixture(); f.latest({ checkpointId: 'c'.repeat(32), phase: 'prepared', checkpoint: checkpoint() }); return f; }]
@@ -194,7 +238,7 @@ describe('merged worker pre-compaction and post-prompt accounting', () => {
     }
   });
   it('an unrelated chat progresses while the affected chat fails pre-prompt usage', async () => {
-    const bad = workerFixture(chat, { tokens: 1, contextWindow: 0, percent: 1 }); const good = workerFixture(other, { tokens: 1000, contextWindow: 10000, percent: 10 });
+    const bad = workerFixture(chat, { tokens: 1, contextWindow: 0, percent: 1 }, undefined, false); const good = workerFixture(other, { tokens: 1000, contextWindow: 10000, percent: 10 });
     await Promise.all([runChatWorker(bad.repository, work(), bad.options), runChatWorker(good.repository, work(other), good.options)]);
     expect(bad.effects).not.toContain('prompt'); expect(good.effects).toContain('complete');
   });
@@ -210,12 +254,13 @@ describe('session-host durability barrier', () => {
     ] as const;
     type FreshReadbackScenario = typeof freshReadbackScenarios[number];
     let freshReadback: { scenario: FreshReadbackScenario; checkpointId: string; entryId: string } | undefined;
-    const calls: string[] = []; let opens = 0; const listeners = new Set<(value: { type: 'agent_settled'; aborted: boolean }) => void>();
+    const calls: string[] = []; let opens = 0; let connectedManager: (SdkManager & { getBranch(): readonly unknown[] }) | undefined;
+    const listeners = new Set<(value: { type: 'agent_settled'; aborted: boolean }) => void>();
     const makeManager = (file: string, header: Record<string, unknown>, entries: Record<string, unknown>[]): SdkManager & { getBranch(): readonly unknown[] } => {
       const activeBranch = () => { const byId = new Map(entries.map(entry => [entry['id'], entry])); const branch: Record<string, unknown>[] = [], seen = new Set<unknown>(); let current = entries.at(-1); while (current && !seen.has(current['id'])) { seen.add(current['id']); branch.push(current); const parent = current['parentId']; current = typeof parent === 'string' ? byId.get(parent) : undefined; } return branch.reverse(); };
       return { getSessionId: () => header['id'] as string, getSessionFile: () => file, getHeader: () => header, getEntries: () => entries, getBranch: activeBranch, appendCustomEntry: (type, data) => { const id = randomUUID(); const entry = { type: 'custom', customType: type, data, id, parentId: entries.at(-1)?.['id'] ?? null, timestamp: '2033-05-18T03:33:20Z' }; entries.push(entry); try { readFileSync(file); appendFileSync(file, JSON.stringify(entry) + '\n'); } catch { /* create is memory-only */ } return id; } };
     };
-    const sdk: SdkPort = { create: (cwd, dir) => makeManager(join(dir, 'session.jsonl'), { type: 'session', version: 3, id: 'HOST_SESSION', cwd, timestamp: '2033-05-18T03:33:20Z' }, []), open: file => { opens++; const rows = readFileSync(file, 'utf8').trimEnd().split('\n').map(line => JSON.parse(line) as Record<string, unknown>); return makeManager(file, rows.shift()!, rows); }, connect: async () => ({ isIdle: true, setAutoCompactionEnabled: () => {}, bindExtensions: async () => {}, prompt: async () => { for (const listener of listeners) listener({ type: 'agent_settled', aborted: false }); }, subscribe: listener => { listeners.add(listener as never); return () => {}; }, waitForIdle: async () => {}, dispose: () => {}, getContextUsage: () => ({ tokens: 1, contextWindow: 10000, percent: 1 }), compact: async () => { throw new Error(); }, getAllTools: () => [], getActiveToolNames: () => [], getCallableToolNames: () => [], getToolDefinition: () => undefined, extensionRunner: {} as never } as SdkSession), ready: async () => {} };
+    const sdk: SdkPort = { create: (cwd, dir) => makeManager(join(dir, 'session.jsonl'), { type: 'session', version: 3, id: 'HOST_SESSION', cwd, timestamp: '2033-05-18T03:33:20Z' }, []), open: file => { opens++; const rows = readFileSync(file, 'utf8').trimEnd().split('\n').map(line => JSON.parse(line) as Record<string, unknown>); return makeManager(file, rows.shift()!, rows); }, connect: async manager => { connectedManager = manager as SdkManager & { getBranch(): readonly unknown[] }; return { isIdle: true, setAutoCompactionEnabled: () => {}, bindExtensions: async () => {}, prompt: async () => { for (const listener of listeners) listener({ type: 'agent_settled', aborted: false }); }, subscribe: listener => { listeners.add(listener as never); return () => {}; }, waitForIdle: async () => {}, dispose: () => {}, getContextUsage: () => ({ tokens: 1, contextWindow: 10000, percent: 1 }), compact: async () => { throw new Error(); }, getAllTools: () => [], getActiveToolNames: () => [], getCallableToolNames: () => [], getToolDefinition: () => undefined, extensionRunner: {} as never } as SdkSession; }, ready: async () => {} };
     const makeIndex = () => createCompletionIndex(root, { groups: [chat], operatorJids: [] }, { list: async () => rows }, async () => false);
     const cp = checkpoint();
     const makeHost = (completionIndex: ReturnType<typeof createCompletionIndex>) => createSessionHost({ cwd: '/tmp', root, sdk, index: completionIndex, current: async () => {}, bind: async (_w, value) => { rows[0]!.binding = value as typeof binding; return true; }, checkpointMaxBytes: 65536, compact: async (_raw, _context, _instructions, value) => {
@@ -257,7 +302,21 @@ describe('session-host durability barrier', () => {
     const handle = await open(root, 'r'); const prototype = Object.getPrototypeOf(handle) as { sync(): Promise<void> }; await handle.close(); const original = prototype.sync; const synced: string[] = []; const spy = vi.spyOn(prototype, 'sync').mockImplementation(async function(this: typeof handle) { synced.push((await this.stat()).isFile() ? 'file' : 'parent'); await original.call(this); });
     try {
       const w = work(), session = await host.open(w); const context: TurnContext = { current: async () => {}, work: () => w };
-      await host.attach(session, context); synced.length = 0;
+      await host.attach(session, context);
+      expect(session.isFresh()).toBe(true); // Binding custom entry is allowed.
+      const branchEntries = connectedManager!.getEntries() as unknown as Record<string, unknown>[];
+      const parentId = branchEntries.at(-1)?.['id'] as string;
+      const forbidden = [
+        { type: 'message', id: 'FRESH_MESSAGE', parentId, timestamp: '2033-05-18T03:33:21Z', message: { role: 'user', content: 'SYNTHETIC', timestamp: 1 } },
+        { type: 'compaction', id: 'FRESH_COMPACTION', parentId, timestamp: '2033-05-18T03:33:21Z' },
+        { type: 'custom', id: 'FRESH_COMPLETION', parentId, timestamp: '2033-05-18T03:33:21Z', customType: COMPLETION_TYPE, data: {} },
+        { type: 'custom', id: 'FRESH_MUTATION', parentId, timestamp: '2033-05-18T03:33:21Z', customType: MUTATION_TYPE, data: {} }
+      ];
+      for (const entry of forbidden) {
+        branchEntries.push(entry); expect.soft(session.isFresh(), String(entry['id'])).toBe(false); branchEntries.pop();
+        expect.soft(session.isFresh(), `${String(entry['id'])}:removed`).toBe(true);
+      }
+      synced.length = 0;
       const result = await session.compact('SYNTHETIC', cp); expect(result.checkpoint).toEqual(cp);
       const recovery = session as PiSessionPort & { reconcileCheckpoint(record: { checkpointId: string; phase: 'prepared' | 'restored'; checkpoint: CheckpointV1; compactionEntryId?: string }): Promise<{ entryId: string; checkpoint: CheckpointV1 }> };
       expect(await recovery.reconcileCheckpoint({ checkpointId: 'c'.repeat(32), phase: 'prepared', checkpoint: cp })).toEqual({ entryId: 'COMPACT_ENTRY', checkpoint: cp });
@@ -311,7 +370,9 @@ describe('session-host durability barrier', () => {
       expect(opens).toBe(opensBeforeFreshMatrix + freshReadbackScenarios.length * 2 + invalid.length + 1);
       expect(calls.filter(call => call === 'compact')).toHaveLength(1 + freshReadbackScenarios.length);
       expect(calls.filter(call => call === 'compacted')).toHaveLength(1 + freshReadbackScenarios.length);
-      expect(calls.filter(call => call === 'restored')).toHaveLength(1); await session.dispose();
+      expect(calls.filter(call => call === 'restored')).toHaveLength(1);
+      await session.prompt(w.event, 'SYNTHETIC'); expect(session.isFresh()).toBe(false);
+      await session.dispose();
     } finally { spy.mockRestore(); await host.close(); await rm(root, { recursive: true, force: true }); }
   });
 });

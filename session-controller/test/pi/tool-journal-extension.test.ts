@@ -242,6 +242,7 @@ describe('direct worker own-message routing', () => {
     const workerBinding: SessionBinding = { canonicalChatId: chat, sessionId: 'SYNTHETIC_WORKER_SESSION', sessionFile: '/tmp/SYNTHETIC_WORKER.jsonl' };
     const session: PiSessionPort = {
       binding: workerBinding,
+      isFresh: () => true,
       async prompt() { effects.push('prompt'); },
       usage: () => undefined,
       async compact() { throw new ControllerError('compaction_failed'); },

@@ -190,6 +190,10 @@ export interface WorkRepository extends IntakeStore {
 export interface UsageSnapshot { readonly tokens: number | null; readonly contextWindow: number; readonly percent: number | null }
 export interface PiSessionPort {
   readonly binding: SessionBinding;
+  /** True only while the active branch has no conversational, compaction,
+   * completion, or mutation entries and this host has not started a prompt.
+   * The controller binding entry itself does not make a session non-fresh. */
+  isFresh(): boolean;
   /** Resolve only after agent_settled, including extension-triggered follow-ups. */
   prompt(event: NotificationV2, instructions: string): Promise<void>;
   usage(): UsageSnapshot | undefined;
