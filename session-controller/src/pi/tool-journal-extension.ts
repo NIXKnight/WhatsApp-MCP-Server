@@ -11,27 +11,57 @@ const fields = { send_message: 'to', send_group_message: 'jid', send_auto_messag
 type Tool = keyof typeof fields;
 const toolOf = (name: string): Tool | undefined => Object.keys(fields).find(t => name === `mcp__${WHATSAPP_SERVER}__${t}`) as Tool | undefined;
 const fail = () => new ControllerError('mutation_uncertain');
+interface PromptFailureFacts { readonly messages: readonly string[]; readonly statuses: readonly number[] }
+/** Inspect only a bounded Error.cause chain. Values are used for fixed-category
+ * selection and are never included in diagnostics. */
+function promptFailureFacts(error: unknown): PromptFailureFacts {
+  const messages: string[] = [], statuses: number[] = [], seen = new Set<object>();
+  let current = error;
+  for (let depth = 0; depth < 6 && current !== null && (typeof current === 'object' || typeof current === 'function'); depth++) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (current instanceof Error) messages.push(current.message);
+    try {
+      const raw = Reflect.get(current, 'status');
+      if (typeof raw === 'number' && Number.isFinite(raw)) statuses.push(raw);
+      else if (typeof raw === 'string' && /^\d{3}$/u.test(raw)) statuses.push(Number(raw));
+    } catch { /* Untrusted error properties cannot suppress the fixed diagnostic. */ }
+    try { current = Reflect.get(current, 'cause'); }
+    catch { break; }
+  }
+  return { messages, statuses };
+}
 const promptFailureCategory = (error: unknown): string => {
   if (error instanceof ControllerError) return error.code;
   if (error instanceof Error && error.name === 'AbortError') return 'aborted';
-  const status = typeof error === 'object' && error !== null && 'status' in error ? Number(error.status) : undefined;
-  if (status === 401 || status === 403) return 'authentication';
-  if (status === 429) return 'rate_limit';
-  if (status === 400 || status === 413) return 'request_rejected';
+  const facts = promptFailureFacts(error);
+  const lower = facts.messages.map(message => message.toLowerCase());
+  // These are exact SDK paths. In particular, inspect cause because pi-ai wraps
+  // authHeader resolution in ModelsError before AgentSession.prompt rejects.
+  if (facts.messages.some(message => message === 'authHeader requires a resolved API key')) return 'model_auth_header_unresolved';
+  if (lower.some(message => /^no api key found for (?:[^\r\n]+)(?:\.|\r?\n|$)/u.test(message))) return 'model_api_key_missing';
+  const message = lower.join('\n');
+  const rejected = /\b(?:401|403|unauthorized|forbidden)\b/u;
+  if (/hindsight.*(?:401|403|unauthorized|forbidden)|(?:401|403|unauthorized|forbidden).*hindsight/u.test(message)) return 'memory_authentication';
+  if (/mcp.*(?:oauth|needs.auth|unauthorized|forbidden)|(?:oauth|needs.auth|unauthorized|forbidden).*mcp/u.test(message)) return 'mcp_authentication';
+  if (facts.statuses.some(status => status === 401 || status === 403)) return 'model_credentials_rejected';
+  // Preserve explicit local approval failures, then treat the SDK/provider's
+  // rejection vocabulary as credential rejection even after status flattening.
+  if (/\b(?:approval|permission)\b/u.test(message)) return 'approval_required';
+  if (lower.some(value => rejected.test(value))) return 'model_credentials_rejected';
+  if (facts.statuses.includes(429)) return 'rate_limit';
+  if (facts.statuses.some(status => status === 400 || status === 413)) return 'request_rejected';
   if (error instanceof TypeError) return 'transport';
-  const message = error instanceof Error ? error.message.toLowerCase() : '';
-  if (/hindsight.*(?:401|403|unauthorized|forbidden)|(?:401|403|unauthorized|forbidden).*hindsight/.test(message)) return 'memory_authentication';
-  if (/mcp.*(?:oauth|needs.auth|unauthorized|forbidden)|(?:oauth|needs.auth|unauthorized|forbidden).*mcp/.test(message)) return 'mcp_authentication';
-  if (/provider.*not configured|api.?key|credential.*provider|(?:401|403|unauthorized|forbidden).*(?:provider|model)/.test(message)) return 'model_authentication';
-  if (/approval|permission|authoriz/.test(message)) return 'approval_required';
-  if (/no model|unknown model|model.*(?:missing|unavailable|not found)/.test(message)) return 'model_unavailable';
-  if (/context|token limit|too many tokens|maximum length|request too large/.test(message)) return 'context_limit';
-  if (/tool.*schema|invalid.*tool|function.*schema|tool definition/.test(message)) return 'tool_schema';
-  if (/mcp|stdio|server.*connect|protocol.*error/.test(message)) return 'mcp_runtime';
-  if (/hindsight|memory|reflect|retain/.test(message)) return 'memory_runtime';
-  if (/extension|hook|handler/.test(message)) return 'extension_runtime';
-  if (/approval.*required|approval.*denied|permission/.test(message)) return 'approval_required';
-  if (/fetch|network|socket|econn|timeout|timed out/.test(message)) return 'transport';
+  if (lower.some(value => /^provider is not configured: [^\r\n]+$/u.test(value))) return 'model_authentication';
+  if (/approval|permission|authoriz/u.test(message)) return 'approval_required';
+  if (/no model|unknown model|model.*(?:missing|unavailable|not found)/u.test(message)) return 'model_unavailable';
+  if (/context|token limit|too many tokens|maximum length|request too large/u.test(message)) return 'context_limit';
+  if (/tool.*schema|invalid.*tool|function.*schema|tool definition/u.test(message)) return 'tool_schema';
+  if (/mcp|stdio|server.*connect|protocol.*error/u.test(message)) return 'mcp_runtime';
+  if (/hindsight|memory|reflect|retain/u.test(message)) return 'memory_runtime';
+  if (/extension|hook|handler/u.test(message)) return 'extension_runtime';
+  if (/approval.*required|approval.*denied|permission/u.test(message)) return 'approval_required';
+  if (/fetch|network|socket|econn|timeout|timed out/u.test(message)) return 'transport';
   return 'unknown';
 };
 const reportPromptFailure = (error: unknown): void => {

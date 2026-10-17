@@ -127,6 +127,29 @@ export interface LazyPiHostWiring {
   readonly journal: JournalAttachment;
   readonly extensions: NonNullable<Parameters<typeof loadNativeSdk>[3]>;
 }
+export interface PromptModelRuntimeOptions {
+  readonly authPath: string;
+  readonly modelsPath: string;
+  readonly allowModelNetwork: false;
+}
+export type PromptModelRuntimeFactory =
+  (options: PromptModelRuntimeOptions) => Promise<Parameters<typeof loadNativeSdk>[2]>;
+/** Production prompt runtimes must complete the SDK's offline credential and
+ * availability refresh. AgentSession.prompt consults that snapshot before its
+ * request path, whereas prepareRequest resolves credentials directly. */
+export async function createPromptModelRuntime(
+  config: ControllerConfig,
+  create: PromptModelRuntimeFactory = async options => {
+    const { ModelRuntime } = await import('@earendil-works/pi-coding-agent');
+    return ModelRuntime.create(options);
+  }
+): Promise<Parameters<typeof loadNativeSdk>[2]> {
+  return create({
+    authPath: join(config.pi.agentDir, 'auth.json'),
+    modelsPath: join(config.pi.agentDir, 'models.json'),
+    allowModelNetwork: false
+  });
+}
 export function createLazyPiHost(options: {
   config: ReturnType<typeof loadConfig>;
   policy: Awaited<ReturnType<typeof loadPromptPolicy>>;
@@ -144,17 +167,11 @@ export function createLazyPiHost(options: {
     if (!initialization) {
       const extensions = [options.journal.extension, options.checkpoint.extension] as const;
       initialization = initializeOverride ? initializeOverride({ journal: options.journal, extensions }) : (async () => {
-        const [{ ModelRuntime }, { createCheckpointExtension }] = await Promise.all([
-          import('@earendil-works/pi-coding-agent'),
-          import('./compaction/checkpoint-extension.js')
+        const [{ createCheckpointExtension }, modelRuntime] = await Promise.all([
+          import('./compaction/checkpoint-extension.js'),
+          createPromptModelRuntime(options.config)
         ]);
         options.checkpoint.initialize(createCheckpointExtension(options.repository, options.config.compaction));
-        const modelRuntime = await ModelRuntime.create({
-          authPath: join(options.config.pi.agentDir, 'auth.json'),
-          modelsPath: join(options.config.pi.agentDir, 'models.json'),
-          allowModelNetwork: false,
-          refreshOnCreate: false
-        });
         const sdk = await loadNativeSdk(options.config, options.policy, modelRuntime, extensions);
         const host = createSessionHost({
           cwd: options.config.pi.cwd,
