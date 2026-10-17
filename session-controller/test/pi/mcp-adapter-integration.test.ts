@@ -1,6 +1,7 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { ModelRuntime, type ToolResultEvent } from '@earendil-works/pi-coding-agent';
 import { computeServerHash, saveMetadataCache } from 'pi-mcp-adapter/metadata-cache';
@@ -48,6 +49,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   })) };
   else if (message.method === 'ping') result = {};
   else if (message.method === 'tools/call') {
+    appendFileSync(lifecycle, 'call\n');
     const raw = JSON.stringify({ success: true, message_id: 'OWNED_ADAPTER_RESULT' });
     result = { content: [{ type: 'text', text: raw }], structuredContent: { result: raw } };
   }
@@ -230,6 +232,110 @@ describe('controller-owned pi-mcp-adapter', () => {
       else process.env['PI_CODING_AGENT_DIR'] = priorAgentDir;
       if (priorSecret === undefined) delete process.env['SYNTHETIC_PRIVATE_VALUE'];
       else process.env['SYNTHETIC_PRIVATE_VALUE'] = priorSecret;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('runs full mode from a scoped in-memory profile snapshot without duplicate adapter conflicts or disk writes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'whatsapp-adapter-full-profile-'));
+    const roots = {
+      cwd: join(root, 'workspace'), agentDir: join(root, 'agent'), sessions: join(root, 'sessions'),
+      server: join(root, 'fake-mcp.mjs'), lifecycle: join(root, 'lifecycle.log'),
+      extensionEffects: join(root, 'extension-effects.log')
+    };
+    const projectDir = join(roots.cwd, '.pi');
+    const fixtureDir = join(roots.agentDir, 'fixtures');
+    const adapterEntry = fileURLToPath(import.meta.resolve('pi-mcp-adapter'));
+    const adapterRoot = dirname(adapterEntry);
+    await Promise.all([roots.cwd, roots.agentDir, roots.sessions, projectDir, fixtureDir]
+      .map(path => mkdir(path, { recursive: true })));
+    await writeFile(roots.server, fakeServer, { mode: 0o700 });
+    const toolFactory = (names: readonly string[]): string => `export default function (pi) {
+  for (const name of ${JSON.stringify(names)}) pi.registerTool({
+    name, label: name, description: 'synthetic-profile-tool',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    async execute() { throw new Error('PROFILE_TOOL_MUST_NOT_BE_CALLED'); }
+  });
+}\n`;
+    await writeFile(join(fixtureDir, 'subagents.ts'), toolFactory(['Agent', 'get', 'steer', 'workflow']));
+    await writeFile(join(fixtureDir, 'hindsight.ts'), toolFactory(['Hindsight']));
+    await writeFile(join(fixtureDir, 'other.ts'), `import { appendFileSync } from 'node:fs';
+export default function (pi) {
+  pi.registerTool({ name: 'other_plugin', label: 'other_plugin', description: 'retained',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    async execute() { throw new Error('PROFILE_TOOL_MUST_NOT_BE_CALLED'); } });
+  pi.on('session_start', () => appendFileSync(${JSON.stringify(roots.extensionEffects)},
+    'other:compaction=' + String(pi.getSettings().compaction?.enabled) + '\\n'));
+}\n`);
+    await symlink(adapterRoot, join(projectDir, 'adapter-link'));
+
+    const globalSettingsPath = join(roots.agentDir, 'settings.json');
+    const projectSettingsPath = join(projectDir, 'settings.json');
+    const globalBytes = `${JSON.stringify({
+      packages: ['  npm:pi-mcp-adapter@5.3.1\n'],
+      extensions: [adapterEntry, 'fixtures/subagents.ts', 'fixtures/hindsight.ts',
+        '-fixtures/hindsight.ts', 'fixtures/other.ts'],
+      compaction: { enabled: true, reserveTokens: 1234 }
+    }, null, 4)}\n`;
+    const projectBytes = `${JSON.stringify({
+      packages: [{ source: '\tnpm:pi-mcp-adapter\r\n', extensions: ['index.ts'] }],
+      extensions: ['adapter-link'], compaction: { enabled: true }
+    }, null, 3)}\n`;
+    await writeFile(globalSettingsPath, globalBytes);
+    await writeFile(projectSettingsPath, projectBytes);
+
+    const priorAgentDir = process.env['PI_CODING_AGENT_DIR'];
+    process.env['PI_CODING_AGENT_DIR'] = roots.agentDir;
+    let session: SdkSession | undefined;
+    try {
+      const runtime = await ModelRuntime.create({
+        authPath: join(roots.agentDir, 'auth.json'), modelsPath: join(roots.agentDir, 'models.json'),
+        allowModelNetwork: false, refreshOnCreate: false
+      });
+      const config = {
+        bridge: { baseUrl: 'http://127.0.0.1:1' },
+        pi: { cwd: roots.cwd, agentDir: roots.agentDir, sessionDir: roots.sessions, provider: '', model: '' },
+        mcp: { command: process.execPath, args: [roots.server, roots.lifecycle], cwd: root }
+      } as never;
+      const sdk = await loadNativeSdk(config, { system: '' } as never, runtime);
+      session = await sdk.connect(sdk.create(roots.cwd, roots.sessions), async () => {});
+      session.setAutoCompactionEnabled(false);
+      await session.bindExtensions({});
+      await sdk.ready(session, async () => {});
+
+      const active = session.getActiveToolNames();
+      expect(['Agent', 'get', 'steer', 'workflow', 'other_plugin'].every(name => active.includes(name))).toBe(true);
+      expect(active.filter(name => name.toLowerCase().includes('hindsight'))).toEqual([]);
+      const whatsapp = session.getAllTools().filter(tool =>
+        tool.name.startsWith('mcp__whatsapp_session_controller__'));
+      expect(whatsapp.map(tool => tool.name)).toEqual(REQUIRED_WHATSAPP_TOOLS.map(whatsappToolName));
+      expect(whatsapp).toHaveLength(21);
+      expect(whatsapp.every(tool => tool.exposure === 'direct' &&
+        tool.sourceInfo.path === MCP_ADAPTER_SOURCE_PATH && tool.sourceInfo.source === 'inline')).toBe(true);
+      const extensionPaths = session.extensionRunner.getExtensionPaths();
+      expect(extensionPaths.filter(path => path === MCP_ADAPTER_SOURCE_PATH)).toHaveLength(1);
+      expect(extensionPaths).not.toContain(adapterEntry);
+      expect(extensionPaths).not.toContain(join(projectDir, 'adapter-link'));
+      expect(await eventuallyRead(roots.extensionEffects, 'other:compaction=false'))
+        .toContain('other:compaction=false');
+      const [pid] = await eventuallyStarted(roots.lifecycle, 1);
+      await session.dispose();
+      session = undefined;
+      await eventuallyStopped(pid!);
+      expect(await readFile(globalSettingsPath)).toEqual(Buffer.from(globalBytes));
+      expect(await readFile(projectSettingsPath)).toEqual(Buffer.from(projectBytes));
+      expect((await readFile(roots.lifecycle, 'utf8')).match(/^call$/gm)).toBeNull();
+    } finally {
+      await Promise.allSettled([Promise.resolve(session?.dispose())]);
+      try {
+        const lifecycle = await readFile(roots.lifecycle, 'utf8');
+        const pids = [...lifecycle.matchAll(/^start:(\d+)$/gm)].map(match => Number(match[1]));
+        await Promise.all(pids.map(eventuallyStopped));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (priorAgentDir === undefined) delete process.env['PI_CODING_AGENT_DIR'];
+      else process.env['PI_CODING_AGENT_DIR'] = priorAgentDir;
       await rm(root, { recursive: true, force: true });
     }
   }, 30_000);

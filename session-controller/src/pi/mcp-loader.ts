@@ -3,6 +3,9 @@ import type {
   ResourceLoader, SessionManager, SettingsManager
 } from '@earendil-works/pi-coding-agent';
 import type { McpAdapterOptions, ServerEntry } from 'pi-mcp-adapter/types';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, parse, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createJiti } from 'jiti';
 import { ControllerError } from '../domain.js';
@@ -131,19 +134,92 @@ export function createControllerMcpConfig(config: ControllerConfig): ControllerM
   };
 }
 
-function packageSource(value: ReturnType<SettingsManager['getPackages']>[number]): string {
+type PiSettings = ReturnType<SettingsManager['getSettings']>;
+type PiPackageSource = ReturnType<SettingsManager['getPackages']>[number];
+type PiSettingsStorage = Parameters<typeof SettingsManager.fromStorage>[0];
+type PiSettingsScope = Parameters<PiSettingsStorage['withLock']>[0];
+
+function packageSource(value: PiPackageSource): string {
   return (typeof value === 'string' ? value : value.source).trim();
 }
 /** Match only the npm declaration whose package identity is pi-mcp-adapter.
  * Local paths, git URLs, aliases, and similarly named packages are untouched. */
-export function isConfiguredMcpAdapterPackage(value: ReturnType<SettingsManager['getPackages']>[number]): boolean {
+export function isConfiguredMcpAdapterPackage(value: PiPackageSource): boolean {
   const source = packageSource(value);
   return /^npm:pi-mcp-adapter(?:@[^/]+)?$/.test(source);
 }
-export function withoutConfiguredMcpAdapter(
-  packages: ReturnType<SettingsManager['getPackages']>
-): ReturnType<SettingsManager['getPackages']> {
+export function withoutConfiguredMcpAdapter(packages: PiPackageSource[]): PiPackageSource[] {
   return packages.filter(value => !isConfiguredMcpAdapterPackage(value));
+}
+
+const hasExtensionPattern = (value: string): boolean =>
+  /^[+!-]/u.test(value) || /[*?\[\]{}()]/u.test(value);
+
+/** Qualify a plain configured extension path without evaluating its module.
+ * The nearest package.json after symlink resolution owns the extension. */
+export function isConfiguredMcpAdapterExtension(value: string, baseDir: string): boolean {
+  const source = value.trim();
+  if (!source || source.startsWith('builtin:') || hasExtensionPattern(source) ||
+      /^[a-z][a-z\d+.-]*:/iu.test(source) || /^git@[^:]+:/iu.test(source)) return false;
+  const unresolved = source === '~' ? homedir() : source.startsWith('~/') ? join(homedir(), source.slice(2)) :
+    resolve(baseDir, source);
+  let resolvedPath: string;
+  try {
+    resolvedPath = realpathSync(unresolved);
+    const status = statSync(resolvedPath);
+    if (status.isFile()) resolvedPath = dirname(resolvedPath);
+    else if (!status.isDirectory()) return false;
+  } catch { return false; }
+  for (let directory = resolvedPath; ; directory = dirname(directory)) {
+    try {
+      const contents = readFileSync(join(directory, 'package.json'), 'utf8').replace(/^\uFEFF/u, '');
+      const manifest = JSON.parse(contents) as unknown;
+      return isRecord(manifest) && manifest['name'] === 'pi-mcp-adapter';
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return false;
+    }
+    if (directory === parse(directory).root) return false;
+  }
+}
+
+export function withoutConfiguredMcpAdapterExtensions(extensions: string[], baseDir: string): string[] {
+  return extensions.filter(value => !isConfiguredMcpAdapterExtension(value, baseDir));
+}
+
+function controllerScopedSettings(settings: PiSettings, baseDir: string): PiSettings {
+  return {
+    ...settings,
+    ...(settings.packages ? { packages: withoutConfiguredMcpAdapter(settings.packages) } : {}),
+    ...(settings.extensions ? {
+      extensions: withoutConfiguredMcpAdapterExtensions(settings.extensions, baseDir)
+    } : {}),
+    compaction: { ...settings.compaction, enabled: false }
+  };
+}
+
+function scopedMemorySettingsStorage(global: PiSettings, project: PiSettings): PiSettingsStorage {
+  const values: Record<PiSettingsScope, string | undefined> = {
+    global: JSON.stringify(global), project: JSON.stringify(project)
+  };
+  return {
+    withLock(scope, fn) {
+      const next = fn(values[scope]);
+      if (next !== undefined) values[scope] = next;
+    }
+  };
+}
+
+/** Snapshot disk-backed settings into session-local scoped storage before any
+ * configured extension executes. Later settings writes cannot touch profile files. */
+function createControllerSessionSettingsManager(sdk: PiSdkModule, cwd: string, agentDir: string): SettingsManager {
+  const disk = sdk.SettingsManager.create(cwd, agentDir);
+  const global = controllerScopedSettings(disk.getGlobalSettings(), agentDir);
+  const project = controllerScopedSettings(disk.getProjectSettings(), join(cwd, '.pi'));
+  return sdk.SettingsManager.fromStorage(
+    scopedMemorySettingsStorage(global, project),
+    { projectTrusted: disk.isProjectTrusted() }
+  );
 }
 
 const ADAPTER_RUNTIME_STATUSES = [
@@ -340,11 +416,12 @@ export async function loadNativeSdk(
       let settingsManager: SettingsManager;
       let loader: ResourceLoader;
       if (mode.kind === 'full') {
-        settingsManager = sdk.SettingsManager.create(config.pi.cwd, config.pi.agentDir);
-        // Session-only override: preserve every configured package except the
-        // exact adapter npm declaration, then inject one controller-owned copy.
-        const packages = withoutConfiguredMcpAdapter(settingsManager.getPackages());
-        settingsManager.applyOverrides({ compaction: { enabled: false }, packages });
+        // Snapshot each settings scope before extension loading. Remove only
+        // declarations proven to be this adapter; all extension-side writes are
+        // then confined to controller-session memory.
+        settingsManager = createControllerSessionSettingsManager(
+          sdk, config.pi.cwd, config.pi.agentDir
+        );
         const leaseFence: ExtensionFactory = pi => {
           // Fencing only: no tool-name, destination, origin or argument policy gate.
           pi.on('tool_call', async () => {

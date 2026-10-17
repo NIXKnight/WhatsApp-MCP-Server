@@ -13,8 +13,9 @@ import { createJournalTurns } from '../src/scheduler/chat-worker.js';
 import {
   ADAPTER_WHATSAPP_SERVER, MCP_ADAPTER_EXTENSION, MCP_ADAPTER_SOURCE_PATH,
   MCP_STATUS_OBSERVER_SOURCE_PATH, createControllerMcpConfig,
-  isConfiguredMcpAdapterPackage, loadNativeSdk, REQUIRED_WHATSAPP_TOOLS,
-  WHATSAPP_SERVER, withoutConfiguredMcpAdapter
+  isConfiguredMcpAdapterExtension, isConfiguredMcpAdapterPackage, loadNativeSdk,
+  REQUIRED_WHATSAPP_TOOLS, WHATSAPP_SERVER, withoutConfiguredMcpAdapter,
+  withoutConfiguredMcpAdapterExtensions
 } from '../src/pi/mcp-loader.js';
 import type { SessionHost } from '../src/pi/session-host.js';
 import type {
@@ -130,6 +131,53 @@ async function mainModule(): Promise<typeof import('../src/main.js')> {
 const execFileAsync = promisify(execFile);
 
 describe('main lifecycle composition', () => {
+  it('qualifies only exact adapter package and explicit extension provenance without importing it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'controller-adapter-qualification-'));
+    const agentDir = join(root, 'agent');
+    const projectBase = join(root, 'workspace', '.pi');
+    const adapter = join(root, 'packages', 'adapter');
+    const lookalike = join(root, 'packages', 'lookalike');
+    const unrelated = join(root, 'packages', 'unrelated');
+    const malformed = join(root, 'packages', 'malformed');
+    try {
+      await Promise.all([agentDir, projectBase, adapter, lookalike, unrelated, malformed]
+        .map(path => mkdir(path, { recursive: true })));
+      await writeFile(join(adapter, 'package.json'), JSON.stringify({ name: 'pi-mcp-adapter' }));
+      await writeFile(join(adapter, 'index.ts'), 'throw new Error("QUALIFICATION_MUST_NOT_IMPORT");\n');
+      await writeFile(join(lookalike, 'package.json'), JSON.stringify({ name: 'pi-mcp-adapter-extra' }));
+      await writeFile(join(lookalike, 'index.ts'), 'export default () => {};\n');
+      await writeFile(join(unrelated, 'package.json'), JSON.stringify({ name: 'other-plugin' }));
+      await writeFile(join(unrelated, 'index.ts'), 'export default () => {};\n');
+      await writeFile(join(malformed, 'package.json'), '{not-json');
+      await writeFile(join(malformed, 'index.ts'), 'export default () => {};\n');
+      await symlink(adapter, join(agentDir, 'adapter-dir-link'));
+      await symlink(join(adapter, 'index.ts'), join(projectBase, 'adapter-file-link.ts'));
+
+      const globalEntries = [
+        '../packages/adapter/index.ts', 'adapter-dir-link', '../packages/lookalike/index.ts',
+        '../packages/malformed/index.ts', './missing.ts', 'builtin:mcp',
+        '+../packages/adapter/index.ts', '../packages/*/index.ts',
+        'git:https://example.test/pi-mcp-adapter', 'https://example.test/adapter.ts'
+      ];
+      const projectEntries = [
+        '../../packages/adapter', 'adapter-file-link.ts', '../../packages/unrelated/index.ts'
+      ];
+      expect(globalEntries.map(value => isConfiguredMcpAdapterExtension(value, agentDir))).toEqual([
+        true, true, false, false, false, false, false, false, false, false
+      ]);
+      expect(projectEntries.map(value => isConfiguredMcpAdapterExtension(value, projectBase))).toEqual([
+        true, true, false
+      ]);
+      expect(withoutConfiguredMcpAdapterExtensions(globalEntries, agentDir)).toEqual(globalEntries.slice(2));
+      expect(withoutConfiguredMcpAdapterExtensions(projectEntries, projectBase)).toEqual([
+        '../../packages/unrelated/index.ts'
+      ]);
+      expect(globalEntries[0]).toBe('../packages/adapter/index.ts');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('retries startup status/fetch failures, disposes non-OK bodies, fails retry-timer errors, and strictly monitors bridge state', async () => {
     const { monitorBridge, runLifecycle, waitForBridge } = await mainModule();
     const config = { baseUrl: 'http://127.0.0.1:8080', pollMs: 17, requestTimeoutMs: 100 };
@@ -383,9 +431,25 @@ describe('main lifecycle composition', () => {
       },
       SettingsManager: {
         create: () => ({
-          getPackages: () => [],
-          applyOverrides: () => {}
-        })
+          getGlobalSettings: () => ({}),
+          getProjectSettings: () => ({}),
+          isProjectTrusted: () => true
+        }),
+        fromStorage: (storage: {
+          withLock(scope: 'global' | 'project', fn: (current?: string) => string | undefined): void;
+        }, options: { projectTrusted?: boolean }) => {
+          const read = (scope: 'global' | 'project'): Record<string, unknown> => {
+            let value: string | undefined;
+            storage.withLock(scope, current => { value = current; return undefined; });
+            return value ? JSON.parse(value) as Record<string, unknown> : {};
+          };
+          return {
+            getGlobalSettings: () => read('global'),
+            getProjectSettings: () => options.projectTrusted === false ? {} : read('project'),
+            isProjectTrusted: () => options.projectTrusted !== false,
+            async reload() {}
+          };
+        }
       },
       DefaultResourceLoader: SyntheticResourceLoader,
       createCodemodeExtension: () => (() => {}),
