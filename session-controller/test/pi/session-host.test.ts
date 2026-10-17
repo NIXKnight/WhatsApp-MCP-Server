@@ -55,6 +55,7 @@ async function fixture() {
   let followup = gate(), prompted = gate();
   let idle = true, aborted = false, omitSettled = false, appendFailure = false, markerWritten = false;
   let markerHold: ReturnType<typeof gate> | undefined, written: ReturnType<typeof gate> | undefined;
+  let disposeHold: ReturnType<typeof gate> | undefined;
   const current = async () => { effects.push('gate'); if (lost) throw new ControllerError('lease_lost'); if (markerWritten) await markerHold?.promise; };
   const runtime: SdkSession = {
     get isIdle() { return idle; }, setAutoCompactionEnabled: enabled => { expect(enabled).toBe(false); effects.push('auto-off'); },
@@ -68,8 +69,10 @@ async function fixture() {
     },
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     waitForIdle: async () => { if (!idle) await followup.promise; },
-    dispose: () => { effects.push('disposed'); },
+    dispose: async () => { effects.push('dispose-start'); await disposeHold?.promise; effects.push('disposed'); },
     getContextUsage: () => ({ tokens: 12, contextWindow: 1000, percent: 1.2 }), getAllTools: () => [],
+    getActiveToolNames: () => [], getCallableToolNames: () => [], getToolDefinition: () => undefined,
+    extensionRunner: {} as never,
     compact: async () => { throw new Error('SYNTHETIC_DO_NOT_CALL_NATIVE_COMPACT'); }
   };
   const sdk: SdkPort = {
@@ -110,7 +113,8 @@ async function fixture() {
     reset: () => { followup = gate(); prompted = gate(); idle = true; }, abort: () => { aborted = true; }, omit: () => { omitSettled = true; },
     compactRelease: () => compactGate.resolve(), compactReset: () => { compactGate = gate(); }, failMarker: () => { appendFailure = true; },
     holdMarker: () => { markerHold = gate(); written = gate(); return { written: written.promise, release: markerHold.resolve }; },
-    cleanup: async () => { markerHold?.resolve(); followup.resolve(); compactGate.resolve(); await host.close(); await rm(root, { recursive: true, force: true }); }
+    holdDispose: () => { disposeHold = gate(); return disposeHold.resolve; },
+    cleanup: async () => { markerHold?.resolve(); disposeHold?.resolve(); followup.resolve(); compactGate.resolve(); await host.close(); await rm(root, { recursive: true, force: true }); }
   };
 }
 async function turn(f: Awaited<ReturnType<typeof fixture>>, w: ClaimedWork, binding?: SessionBinding) {
@@ -142,6 +146,21 @@ describe('isolated Pi boundary and durable noncontext evidence (no native runtim
       await expect(restored.prompt(next.event, 'SYNTHETIC')).rejects.toMatchObject({ code: 'session_failed' });
       f.release(); await nextTurn; await disposing;
       await expect(session.prompt(w.event, 'SYNTHETIC')).rejects.toMatchObject({ code: 'session_failed' });
+    } finally { await f.cleanup(); }
+  });
+  it('awaits asynchronous native session teardown before reporting controller disposal complete', async () => {
+    const f = await fixture();
+    try {
+      const session = await f.host.open(work());
+      const release = f.holdDispose();
+      let settled = false;
+      const disposing = session.dispose().then(() => { settled = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(f.effects).toContain('dispose-start');
+      expect(settled).toBe(false);
+      release();
+      await disposing;
+      expect(f.effects).toContain('disposed');
     } finally { await f.cleanup(); }
   });
   it('requires original fingerprint and strict durable evidence; malformed, missing and legacy files fail closed', async () => {

@@ -4,7 +4,7 @@ import { checked, ControllerError, ChatJidSchema, MessageIdSchema, MutationAttem
   type SessionBinding, type MutationState, type MutationAttempt, type CompletionMarker, type CanonicalChatId, type Clock, systemClock } from '../domain.js';
 import type { TurnContext } from '../scheduler/chat-worker.js';
 import type { RedisRepository } from '../redis/repository.js';
-import { WHATSAPP_SERVER } from './mcp-loader.js';
+import { ADAPTER_WHATSAPP_SERVER, MCP_ADAPTER_SOURCE_PATH, WHATSAPP_SERVER } from './mcp-loader.js';
 export const MUTATION_TYPE = 'whatsapp.controller.mutation.v1';
 const fields = { send_message: 'to', send_group_message: 'jid', send_auto_message: 'jid', send_media: 'to',
   send_reaction: 'chat_jid', edit_message: 'chat_jid', revoke_message: 'chat_jid' } as const;
@@ -38,19 +38,27 @@ export function mutationDestination(tool: Tool, input: Record<string, unknown>):
   return checked(ChatJidSchema, actual, 'mutation_uncertain');
 }
 /** FastMCP 3.2 wraps every annotated `-> str` result as
- * structuredContent.result; Pi 1.1.0 stores the untruncated CallToolResult
- * envelope here and removes only `_meta`. The sole text block must be the same
- * string. Direct objects and alternate renderings are not production paths. */
+ * structuredContent.result. The adapter's bounded direct-tool details retain
+ * the untruncated CallToolResult as details.mcpResult for these small mutation
+ * responses; model-facing content alone is never confirmation evidence. */
 export function confirmedMessage(event: ToolResultEvent, tool: Tool): string | undefined {
-  const details = object(event.details), envelope = object(event.structuredContent);
-  if (event.isError || details?.['server'] !== WHATSAPP_SERVER || details['tool'] !== tool || !envelope) return undefined;
-  const envelopeKeys = Object.keys(envelope).sort();
-  if ((envelopeKeys.join(',') !== 'content,structuredContent' && envelopeKeys.join(',') !== 'content,isError,structuredContent') ||
+  const details = object(event.details), envelope = object(details?.['mcpResult']);
+  if (event.isError || details?.['server'] !== ADAPTER_WHATSAPP_SERVER || details['tool'] !== tool ||
+      details['error'] !== undefined || details['outputGuard'] !== undefined || !envelope) return undefined;
+  const allowedEnvelopeKeys = new Set(['content', 'structuredContent', 'isError', '_meta']);
+  if (Object.keys(envelope).some(key => !allowedEnvelopeKeys.has(key)) ||
       (envelope['isError'] !== undefined && envelope['isError'] !== false)) return undefined;
   const content = envelope['content']; if (!Array.isArray(content) || content.length !== 1) return undefined;
   const block = object(content[0]), structured = object(envelope['structuredContent']);
   if (!block || !exactKeys(block, ['text', 'type']) || block['type'] !== 'text' || typeof block['text'] !== 'string' ||
       !structured || !exactKeys(structured, ['result']) || typeof structured['result'] !== 'string' || block['text'] !== structured['result']) return undefined;
+  // Model-facing rendering may add blocks independently of the retained raw
+  // envelope. Its first block must still be the exact FastMCP result string.
+  const visible = event.content;
+  if (!Array.isArray(visible) || visible.length < 1) return undefined;
+  const visibleBlock = object(visible[0]);
+  if (!visibleBlock || !exactKeys(visibleBlock, ['text', 'type']) || visibleBlock['type'] !== 'text' ||
+      visibleBlock['text'] !== block['text']) return undefined;
   const raw = structured['result'];
   if (Buffer.byteLength(raw) < 2 || Buffer.byteLength(raw) > 4096) return undefined;
   let parsed: unknown; try { parsed = JSON.parse(raw); } catch { return undefined; }
@@ -120,8 +128,9 @@ export function createToolJournal(ports: Pick<RedisRepository, 'nativeJournal' |
     const verifySource = (event: ToolCallEvent) => {
       const matching = pi.getAllTools().filter(t => t.name === event.toolName);
       if (matching.length !== 1) throw fail(); const info: ToolInfo = matching[0]!;
-      // Actual public metadata: Slice 6 named MCP factory (not builtin:true), server namespace.
-      if (info.sourceInfo.path !== '<inline:mcp>' || info.sourceInfo.source !== 'inline' || info.namespace?.name !== `mcp__${WHATSAPP_SERVER}`) throw fail();
+      // Direct tools inherit the named programmatic adapter factory's public
+      // source metadata. Namespace metadata is optional for eager direct tools.
+      if (info.sourceInfo.path !== MCP_ADAPTER_SOURCE_PATH || info.sourceInfo.source !== 'inline') throw fail();
     };
     pi.on('tool_call', async (event, ctx) => {
       const tool = toolOf(event.toolName); if (!tool) return undefined;
