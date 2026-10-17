@@ -44,7 +44,7 @@ function fixture() {
     open: async w => {
       effects.push('open'); let guard: TurnContext | undefined;
       const session: PiSessionPort = {
-        binding: binding(w.event.canonical_chat_jid), usage: () => undefined,
+        binding: binding(w.event.canonical_chat_jid), isFresh: () => true, usage: () => undefined,
         compact: async () => { throw new ControllerError('compaction_failed'); },
         prompt: async () => { await guard?.current(); effects.push('prompt'); await promptGate?.promise; },
         appendCompletion: async (marker: CompletionMarker) => { await guard?.current(); effects.push('marker'); evidence = { ...proof(w), marker }; return evidence; },
@@ -148,7 +148,7 @@ describe('bounded coordinator and recovery hints', () => {
     f.options.host.open = async w => {
       const h = gate(); holds.set(w.event.canonical_chat_jid, h);
       starts.set(w.event.canonical_chat_jid, (starts.get(w.event.canonical_chat_jid) ?? 0) + 1);
-      return { binding: binding(w.event.canonical_chat_jid), usage: () => undefined,
+      return { binding: binding(w.event.canonical_chat_jid), isFresh: () => true, usage: () => undefined,
         prompt: async () => h.promise, appendCompletion: async () => proof(w),
         compact: async () => { throw new ControllerError('compaction_failed'); }, dispose: async () => { scheduling--; } };
     };

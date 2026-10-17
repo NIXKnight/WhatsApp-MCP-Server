@@ -320,7 +320,7 @@ describe('main lifecycle composition', () => {
   it('lazily opens one fully inventoried host with one journal and preserves in-flight close outcomes', async () => {
     const { checkPiInventory, createLazyPiHost, runCli, runLifecycle } = await mainModule();
     const effects: string[] = [];
-    const session = { binding: { canonicalChatId: '100@g.us', sessionId: 'S', sessionFile: '/synthetic/S.jsonl' } } as PiSessionPort;
+    const session = { binding: { canonicalChatId: '100@g.us', sessionId: 'S', sessionFile: '/synthetic/S.jsonl' }, isFresh: () => true } as PiSessionPort;
     const journalExtension = (() => {}) as never;
     const checkpointExtension = (() => {}) as never;
     const confirmed = vi.fn(async () => []);

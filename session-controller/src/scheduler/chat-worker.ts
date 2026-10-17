@@ -19,14 +19,14 @@ export interface TurnPorts {
    * including marker fsync and extension follow-ups, before any prompt.
    * This is ownership fencing only, never capability/destination policy. */
   attach(session: PiSessionPort, context: TurnContext): Promise<void>;
-  /** Slice 8 may compact before this event. Null usage immediately afterward
-   * is expected and is carried into afterPrompt rather than blocking prompt. */
-  prepare(session: PiSessionPort, context: TurnContext): Promise<{ usagePendingAfterCompaction: boolean } | void>;
+  /** Preparation may defer an unknown usage decision for an exact fresh first
+   * turn or after compaction; afterPrompt must validate the real prompt usage. */
+  prepare(session: PiSessionPort, context: TurnContext): Promise<{ usageRequiredAfterPrompt: boolean } | void>;
   /** Slice 7 installs journal hooks through this port. It must settle all
    * hooks before returning and must not replay uncertain calls. */
   run(session: PiSessionPort, context: TurnContext, prompt: () => Promise<void>): Promise<void>;
   /** Runs after the real event prompt settles under the journal/fences. */
-  afterPrompt?(session: PiSessionPort, context: TurnContext, preparation: { usagePendingAfterCompaction: boolean }): Promise<void>;
+  afterPrompt?(session: PiSessionPort, context: TurnContext, preparation: { usageRequiredAfterPrompt: boolean }): Promise<void>;
   confirmed(context: TurnContext): Promise<CompletionMarker['confirmedSends']>;
 }
 /** Native composition: host performs the durable journal run inside prompt;
@@ -111,7 +111,7 @@ export async function runChatWorker(repository: WorkerRepository, initial: Claim
     await context.current(); await options.turns.attach(session, context);
     if (own !== 'confirmed') {
       reason = 'preparation_failed';
-      const preparation = await options.turns.prepare(session, context) ?? { usagePendingAfterCompaction: false };
+      const preparation = await options.turns.prepare(session, context) ?? { usageRequiredAfterPrompt: false };
       await context.current();
       if (!await repository.beginTurn(work)) throw new ControllerError('mutation_uncertain');
       // Crash from here without a durable marker is uncertain, never auto-prompted.
@@ -122,8 +122,8 @@ export async function runChatWorker(repository: WorkerRepository, initial: Claim
         await context.current(); prompted = true;
         await opened.prompt(work.event, options.instructions(work));
       });
-      // The real current-event assistant response has settled. If compaction
-      // made pre-prompt usage null, require its valid usage before completion.
+      // The real current-event assistant response has settled. If preparation
+      // deferred unknown usage, require valid usage before completion.
       await options.turns.afterPrompt?.(opened, context, preparation);
     }
     await context.current();

@@ -95,16 +95,20 @@ export function createCompactor(options: CompactorOptions): Compactor {
           settled.checkpointId !== original.checkpointId || !isDeepStrictEqual(settled.checkpoint, recovered.checkpoint)) throw new ControllerError('restore_failed');
     }
     const decision = usage.decide(session.usage(), options.incoming(session, context));
-    if (decision.status === 'unknown') throw new ControllerError('usage_unknown');
-    if (decision.status === 'ok') return { usagePendingAfterCompaction: false };
+    if (decision.status === 'ok') return { usageRequiredAfterPrompt: false };
+    if (decision.status === 'unknown' && (settled || !session.isFresh())) throw new ControllerError('usage_unknown');
     await context.current();
     const state = await options.repository.readChat(context.work().event.canonical_chat_jid);
-    if (!state.session || state.session.sessionId !== session.binding.sessionId || state.lastCompletedSequence !== context.work().event.chat_sequence - 1) throw new ControllerError('checkpoint_invalid');
-    await context.current();
-    const historical = await withHistory(session).history(state.lastCompletedSequence, settled?.checkpoint);
+    if (!state.session || !isDeepStrictEqual(state.session, session.binding) || state.lastCompletedSequence !== context.work().event.chat_sequence - 1) throw new ControllerError('checkpoint_invalid');
     await context.current();
     const pending = await options.repository.nativeJournal.list(context.work().event.canonical_chat_jid);
     if (pending.some(value => value.status !== 'confirmed')) throw new ControllerError('checkpoint_invalid');
+    // A brand-new mapped session has no model usage until its first real event
+    // prompt. Its durable mapping/cursor/journal must still prove that this is
+    // exactly that first turn; no synthetic prompt or compaction is permitted.
+    if (decision.status === 'unknown') return { usageRequiredAfterPrompt: true };
+    await context.current();
+    const historical = await withHistory(session).history(state.lastCompletedSequence, settled?.checkpoint);
     const native = pending.map(value => {
       if (value.status !== 'confirmed') throw new ControllerError('checkpoint_invalid');
       return { attemptId: value.attemptId, tool: value.tool, destination: value.destination, messageId: value.messageId };
@@ -125,14 +129,14 @@ export function createCompactor(options: CompactorOptions): Compactor {
       // Pi 1.1 deliberately reports null usage immediately after compaction.
       // The current real event prompt must refill it; never block or synthesize
       // an internal prompt here.
-      return { usagePendingAfterCompaction: true };
+      return { usageRequiredAfterPrompt: true };
     } catch (error) {
       if (error instanceof ControllerError) throw error;
       throw new ControllerError('compaction_failed');
     }
   },
   async afterPrompt(session, context, preparation) {
-    if (!preparation.usagePendingAfterCompaction) return;
+    if (!preparation.usageRequiredAfterPrompt) return;
     await context.current();
     // Called only after the journaled event prompt has emitted agent_settled.
     // Completion requires the actual assistant response's public usage.
