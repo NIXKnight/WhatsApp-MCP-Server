@@ -75,8 +75,15 @@ require_source_dir "${SRC}/config"
 for source_input in package.json package-lock.json tsconfig.json; do
   require_source_file "${SRC}/${source_input}"
 done
-for template in system-prompt.md pre-compaction.md compaction-summary.md; do
-  require_source_file "${SRC}/config/${template}"
+release_prompt_artifacts=(
+  system-prompt.md
+  pre-compaction.md
+  compaction-summary.md
+  cabal-system-profile.md
+  cabal-system-profile.manifest.md
+)
+for artifact in "${release_prompt_artifacts[@]}"; do
+  require_source_file "${SRC}/config/${artifact}"
 done
 
 secure_dir() {
@@ -145,8 +152,8 @@ source_count=0
 while IFS= read -r -d '' _; do ((source_count += 1)); done \
   < <(find "${STAGING}/src" -type f -name '*.ts' -print0)
 (( source_count > 0 )) || { error 'No controller TypeScript sources found'; exit 1; }
-for template in system-prompt.md pre-compaction.md compaction-summary.md; do
-  install -m 0644 -- "${SRC}/config/${template}" "${STAGING}/config/${template}"
+for artifact in "${release_prompt_artifacts[@]}"; do
+  install -m 0644 -- "${SRC}/config/${artifact}" "${STAGING}/config/${artifact}"
 done
 (
   cd "${STAGING}"
@@ -172,6 +179,7 @@ for template in system-prompt.md pre-compaction.md compaction-summary.md; do
   fi
   chmod 0600 -- "${target}"
 done
+info 'Preserved operator choice for Pi SYSTEM.md; the reviewed CABAL profile and manifest remain immutable release artifacts.'
 
 if [[ ! -e "${REDIS_CONFIG}" ]]; then
   cat >"${REDIS_CONFIG}" <<EOF
